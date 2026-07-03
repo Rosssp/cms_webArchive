@@ -1,0 +1,907 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Site Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Jost:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f6f4ef;
+    --panel: #f1efe8;
+    --surface: #ffffff;
+    --border: #ddd8cd;
+    --border-strong: #bdb6a6;
+    --text: #1c1b17;
+    --text-dim: #6e6a5f;
+    --text-faint: #9d978a;
+    --green: #1c8a4c;
+    --green-dim: rgba(28, 138, 76, .10);
+    --red: #b5433a;
+    --red-dim: rgba(181, 67, 58, .08);
+    --r: 7px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; display: flex; height: 100vh; background: var(--bg); color: var(--text);
+    font-family: 'Jost', -apple-system, 'Segoe UI', sans-serif;
+    font-size: 13.5px; font-weight: 400; -webkit-font-smoothing: antialiased;
+  }
+
+  #panel {
+    width: 400px; min-width: 360px; padding: 26px 24px; overflow-y: auto;
+    background: var(--panel); border-right: 1px solid var(--border);
+  }
+  #panel::-webkit-scrollbar { width: 7px; }
+  #panel::-webkit-scrollbar-thumb { background: #d8d3c6; border-radius: 4px; }
+  #panel::-webkit-scrollbar-track { background: transparent; }
+
+  .brand { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 28px; }
+  .brand-name { font-size: 15px; font-weight: 600; letter-spacing: 2.5px; text-transform: uppercase; }
+  .brand-tag { font-size: 10px; color: var(--text-faint); letter-spacing: 1px; text-transform: uppercase; }
+
+  .section { padding: 24px 0; border-bottom: 1px solid var(--border); }
+  .section:first-of-type { padding-top: 0; }
+  .section:last-child { border-bottom: none; padding-bottom: 4px; }
+
+  .section-head {
+    display: flex; align-items: baseline; gap: 12px; margin: -8px -8px 16px -8px;
+    padding: 10px 40px 10px 8px; border-radius: 8px;
+    cursor: pointer; user-select: none; position: relative;
+    transition: background .15s ease;
+  }
+  .section-head:hover { background: rgba(28, 27, 23, .05); }
+  .section-num { font-size: 11px; color: var(--text-faint); letter-spacing: 1px; font-variant-numeric: tabular-nums; }
+  .section-head h2 {
+    font-weight: 600; font-size: 14px; letter-spacing: 1.5px; text-transform: uppercase;
+    margin: 0; color: var(--text);
+  }
+  .section-sub { font-size: 11px; color: var(--text-faint); margin: 4px 0 0; line-height: 1.5; }
+  .section-head::after {
+    content: '−'; position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+    width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--border-strong);
+    background: var(--surface); color: var(--text-dim);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15px; line-height: 1; transition: border-color .15s ease, color .15s ease;
+  }
+  .section-head:hover::after { border-color: var(--text); color: var(--text); }
+  .section.collapsed .section-head { margin-bottom: -8px; }
+  .section.collapsed .section-head::after { content: '+'; }
+  .section.collapsed > *:not(.section-head) { display: none; }
+
+  label {
+    display: block; font-size: 10.5px; margin: 14px 0 6px; color: var(--text-dim);
+    font-weight: 500; text-transform: uppercase; letter-spacing: 1.1px;
+  }
+  label:first-of-type { margin-top: 0; }
+
+  input, select {
+    width: 100%; padding: 10px 11px; background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); border-radius: var(--r); font-size: 13px;
+    font-family: inherit; transition: border-color .15s, box-shadow .15s;
+  }
+  input::placeholder { color: var(--text-faint); }
+  input:focus, select:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 3px var(--green-dim); }
+  input[type=number] { font-variant-numeric: tabular-nums; }
+
+  button {
+    margin-top: 14px; padding: 11px 16px; background: var(--text); border: none; color: var(--bg);
+    border-radius: var(--r); cursor: pointer; font-size: 11.5px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 1.2px; width: 100%;
+    transition: background .15s, transform .1s; font-family: inherit;
+  }
+  button:hover { background: #3a3830; }
+  button:active { transform: translateY(1px); }
+  button.secondary {
+    background: transparent; color: var(--text-dim); border: 1px solid var(--border-strong); font-weight: 500;
+  }
+  button.secondary:hover { border-color: var(--text); color: var(--text); }
+
+  .status {
+    font-size: 11.5px; margin-top: 12px; padding: 10px 12px; border-radius: var(--r);
+    white-space: pre-wrap; max-height: 260px; overflow-y: auto;
+    font-family: 'JetBrains Mono', Consolas, monospace; line-height: 1.55;
+    background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--text-faint);
+    color: var(--text-dim);
+  }
+  .status.ok { border-left-color: var(--green); background: var(--green-dim); color: #0f5c32; }
+  .status.err { border-left-color: var(--red); background: var(--red-dim); color: #7d2c25; }
+
+  .hint { font-size: 10.5px; color: var(--text-faint); margin-top: 6px; line-height: 1.55; }
+  .hint.warn { color: var(--red); font-weight: 600; }
+  .hint.ok { color: var(--green); font-weight: 600; }
+
+  .check { display: flex; align-items: center; gap: 9px; margin: 12px 0 0; }
+  .check input[type=checkbox] {
+    appearance: none; -webkit-appearance: none; width: 17px; height: 17px; margin: 0;
+    border: 1px solid var(--border-strong); background: var(--surface); border-radius: 5px;
+    cursor: pointer; position: relative; flex-shrink: 0;
+    background-repeat: no-repeat; background-position: center; background-size: 11px 11px;
+    transition: background-color .12s, border-color .12s;
+  }
+  .check input[type=checkbox]:hover { border-color: var(--text-dim); }
+  .check input[type=checkbox]:checked {
+    background-color: var(--green); border-color: var(--green);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.4L6.6 11.5L12.5 4.8' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  }
+  .check label { margin: 0; font-size: 11.5px; color: var(--text-dim); cursor: pointer; text-transform: none; letter-spacing: normal; font-weight: 400; }
+
+  details { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
+  summary {
+    font-size: 10.5px; color: var(--text-dim); cursor: pointer; font-weight: 500; list-style: none;
+    text-transform: uppercase; letter-spacing: 1.1px;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: '+  '; color: var(--text-faint); }
+  details[open] summary::before { content: '−  '; }
+
+  #preview-wrap { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #preview-bar {
+    padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; gap: 12px; align-items: center;
+  }
+  #preview { flex: 1; border: none; background: #fff; }
+  .path-pill {
+    font-size: 10.5px; color: var(--text-faint); background: var(--surface); border: 1px solid var(--border);
+    padding: 5px 11px; border-radius: var(--r); font-family: Consolas, monospace; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; max-width: 420px;
+  }
+
+  .picker-btn {
+    background: transparent; color: var(--text-dim); border: 1px solid var(--border-strong);
+    display: flex; align-items: center; justify-content: center; gap: 7px; font-weight: 500;
+  }
+  .picker-btn:hover { border-color: var(--text); color: var(--text); }
+  .picker-btn.picking {
+    background: var(--green-dim); color: var(--green); border-color: var(--green);
+    animation: picker-ring 1.2s ease-in-out infinite;
+  }
+  button.danger { background: transparent; color: #b5433a; border: 1px solid rgba(181, 67, 58, .4); font-weight: 500; }
+  button.danger:hover { background: var(--red-dim); border-color: #b5433a; }
+  @keyframes picker-ring {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(28, 138, 76, .35); }
+    50% { box-shadow: 0 0 0 6px rgba(28, 138, 76, 0); }
+  }
+
+  .picker-banner {
+    display: none; align-items: center; gap: 7px; font-size: 10.5px; font-weight: 600; color: var(--green);
+    background: var(--green-dim); border: 1px solid rgba(28, 138, 76, .35);
+    padding: 6px 12px; border-radius: var(--r); white-space: nowrap;
+    text-transform: uppercase; letter-spacing: .8px;
+  }
+  .picker-banner.show { display: flex; }
+  .picker-banner .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: picker-ring 1.2s ease-in-out infinite; }
+
+  .modal-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(20, 18, 14, .55);
+    z-index: 1000; align-items: center; justify-content: center; padding: 40px;
+  }
+  .modal-overlay.show { display: flex; }
+  .modal {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    width: 100%; max-width: 960px; max-height: 100%; display: flex; flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, .35);
+  }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--border); }
+  .modal-title { font-weight: 600; font-size: 14px; letter-spacing: .3px; }
+  .modal-sub { font-size: 11px; color: var(--text-faint); margin-top: 2px; }
+  .modal-grid {
+    padding: 16px 20px; overflow-y: auto; display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px;
+  }
+  .modal-tile {
+    position: relative; border-radius: 6px; overflow: hidden; cursor: pointer;
+    border: 2px solid transparent; background: var(--surface); aspect-ratio: 1 / 1;
+  }
+  .modal-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .modal-tile.picked { border-color: var(--green); }
+  .modal-tile.picked::after {
+    content: '✓'; position: absolute; top: 6px; right: 6px; width: 20px; height: 20px;
+    background: var(--green); color: #fff; border-radius: 50%; font-size: 12px;
+    display: flex; align-items: center; justify-content: center; font-weight: 700;
+  }
+  .modal-tile.broken { display: none; }
+  .modal-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<div id="panel">
+
+  <div class="brand">
+    <span class="brand-name">Site Studio</span>
+    <span class="brand-tag">Local Control</span>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">01</span>
+      <div>
+        <h2>Сайт</h2>
+        <div class="section-sub">Папка с index.html, которую редактируем</div>
+      </div>
+    </div>
+    <label>Путь к папке сайта</label>
+    <input id="siteDir" placeholder="D:\...\site-folder">
+    <button onclick="setSite()">Открыть</button>
+    <div id="siteStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">02</span>
+      <div>
+        <h2>Очистка</h2>
+        <div class="section-sub">Unwrap web.archive.org, снос тулбара/скриптов/меты, внешние ссылки и соцсети, шрифты на Google Fonts, data-*/on* атрибуты, mailto/tel, favicon, .htaccess, robots/sitemap, PBN-чеклист отчёт</div>
+      </div>
+    </div>
+
+    <label>Google Fonts (для очистки)</label>
+    <input id="cleanFonts" placeholder="{{ default_fonts }}" value="{{ default_fonts }}">
+
+    <label>Brand text (заменить логотип-текст/title)</label>
+    <input id="cleanBrand" placeholder="необязательно">
+
+    <label>Logo image (путь к файлу, заменить логотип)</label>
+    <input id="cleanLogo" placeholder="необязательно, игнорируется при авто-логотипе">
+
+    <div class="check"><input type="checkbox" id="cleanAutoLogo"><label for="cleanAutoLogo">Авто-логотип по домену - удалить картинку-лого, вписать своё имя по названию домена, размер шрифта сам подгонится под исходный слот</label></div>
+
+    <label>Цвет авто-логотипа</label>
+    <div class="row">
+      <div><button type="button" class="secondary" id="logoColorWhiteBtn" onclick="setLogoColorPreset('white')">⚪ Белый</button></div>
+      <div><button type="button" class="secondary" id="logoColorBlackBtn" onclick="setLogoColorPreset('black')">⚫ Чёрный</button></div>
+    </div>
+    <input id="cleanLogoColor" placeholder="или свой цвет: #ff6600 / rgb(255,102,0) - перебивает белый/чёрный">
+    <div class="hint">Пусто - цвет подберётся сам по названию. Кнопки выше просто вписывают white/black в поле - можно и стереть, и ввести любой hex/rgb руками.</div>
+
+    <label>Favicon (путь к файлу)</label>
+    <input id="cleanFavicon" placeholder="необязательно, иначе сгенерируется автоматически">
+
+    <label>Domain override</label>
+    <input id="cleanDomain" placeholder="необязательно">
+
+    <div class="check"><input type="checkbox" id="cleanDryRun"><label for="cleanDryRun">Dry-run (только отчёт, ничего не менять)</label></div>
+    <div class="check"><input type="checkbox" id="cleanKeepContact"><label for="cleanKeepContact">Оставить mailto/tel/email/телефоны</label></div>
+    <div class="check"><input type="checkbox" id="cleanNoBackup"><label for="cleanNoBackup">Не делать .bak бэкап</label></div>
+    <div class="check"><input type="checkbox" id="cleanNoImageRecovery"><label for="cleanNoImageRecovery">Не восстанавливать картинки из web.archive.org</label></div>
+
+    <button onclick="runCleanup()">Запустить очистку</button>
+    <div id="cleanStatus" class="status" style="display:none"></div>
+
+    <details>
+      <summary>Проверка живого сайта</summary>
+      <label>URL</label>
+      <input id="checkUrl" placeholder="https://example.com">
+      <button class="secondary" onclick="runCheckUrl()">Проверить</button>
+      <div id="checkStatus" class="status" style="display:none"></div>
+    </details>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">03</span>
+      <div>
+        <h2>Шрифт</h2>
+        <div class="section-sub">Быстрая замена без полного прогона очистки</div>
+      </div>
+    </div>
+    <label>Google Fonts family</label>
+    <input id="fontFamily" placeholder="Jost:wght@400;500;600;700">
+    <button onclick="applyFont()">Применить шрифт</button>
+    <div id="fontStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">04</span>
+      <div>
+        <h2>Логотип</h2>
+        <div class="section-sub">Быстрая замена логотипа без полного прогона очистки</div>
+      </div>
+    </div>
+
+    <label>Brand text (заменить логотип-текст/title)</label>
+    <input id="logoBrand" placeholder="необязательно">
+
+    <label>Logo image (путь к файлу, заменить логотип)</label>
+    <input id="logoImage" placeholder="необязательно, игнорируется при авто-логотипе">
+
+    <div class="check"><input type="checkbox" id="logoAuto"><label for="logoAuto">Авто-логотип по домену - удалить картинку-лого, вписать своё имя по названию домена</label></div>
+
+    <label>Цвет авто-логотипа</label>
+    <div class="row">
+      <div><button type="button" class="secondary" id="logoBtnWhite" onclick="setLogoColorPreset2('white')">⚪ Белый</button></div>
+      <div><button type="button" class="secondary" id="logoBtnBlack" onclick="setLogoColorPreset2('black')">⚫ Чёрный</button></div>
+    </div>
+    <input id="logoColor" placeholder="или свой цвет: #ff6600 / rgb(255,102,0)">
+
+    <label>Domain override</label>
+    <input id="logoDomain" placeholder="необязательно">
+
+    <button onclick="applyLogo()">Заменить логотип</button>
+    <div id="logoStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">05</span>
+      <div>
+        <h2>SEO-файлы</h2>
+        <div class="section-sub">Добавляет .htaccess (gzip/mime), robots.txt и sitemap.xml, если их ещё нет рядом с сайтом - без полного прогона очистки</div>
+      </div>
+    </div>
+    <label>Domain override</label>
+    <input id="seoDomain" placeholder="необязательно, иначе определится по canonical/og:url/ссылкам">
+    <button onclick="runEnsureSeo()">Добавить .htaccess / robots / sitemap</button>
+    <div id="seoStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">06</span>
+      <div>
+        <h2>Картинки</h2>
+        <div class="section-sub">Автопоиск и скачивание по запросу, без API-ключа</div>
+      </div>
+    </div>
+
+    <label>Поисковый запрос</label>
+    <input id="imgQuery" placeholder="autumn forest watercolor painting">
+
+    <label>CSS-селектор родителя</label>
+    <input id="imgSelector" placeholder=".gallery-item, #calendar, .thumb (или выбери курсором ниже)" oninput="updateSelectorMatchInfo()">
+    <button type="button" class="picker-btn" data-target="imgSelector" onclick="togglePicker(this)"><span class="picker-btn-icon">◎</span><span class="picker-btn-text">Выбрать на превью</span></button>
+    <div class="hint">Наведи курсор на превью справа - блок под курсором подсветится и покажет свой селектор, кликни, чтобы вставить его сюда (как выбор элемента в devtools, Esc - отмена). Можно и вписать вручную.</div>
+    <div id="imgSelMatchInfo" class="hint"></div>
+
+    <button onclick="findImages()">Найти картинки</button>
+    <div class="hint">Ищет через настоящий headless-браузер (без API-ключа, без скрейпинг-мусора) и покажет найденное в попапе - сам выберешь, что вставлять.</div>
+    <div id="imgStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">07</span>
+      <div>
+        <h2>Удалить элемент</h2>
+        <div class="section-sub">Вырезает элемент(ы) целиком из HTML - блок, секцию, что угодно</div>
+      </div>
+    </div>
+
+    <label>CSS-селектор элемента</label>
+    <input id="delSelector" placeholder=".old-banner, #popup (или выбери курсором ниже)">
+    <button type="button" class="picker-btn" data-target="delSelector" onclick="togglePicker(this)"><span class="picker-btn-icon">◎</span><span class="picker-btn-text">Выбрать на превью</span></button>
+    <div class="hint">Наведи курсор на превью справа и кликни ровно по тому элементу, который нужно вырезать (без подъёма к родителю картинки, в отличие от пикера картинок выше). Можно вписать селектор вручную.</div>
+
+    <button class="danger" onclick="runRemoveElements()">Удалить</button>
+    <div id="delStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">08</span>
+      <div>
+        <h2>Убрать битый файл</h2>
+        <div class="section-sub">Красное в Network - вставь путь/URL файла, вычистит все ссылки на него из HTML и подключённых CSS</div>
+      </div>
+    </div>
+
+    <label>Путь или URL файла</label>
+    <input id="assetRefPath" placeholder="картинка.jpg, index_files/foo.png или полный URL">
+    <div class="hint">Ищет по точному совпадению, вхождению строки или просто имени файла - не обязательно вписывать целиком. Из подключённых CSS вырезает конкретное правило (background-image и т.п.), из HTML - src/srcset/href у &lt;img&gt;/&lt;source&gt;/&lt;link&gt;/&lt;script&gt; и инлайн background. Файл с диска не удаляет - если он локальный и стал не нужен, потом прогони «Очистить неиспользуемые картинки».</div>
+    <button class="danger" onclick="runRemoveAssetReference()">Вычистить ссылки</button>
+    <div id="assetRefStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">09</span>
+      <div>
+        <h2>Оптимизация картинок</h2>
+        <div class="section-sub">Чистит мусор в _files и пережимает всё в WebP</div>
+      </div>
+    </div>
+
+    <button class="secondary" onclick="runRemoveUnusedAssets()">Очистить неиспользуемые картинки</button>
+    <div class="hint">Смотрит, какие файлы в папке _files реально упомянуты в HTML и подключённых CSS (включая background-image), остальное уносит в _unused_removed - ничего не удаляется насовсем.</div>
+    <div id="unusedStatus" class="status" style="display:none"></div>
+
+    <label>Качество WebP</label>
+    <input id="webpQuality" type="number" min="1" max="100" value="82">
+    <div class="hint">82 - хороший баланс: заметно меньше веса, разница на глаз не видна. Выше 90 почти не уменьшает размер (это уже почти оригинал), ниже 70 - заметны артефакты.</div>
+    <label>Макс. сторона картинки, px</label>
+    <input id="webpMaxDim" type="number" min="200" max="8000" value="2000">
+    <div class="hint">Главный рычаг размера и скорости, не качество: камерафото 4000-7000px+ ужимается до этой длинной стороны перед сжатием - на экране всё равно столько пикселей никто не увидит, а весит и жмётся кратно быстрее.</div>
+    <button onclick="runCompressImages()">Сжать в WebP и переподключить</button>
+    <div class="hint">Через sharp (Node/libvips, вдвое быстрее Pillow на тех же настройках). Конвертирует все локальные .png/.jpg/.jpeg/.bmp/.tiff (в &lt;img&gt;/srcset и в background-image, включая CSS-файлы), переписывает ссылки, удаляет оригиналы после успешной перелинковки. Побайтово одинаковые дубли файлов сжимаются один раз. Битые файлы пропускает и пишет в отчёт. Прогресс смотри в консоли сервера.</div>
+    <div id="compressStatus" class="status" style="display:none"></div>
+  </div>
+
+</div>
+
+<div id="preview-wrap">
+  <div id="preview-bar">
+    <button class="secondary" style="width:auto; margin-top:0;" onclick="reloadPreview()">↻ Обновить превью</button>
+    <div id="pickerBanner" class="picker-banner"><span class="dot"></span>Кликни элемент на превью · Esc</div>
+    <span class="path-pill" id="previewPath"></span>
+  </div>
+  <iframe id="preview" src="/preview/"></iframe>
+</div>
+
+<div id="imgModal" class="modal-overlay">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title">Выбери картинки</div>
+        <div class="modal-sub" id="modalSub"></div>
+      </div>
+      <button class="secondary" style="width:auto; margin-top:0;" onclick="closeImageModal()">✕ Закрыть</button>
+    </div>
+    <div class="modal-grid" id="modalGrid"></div>
+    <div class="modal-foot">
+      <span class="hint" id="modalCount">Выбрано: 0</span>
+      <button style="width:auto; margin-top:0;" onclick="applySelectedImages()">Вставить выбранные</button>
+    </div>
+  </div>
+</div>
+
+<script>
+function toggleSection(headEl) {
+  headEl.closest('.section').classList.toggle('collapsed');
+}
+
+function showStatus(id, ok, text) {
+  const el = document.getElementById(id);
+  el.style.display = 'block';
+  el.className = 'status ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+}
+
+function reloadPreview() {
+  const f = document.getElementById('preview');
+  f.src = '/preview/?_=' + Date.now();
+}
+
+async function refreshStatus() {
+  const r = await fetch('/api/status');
+  const data = await r.json();
+  document.getElementById('siteDir').value = data.site_dir || '';
+  document.getElementById('previewPath').textContent = data.site_dir ? data.site_dir : 'сайт не выбран';
+}
+
+async function setSite() {
+  const site_dir = document.getElementById('siteDir').value.trim();
+  const r = await fetch('/api/set-site', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({site_dir})
+  });
+  const data = await r.json();
+  showStatus('siteStatus', data.ok, data.ok ? ('OK: ' + data.site_dir) : data.error);
+  if (data.ok) { await refreshStatus(); reloadPreview(); }
+}
+
+async function applyFont() {
+  const family = document.getElementById('fontFamily').value.trim();
+  const r = await fetch('/api/apply-font', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({family})
+  });
+  const data = await r.json();
+  showStatus('fontStatus', data.ok, data.ok ? ('Шрифт применён: ' + data.family) : data.error);
+  if (data.ok) reloadPreview();
+}
+
+function setLogoColorPreset2(name) {
+  document.getElementById('logoColor').value = name;
+}
+
+async function applyLogo() {
+  const body = {
+    auto_logo: document.getElementById('logoAuto').checked,
+    brand_text: document.getElementById('logoBrand').value.trim(),
+    logo_image: document.getElementById('logoImage').value.trim(),
+    color: document.getElementById('logoColor').value.trim(),
+    domain: document.getElementById('logoDomain').value.trim(),
+  };
+  showStatus('logoStatus', true, 'Меняю логотип...');
+  const r = await fetch('/api/apply-logo', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  showStatus('logoStatus', data.ok, data.ok
+    ? `Логотип заменён: ${data.logo_replaced}, текст/мета обновлено: ${data.brand_text_replaced}`
+    : data.error);
+  if (data.ok) reloadPreview();
+}
+
+function updateSelectorMatchInfo() {
+  const el = document.getElementById('imgSelMatchInfo');
+  const selector = document.getElementById('imgSelector').value.trim();
+  if (!selector) { el.textContent = ''; el.className = 'hint'; return; }
+  const iframe = document.getElementById('preview');
+  let doc;
+  try { doc = iframe.contentDocument; } catch (e) { doc = null; }
+  if (!doc) { el.textContent = ''; el.className = 'hint'; return; }
+  let matches;
+  try { matches = doc.querySelectorAll(selector); } catch (e) { el.textContent = 'Невалидный селектор'; el.className = 'hint warn'; return; }
+  if (matches.length === 0) {
+    el.textContent = 'Селектор ничего не находит на странице';
+    el.className = 'hint warn';
+  } else if (matches.length === 1) {
+    el.textContent = 'Селектор совпадает ровно с 1 элементом';
+    el.className = 'hint ok';
+  } else {
+    el.textContent = `⚠ Селектор совпадает с ${matches.length} элементами - картинки встанут во ВСЕ сразу, не только в тот, что на превью`;
+    el.className = 'hint warn';
+  }
+}
+
+const imgPicker = { candidates: [], picked: new Set(), suggestedCount: 1, selector: '' };
+
+async function findImages() {
+  const query = document.getElementById('imgQuery').value.trim();
+  const selector = document.getElementById('imgSelector').value.trim();
+  if (!query || !selector) { showStatus('imgStatus', false, 'Запрос и селектор обязательны'); return; }
+  showStatus('imgStatus', true, 'Ищу через браузер (может занять до минуты на первый раз - ставится Chromium)...');
+  const r = await fetch('/api/find-images', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({query, selector})
+  });
+  const data = await r.json();
+  if (!data.ok) { showStatus('imgStatus', false, data.error); return; }
+  document.getElementById('imgStatus').style.display = 'none';
+  imgPicker.candidates = data.candidates;
+  imgPicker.suggestedCount = data.suggested_count;
+  imgPicker.selector = selector;
+  imgPicker.picked = new Set(data.candidates.slice(0, data.suggested_count));
+  renderImageModal();
+  openImageModal();
+}
+
+function renderImageModal() {
+  const sub = document.getElementById('modalSub');
+  if (imgPicker.suggestedCount > 1) {
+    sub.innerHTML = `Найдено ${imgPicker.candidates.length}. ⚠ Селектор "${imgPicker.selector}" совпадает с ${imgPicker.suggestedCount} слотами - вставка затронет ВСЕ сразу, не только один элемент.`;
+    sub.style.color = 'var(--red)';
+    sub.style.fontWeight = '600';
+  } else {
+    sub.textContent = `Найдено ${imgPicker.candidates.length} - слотов в селекторе: ${imgPicker.suggestedCount}. Кликай, чтобы выбрать/снять.`;
+    sub.style.color = '';
+    sub.style.fontWeight = '';
+  }
+  const grid = document.getElementById('modalGrid');
+  grid.innerHTML = '';
+  imgPicker.candidates.forEach((url) => {
+    const tile = document.createElement('div');
+    tile.className = 'modal-tile' + (imgPicker.picked.has(url) ? ' picked' : '');
+    const img = document.createElement('img');
+    img.src = url;
+    img.loading = 'lazy';
+    img.referrerPolicy = 'no-referrer';
+    img.onerror = () => tile.classList.add('broken');
+    tile.appendChild(img);
+    tile.onclick = () => {
+      if (imgPicker.picked.has(url)) imgPicker.picked.delete(url);
+      else imgPicker.picked.add(url);
+      tile.classList.toggle('picked');
+      updateModalCount();
+    };
+    grid.appendChild(tile);
+  });
+  updateModalCount();
+}
+
+function updateModalCount() {
+  document.getElementById('modalCount').textContent = `Выбрано: ${imgPicker.picked.size}`;
+}
+
+function openImageModal() {
+  document.getElementById('imgModal').classList.add('show');
+}
+
+function closeImageModal() {
+  document.getElementById('imgModal').classList.remove('show');
+}
+
+async function applySelectedImages() {
+  const urls = Array.from(imgPicker.picked);
+  if (!urls.length) { alert('Выбери хотя бы одну картинку'); return; }
+  showStatus('imgStatus', true, 'Скачиваю выбранное и вставляю...');
+  closeImageModal();
+  const r = await fetch('/api/apply-selected-images', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({selector: imgPicker.selector, urls})
+  });
+  const data = await r.json();
+  showStatus('imgStatus', data.ok, data.ok
+    ? `Скачано ${data.images_downloaded}, вставлено в ${data.slots_filled} слотов`
+    : data.error);
+  if (data.ok) reloadPreview();
+}
+
+// --- element picker: click an element in the live preview to grab its selector,
+// same idea as devtools' inspect tool. If you land on an <img>/<svg>/<picture>
+// itself, it climbs to the parent wrapper instead, since the selector this tool
+// wants is the *container* whose <img> children get filled in.
+const picker = { active: false, doc: null, hovered: null, tagEl: null, btn: null, targetInput: null };
+
+function pickerTargetFor(el) {
+  if (!el) return el;
+  // For the image-slot picker, landing on the <img>/<svg>/<picture> itself should
+  // climb to its parent wrapper - that's the "container" the fill logic wants. Every
+  // other picker (e.g. delete) wants exactly the element under the cursor.
+  if (picker.targetInput && picker.targetInput.id === 'imgSelector') {
+    const media = el.closest('img, svg, picture');
+    if (media) return media.parentElement || media;
+  }
+  return el;
+}
+
+// Page-builder markup (Colibri, Elementor, ...) puts generic utility classes first
+// (d-flex, position-relative, align-items-center - shared by dozens of unrelated
+// elements) and the actually-unique per-element class last (style-204, style-local-
+// 60-c2, ...). A naive "first 2 classes" pick grabs the generic ones and produces a
+// selector that silently matches many elements at once - classes containing a digit
+// are a solid proxy for "auto-generated, probably unique", so prefer those first.
+function _classSpecificityRank(c) {
+  return /\d/.test(c) ? 0 : 1;
+}
+
+function cssPathFor(el) {
+  if (!el || el.nodeType !== 1) return '';
+  if (el.id) return '#' + CSS.escape(el.id);
+  const parts = [];
+  let node = el;
+  while (node && node.nodeType === 1 && !['html', 'body'].includes(node.tagName.toLowerCase())) {
+    let part = node.tagName.toLowerCase();
+    const cls = (typeof node.className === 'string' ? node.className : '')
+      .trim().split(/\s+/).filter(Boolean).filter(c => !c.startsWith('site-studio'))
+      .sort((a, b) => _classSpecificityRank(a) - _classSpecificityRank(b))
+      .slice(0, 2);
+    if (cls.length) part += '.' + cls.map(c => CSS.escape(c)).join('.');
+    const parent = node.parentElement;
+    if (parent) {
+      const sameTag = Array.from(parent.children).filter(s => s.tagName === node.tagName);
+      if (sameTag.length > 1) part += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
+    }
+    parts.unshift(part);
+    if (node.id || parts.length >= 4) break;
+    node = node.parentElement;
+  }
+  return parts.join(' > ');
+}
+
+function paintHighlight(el, color, fill) {
+  el.style.outline = `2px solid ${color}`;
+  el.style.outlineOffset = '-2px';
+  el.style.boxShadow = `inset 0 0 0 9999px ${fill}`;
+  el.style.transition = 'box-shadow .1s ease';
+}
+
+function clearHighlight(el) {
+  if (!el) return;
+  el.style.outline = '';
+  el.style.outlineOffset = '';
+  el.style.boxShadow = '';
+  el.style.transition = '';
+}
+
+function positionTag(el) {
+  if (!picker.tagEl || !el) return;
+  const rect = el.getBoundingClientRect();
+  const selector = cssPathFor(el);
+  const dims = `${Math.round(rect.width)}×${Math.round(rect.height)}`;
+  picker.tagEl.textContent = `${selector}  ${dims}`;
+  const top = rect.top > 24 ? rect.top - 22 : rect.bottom + 4;
+  picker.tagEl.style.top = Math.max(2, top) + 'px';
+  picker.tagEl.style.left = Math.max(2, rect.left) + 'px';
+  picker.tagEl.style.display = 'block';
+}
+
+function onPickerOver(e) {
+  const el = pickerTargetFor(e.target);
+  if (picker.hovered === el) return;
+  if (picker.hovered) clearHighlight(picker.hovered);
+  picker.hovered = el;
+  if (el) {
+    paintHighlight(el, '#1c8a4c', 'rgba(28,138,76,.14)');
+    positionTag(el);
+  }
+}
+
+function onPickerClick(e) {
+  e.preventDefault();
+  e.stopPropagation();
+  e.stopImmediatePropagation();
+  const el = pickerTargetFor(e.target);
+  if (!el) { stopPicker(); return; }
+  if (picker.targetInput) {
+    picker.targetInput.value = cssPathFor(el);
+    if (picker.targetInput.id === 'imgSelector') updateSelectorMatchInfo();
+  }
+  paintHighlight(el, '#7fe0a8', 'rgba(127,224,168,.22)');
+  if (picker.tagEl) picker.tagEl.style.display = 'none';
+  stopPickerListeners();
+  setTimeout(() => { clearHighlight(el); }, 260);
+}
+
+function onPickerKey(e) {
+  if (e.key === 'Escape') stopPicker();
+}
+
+function togglePicker(btn) {
+  if (picker.active) { stopPicker(); return; }
+  const iframe = document.getElementById('preview');
+  let doc;
+  try { doc = iframe.contentDocument; } catch (e) { doc = null; }
+  if (!doc || !doc.body) { alert('Превью ещё не загружено'); return; }
+  picker.active = true;
+  picker.doc = doc;
+  picker.btn = btn;
+  picker.targetInput = document.getElementById(btn.dataset.target);
+
+  const tag = doc.createElement('div');
+  tag.id = 'site-studio-picker-tag';
+  tag.style.cssText = 'position:fixed; z-index:2147483647; display:none; pointer-events:none; ' +
+    'background:#1c8a4c; color:#fff; font:600 11px/1 Consolas,monospace; padding:4px 7px; ' +
+    'border-radius:4px; box-shadow:0 2px 8px rgba(0,0,0,.25); white-space:nowrap;';
+  doc.body.appendChild(tag);
+  picker.tagEl = tag;
+
+  const cursorStyle = doc.createElement('style');
+  cursorStyle.id = 'site-studio-picker-style';
+  cursorStyle.textContent = '* { cursor: crosshair !important; }';
+  doc.head.appendChild(cursorStyle);
+  picker.cursorStyleEl = cursorStyle;
+
+  doc.addEventListener('mouseover', onPickerOver, true);
+  doc.addEventListener('click', onPickerClick, true);
+  doc.addEventListener('keydown', onPickerKey, true);
+
+  btn.classList.add('picking');
+  btn.querySelector('.picker-btn-icon').textContent = '✕';
+  btn.querySelector('.picker-btn-text').textContent = 'Отмена (Esc)';
+  document.getElementById('pickerBanner').classList.add('show');
+}
+
+function stopPickerListeners() {
+  const doc = picker.doc;
+  if (doc) {
+    doc.removeEventListener('mouseover', onPickerOver, true);
+    doc.removeEventListener('click', onPickerClick, true);
+    doc.removeEventListener('keydown', onPickerKey, true);
+    if (picker.cursorStyleEl) picker.cursorStyleEl.remove();
+  }
+  picker.active = false;
+  if (picker.btn) {
+    picker.btn.classList.remove('picking');
+    picker.btn.querySelector('.picker-btn-icon').textContent = '◎';
+    picker.btn.querySelector('.picker-btn-text').textContent = 'Выбрать на превью';
+  }
+  document.getElementById('pickerBanner').classList.remove('show');
+}
+
+function stopPicker() {
+  if (!picker.active) return;
+  if (picker.hovered) clearHighlight(picker.hovered);
+  if (picker.tagEl) { picker.tagEl.remove(); picker.tagEl = null; }
+  stopPickerListeners();
+  picker.doc = null;
+  picker.hovered = null;
+  picker.btn = null;
+  picker.targetInput = null;
+}
+
+function setLogoColorPreset(name) {
+  document.getElementById('cleanLogoColor').value = name;
+}
+
+async function runCleanup() {
+  const body = {
+    fonts: document.getElementById('cleanFonts').value.trim(),
+    brand_text: document.getElementById('cleanBrand').value.trim(),
+    logo_image: document.getElementById('cleanLogo').value.trim(),
+    auto_logo: document.getElementById('cleanAutoLogo').checked,
+    auto_logo_color: document.getElementById('cleanLogoColor').value.trim(),
+    favicon: document.getElementById('cleanFavicon').value.trim(),
+    domain: document.getElementById('cleanDomain').value.trim(),
+    dry_run: document.getElementById('cleanDryRun').checked,
+    keep_contact_info: document.getElementById('cleanKeepContact').checked,
+    no_backup: document.getElementById('cleanNoBackup').checked,
+    no_image_recovery: document.getElementById('cleanNoImageRecovery').checked,
+  };
+  showStatus('cleanStatus', true, 'Чищу...');
+  const r = await fetch('/api/cleanup', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  showStatus('cleanStatus', data.ok, data.ok ? data.report : data.error);
+  if (data.ok && !body.dry_run) reloadPreview();
+}
+
+async function runEnsureSeo() {
+  const domain = document.getElementById('seoDomain').value.trim();
+  showStatus('seoStatus', true, 'Проверяю и создаю недостающее...');
+  const r = await fetch('/api/ensure-seo', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({domain})
+  });
+  const data = await r.json();
+  showStatus('seoStatus', data.ok, data.ok ? data.report : data.error);
+}
+
+async function runRemoveElements() {
+  const selector = document.getElementById('delSelector').value.trim();
+  if (!selector) { showStatus('delStatus', false, 'Укажи селектор'); return; }
+  if (!confirm(`Удалить все элементы по селектору "${selector}"? Восстановить можно только из .studio-bak.`)) return;
+  showStatus('delStatus', true, 'Удаляю...');
+  const r = await fetch('/api/remove-elements', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({selector})
+  });
+  const data = await r.json();
+  showStatus('delStatus', data.ok, data.ok ? `Удалено элементов: ${data.removed}` : data.error);
+  if (data.ok) reloadPreview();
+}
+
+async function runRemoveAssetReference() {
+  const path = document.getElementById('assetRefPath').value.trim();
+  if (!path) { showStatus('assetRefStatus', false, 'Укажи путь или URL'); return; }
+  showStatus('assetRefStatus', true, 'Ищу и вычищаю...');
+  const r = await fetch('/api/remove-asset-reference', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path})
+  });
+  const data = await r.json();
+  showStatus('assetRefStatus', data.ok, data.ok
+    ? `Вычищено:\n${data.cleared.join('\n')}`
+    : data.error);
+  if (data.ok) reloadPreview();
+}
+
+async function runRemoveUnusedAssets() {
+  showStatus('unusedStatus', true, 'Ищу неиспользуемое...');
+  const r = await fetch('/api/remove-unused-assets', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+  const data = await r.json();
+  showStatus('unusedStatus', data.ok, data.ok
+    ? (data.removed.length ? `Унесено в _unused_removed (${data.removed.length}):\n` + data.removed.join('\n') : 'Всё используется, чистить нечего')
+    : data.error);
+}
+
+async function runCompressImages() {
+  const quality = parseInt(document.getElementById('webpQuality').value, 10) || 82;
+  const max_dimension = parseInt(document.getElementById('webpMaxDim').value, 10) || 2000;
+  showStatus('compressStatus', true, 'Конвертирую в WebP через sharp...');
+  const r = await fetch('/api/compress-images', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({quality, max_dimension})
+  });
+  const data = await r.json();
+  showStatus('compressStatus', data.ok, data.ok
+    ? `Сконвертировано: ${data.converted}, уже было .webp: ${data.skipped}, ошибок: ${data.failed}, оригиналов удалено: ${data.removed_originals}` +
+      (data.details && data.details.length ? '\n\n' + data.details.join('\n') : '')
+    : data.error);
+  if (data.ok) reloadPreview();
+}
+
+async function runCheckUrl() {
+  const url = document.getElementById('checkUrl').value.trim();
+  showStatus('checkStatus', true, 'Проверяю...');
+  const r = await fetch('/api/check-url', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url})
+  });
+  const data = await r.json();
+  showStatus('checkStatus', data.ok, data.ok ? data.report : data.error);
+}
+
+refreshStatus();
+</script>
+
+</body>
+</html>
