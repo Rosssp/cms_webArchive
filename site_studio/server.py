@@ -73,13 +73,42 @@ def api_set_site():
         return jsonify({"ok": False, "error": str(e)}), 400
 
 
+@app.route("/api/pick-folder", methods=["POST"])
+def api_pick_folder():
+    """Open a native OS folder-picker on the machine running this server (this is a
+    local tool, so the server and the user are the same machine) and return the chosen
+    absolute path. The browser can't hand back an absolute folder path for security
+    reasons, so the dialog has to happen server-side. Tk runs in a throwaway subprocess
+    so it never fights Flask's request thread, and the path comes back as raw UTF-8
+    bytes to survive non-ASCII (Cyrillic) folder names on Windows."""
+    picker_code = (
+        "import sys, tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "root = tk.Tk()\n"
+        "root.withdraw()\n"
+        "root.attributes('-topmost', True)\n"
+        "path = filedialog.askdirectory(title='Выбери папку сайта (с index.html)')\n"
+        "root.destroy()\n"
+        "sys.stdout.buffer.write((path or '').encode('utf-8'))\n"
+    )
+    try:
+        proc = subprocess.run([sys.executable, "-c", picker_code], capture_output=True, timeout=300)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"не удалось открыть диалог выбора папки: {e}"}), 400
+    path = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    if not path:
+        return jsonify({"ok": False, "error": "папка не выбрана"}), 400
+    return jsonify({"ok": True, "path": path})
+
+
 @app.route("/api/apply-font", methods=["POST"])
 def api_apply_font():
     if not STATE["html_path"]:
         return jsonify({"ok": False, "error": "select a site folder first"}), 400
-    family = (request.json or {}).get("family", "").strip()
-    if not family:
+    family_raw = ((request.json or {}).get("family") or "").strip()
+    if not family_raw:
         return jsonify({"ok": False, "error": "font family is required"}), 400
+    family = clean_wayback_site.resolve_font_input(family_raw)
     try:
         result = site_edit.apply_font(STATE["html_path"], family)
         return jsonify({"ok": True, **result})
@@ -237,7 +266,7 @@ def api_cleanup():
         with contextlib.redirect_stdout(buf):
             clean_wayback_site.clean_html_file(
                 STATE["html_path"],
-                (body.get("fonts") or "").strip() or clean_wayback_site.DEFAULT_GOOGLE_FONTS,
+                clean_wayback_site.resolve_font_input(body.get("fonts")),
                 dry_run=bool(body.get("dry_run")),
                 backup=not body.get("no_backup"),
                 keep_contact_info=bool(body.get("keep_contact_info")),
@@ -248,6 +277,7 @@ def api_cleanup():
                 domain_override=(body.get("domain") or "").strip() or None,
                 auto_logo=bool(body.get("auto_logo")),
                 auto_logo_color=(body.get("auto_logo_color") or "").strip() or None,
+                brand_old_name=(body.get("brand_old_name") or "").strip() or None,
             )
     except Exception as e:
         return jsonify({"ok": False, "error": f"{e}\n\n{buf.getvalue()}"}), 400
@@ -296,6 +326,65 @@ def api_check_url():
     try:
         report = clean_wayback_site.check_url_live(url)
         return jsonify({"ok": True, "report": report})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/replace-brand-text", methods=["POST"])
+def api_replace_brand_text():
+    if not STATE["html_path"]:
+        return jsonify({"ok": False, "error": "select a site folder first"}), 400
+    body = request.json or {}
+    try:
+        result = site_edit.replace_brand_text_everywhere(
+            STATE["html_path"],
+            (body.get("old_name") or "").strip(),
+            (body.get("new_name") or "").strip(),
+        )
+        return jsonify({"ok": True, **result})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/strip-owner-traces", methods=["POST"])
+def api_strip_owner_traces():
+    if not STATE["html_path"]:
+        return jsonify({"ok": False, "error": "select a site folder first"}), 400
+    body = request.json or {}
+    try:
+        result = site_edit.strip_owner_traces(STATE["html_path"], update_year=body.get("update_year", True))
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/revert-backup", methods=["POST"])
+def api_revert_backup():
+    if not STATE["html_path"]:
+        return jsonify({"ok": False, "error": "select a site folder first"}), 400
+    body = request.json or {}
+    try:
+        result = site_edit.revert_to_backup(STATE["html_path"], which=(body.get("which") or "auto"))
+        return jsonify({"ok": True, **result})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/format-dir", methods=["POST"])
+def api_format_dir():
+    if not STATE["html_path"]:
+        return jsonify({"ok": False, "error": "select a site folder first"}), 400
+    body = request.json or {}
+    try:
+        result = site_edit.format_for_upload(
+            STATE["html_path"],
+            clean_unused=bool(body.get("clean_unused", True)),
+        )
+        return jsonify({"ok": True, **result})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 

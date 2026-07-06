@@ -42,12 +42,16 @@
   .brand-name { font-size: 15px; font-weight: 600; letter-spacing: 2.5px; text-transform: uppercase; }
   .brand-tag { font-size: 10px; color: var(--text-faint); letter-spacing: 1px; text-transform: uppercase; }
 
-  .section { padding: 24px 0; border-bottom: 1px solid var(--border); }
+  .section {
+    padding: 24px 0; border-bottom: 1px solid var(--border);
+    transition: padding-bottom .32s cubic-bezier(.4, 0, .2, 1);
+  }
   .section:first-of-type { padding-top: 0; }
   .section:last-child { border-bottom: none; padding-bottom: 4px; }
+  .section.collapsed { padding-bottom: 17px; }
 
   .section-head {
-    display: flex; align-items: baseline; gap: 12px; margin: -8px -8px 16px -8px;
+    display: flex; align-items: baseline; gap: 12px; margin: -8px -8px 0 -8px;
     padding: 10px 40px 10px 8px; border-radius: 8px;
     cursor: pointer; user-select: none; position: relative;
     transition: background .15s ease;
@@ -60,16 +64,28 @@
   }
   .section-sub { font-size: 11px; color: var(--text-faint); margin: 4px 0 0; line-height: 1.5; }
   .section-head::after {
-    content: '−'; position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
-    width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--border-strong);
-    background: var(--surface); color: var(--text-dim);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 15px; line-height: 1; transition: border-color .15s ease, color .15s ease;
+    content: ''; position: absolute; right: 12px; top: 50%; margin-top: -8px;
+    width: 16px; height: 16px; background-color: var(--text-faint);
+    -webkit-mask: center / 11px no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");
+    mask: center / 11px no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");
+    transform: rotate(180deg);
+    transition: transform .32s cubic-bezier(.4, 0, .2, 1), background-color .15s ease;
   }
-  .section-head:hover::after { border-color: var(--text); color: var(--text); }
-  .section.collapsed .section-head { margin-bottom: -8px; }
-  .section.collapsed .section-head::after { content: '+'; }
-  .section.collapsed > *:not(.section-head) { display: none; }
+  .section-head:hover::after { background-color: var(--text); }
+  .section.collapsed .section-head::after { transform: rotate(0deg); }
+
+  /* collapsible body - smooth height via grid 1fr <-> 0fr (wrappers injected in JS).
+     Two layers on purpose: the CLIP layer is the grid item and carries overflow:hidden
+     with NO vertical padding, so at 0fr it truly collapses to zero. The INNER layer
+     holds the vertical padding (header<->content gap) so that padding gets clipped away
+     when collapsed instead of leaking as dead space at the bottom. */
+  .section-body {
+    display: grid; grid-template-rows: 1fr; opacity: 1;
+    transition: grid-template-rows .32s cubic-bezier(.4, 0, .2, 1), opacity .26s ease;
+  }
+  .section-body-clip { overflow: hidden; min-height: 0; padding: 0 6px; margin: 0 -6px; }
+  .section-body-inner { padding: 16px 0 2px; }
+  .section.collapsed .section-body { grid-template-rows: 0fr; opacity: 0; }
 
   label {
     display: block; font-size: 10.5px; margin: 14px 0 6px; color: var(--text-dim);
@@ -98,6 +114,9 @@
     background: transparent; color: var(--text-dim); border: 1px solid var(--border-strong); font-weight: 500;
   }
   button.secondary:hover { border-color: var(--text); color: var(--text); }
+  .preset-row { display: flex; gap: 8px; margin-top: 12px; }
+  .preset-row button { margin-top: 0; }
+  .color-input { margin-top: 12px; }
 
   .status {
     font-size: 11.5px; margin-top: 12px; padding: 10px 12px; border-radius: var(--r);
@@ -225,6 +244,7 @@
     </div>
     <label>Путь к папке сайта</label>
     <input id="siteDir" placeholder="D:\...\site-folder">
+    <button type="button" class="picker-btn" onclick="pickFolder()"><span>📁</span> Указать путь к папке сайта</button>
     <button onclick="setSite()">Открыть</button>
     <div id="siteStatus" class="status" style="display:none"></div>
   </div>
@@ -234,15 +254,18 @@
       <span class="section-num">02</span>
       <div>
         <h2>Очистка</h2>
-        <div class="section-sub">Unwrap web.archive.org, снос тулбара/скриптов/меты, внешние ссылки и соцсети, шрифты на Google Fonts, data-*/on* атрибуты, mailto/tel, favicon, .htaccess, robots/sitemap, PBN-чеклист отчёт</div>
+        <div class="section-sub">Unwrap web.archive.org, снос тулбара/скриптов/меты, внешние ссылки и соцсети, случайный шрифт (Jost/Montserrat), data-*/on*, mailto/tel, favicon, следы владельца (метрики/verification/год ©), robots/sitemap/.htaccess (перезаписью), PBN-чеклист отчёт</div>
       </div>
     </div>
 
-    <label>Google Fonts (для очистки)</label>
-    <input id="cleanFonts" placeholder="{{ default_fonts }}" value="{{ default_fonts }}">
+    <label>Шрифт для очистки (пусто = случайный)</label>
+    <input id="cleanFonts" placeholder="пусто — случайный Jost/Montserrat, или впиши название">
 
     <label>Brand text (заменить логотип-текст/title)</label>
     <input id="cleanBrand" placeholder="необязательно">
+
+    <label>Старое имя бренда (замена по всему тексту)</label>
+    <input id="cleanBrandOld" placeholder="необязательно - вычистит старое имя из заголовков/футера/alt на Brand text">
 
     <label>Logo image (путь к файлу, заменить логотип)</label>
     <input id="cleanLogo" placeholder="необязательно, игнорируется при авто-логотипе">
@@ -254,7 +277,7 @@
       <div><button type="button" class="secondary" id="logoColorWhiteBtn" onclick="setLogoColorPreset('white')">⚪ Белый</button></div>
       <div><button type="button" class="secondary" id="logoColorBlackBtn" onclick="setLogoColorPreset('black')">⚫ Чёрный</button></div>
     </div>
-    <input id="cleanLogoColor" placeholder="или свой цвет: #ff6600 / rgb(255,102,0) - перебивает белый/чёрный">
+    <input id="cleanLogoColor" class="color-input" placeholder="или свой цвет: #ff6600 / rgb(255,102,0) - перебивает белый/чёрный">
     <div class="hint">Пусто - цвет подберётся сам по названию. Кнопки выше просто вписывают white/black в поле - можно и стереть, и ввести любой hex/rgb руками.</div>
 
     <label>Favicon (путь к файлу)</label>
@@ -288,8 +311,13 @@
         <div class="section-sub">Быстрая замена без полного прогона очистки</div>
       </div>
     </div>
-    <label>Google Fonts family</label>
-    <input id="fontFamily" placeholder="Jost:wght@400;500;600;700">
+    <label>Шрифт (только название)</label>
+    <input id="fontFamily" placeholder="Jost">
+    <div class="preset-row">
+      <button type="button" class="secondary" onclick="setFontPreset('Jost')">Jost</button>
+      <button type="button" class="secondary" onclick="setFontPreset('Montserrat')">Montserrat</button>
+    </div>
+    <div class="hint">Впиши только название шрифта из Google Fonts (напр. Jost, Montserrat, Inter). Подключится на 3 жирности - 400/500/700. Пресеты - кнопками выше.</div>
     <button onclick="applyFont()">Применить шрифт</button>
     <div id="fontStatus" class="status" style="display:none"></div>
   </div>
@@ -316,7 +344,7 @@
       <div><button type="button" class="secondary" id="logoBtnWhite" onclick="setLogoColorPreset2('white')">⚪ Белый</button></div>
       <div><button type="button" class="secondary" id="logoBtnBlack" onclick="setLogoColorPreset2('black')">⚫ Чёрный</button></div>
     </div>
-    <input id="logoColor" placeholder="или свой цвет: #ff6600 / rgb(255,102,0)">
+    <input id="logoColor" class="color-input" placeholder="или свой цвет: #ff6600 / rgb(255,102,0)">
 
     <label>Domain override</label>
     <input id="logoDomain" placeholder="необязательно">
@@ -420,6 +448,64 @@
     <div id="compressStatus" class="status" style="display:none"></div>
   </div>
 
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">10</span>
+      <div>
+        <h2>Бренд в тексте</h2>
+        <div class="section-sub">Меняет старое имя на новое ВЕЗДЕ в тексте и alt/title/aria - не только в лого/title</div>
+      </div>
+    </div>
+    <label>Старое имя (что заменить)</label>
+    <input id="brandOld" placeholder="Old Company Name">
+    <label>Новое имя</label>
+    <input id="brandNew" placeholder="Новый бренд">
+    <div class="hint">Ищет как целое слово, регистр не важен. Проходит по видимому тексту (заголовки, футер ©, абзацы) и атрибутам alt/title/aria-label/placeholder/meta content/value. Лого и &lt;title&gt; меняй в секции «Логотип».</div>
+    <button onclick="runReplaceBrand()">Заменить в тексте</button>
+    <div id="brandTextStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">11</span>
+      <div>
+        <h2>Следы владельца</h2>
+        <div class="section-sub">Сносит verification-меты (Google/Yandex/Bing/FB/Pinterest), generator/author/copyright-мету, GTM/GA-остатки, обновляет год в ©</div>
+      </div>
+    </div>
+    <div class="hint">Скриптовую аналитику режет основная очистка, а мета-хвосты владельца и год в футере остаются - этот проход убирает именно их.</div>
+    <div class="check"><input type="checkbox" id="tracesUpdateYear" checked><label for="tracesUpdateYear">Обновить год в © на текущий</label></div>
+    <button onclick="runStripTraces()">Убрать следы</button>
+    <div id="tracesStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">12</span>
+      <div>
+        <h2>Откатить к бэкапу</h2>
+        <div class="section-sub">Возвращает index.html к самому свежему бэкапу (.bak до очистки / .studio-bak до правок)</div>
+      </div>
+    </div>
+    <div class="hint">Восстанавливает только index.html - перенесённые ассеты и вынесенный CSS не откатывает. Текущее состояние перед откатом сохраняется в .pre-revert, так что откат тоже обратим.</div>
+    <button class="danger" onclick="runRevert()">Откатить index.html</button>
+    <div id="revertStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">13</span>
+      <div>
+        <h2>Форматировать папку</h2>
+        <div class="section-sub">Приводит саму папку к заливке: удаляет бэкапы и папки _wayback_removed / _unused_removed целиком. Без zip - чистит на месте</div>
+      </div>
+    </div>
+    <div class="check"><input type="checkbox" id="fmtCleanUnused" checked><label for="fmtCleanUnused">Сначала вымести неиспользуемые картинки (удалятся насовсем)</label></div>
+    <div class="hint">Удаляет из папки: бэкапы (.bak/.studio-bak/.pre-revert), *.cleanup-report.txt и папки _wayback_removed/ и _unused_removed/ целиком. Ничего не архивирует - в папке остаётся только рабочий сайт. После этого «Откатить к бэкапу» уже не сработает.</div>
+    <button class="danger" onclick="runFormat()">Форматировать папку</button>
+    <div id="fmtStatus" class="status" style="display:none"></div>
+  </div>
+
 </div>
 
 <div id="preview-wrap">
@@ -453,6 +539,43 @@ function toggleSection(headEl) {
   headEl.closest('.section').classList.toggle('collapsed');
 }
 
+// Wrap everything after each .section-head into a .section-body > .section-body-inner
+// so the body can animate its height smoothly (grid 1fr <-> 0fr) instead of snapping
+// with display:none. Done in JS to keep the markup of all sections untouched.
+function wrapSections() {
+  document.querySelectorAll('.section').forEach(sec => {
+    if (sec.querySelector(':scope > .section-body')) return;
+    const head = sec.querySelector('.section-head');
+    if (!head) return;
+    const body = document.createElement('div');
+    body.className = 'section-body';
+    const clip = document.createElement('div');
+    clip.className = 'section-body-clip';
+    const inner = document.createElement('div');
+    inner.className = 'section-body-inner';
+    let node = head.nextSibling;
+    while (node) { const next = node.nextSibling; inner.appendChild(node); node = next; }
+    clip.appendChild(inner);
+    body.appendChild(clip);
+    sec.appendChild(body);
+  });
+}
+
+async function pickFolder() {
+  showStatus('siteStatus', true, 'Открываю диалог выбора папки...');
+  let data;
+  try {
+    const r = await fetch('/api/pick-folder', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+    data = await r.json();
+  } catch (e) {
+    showStatus('siteStatus', false, 'Не удалось открыть диалог: ' + e);
+    return;
+  }
+  if (!data.ok) { showStatus('siteStatus', false, data.error); return; }
+  document.getElementById('siteDir').value = data.path;
+  setSite();
+}
+
 function showStatus(id, ok, text) {
   const el = document.getElementById(id);
   el.style.display = 'block';
@@ -481,6 +604,10 @@ async function setSite() {
   const data = await r.json();
   showStatus('siteStatus', data.ok, data.ok ? ('OK: ' + data.site_dir) : data.error);
   if (data.ok) { await refreshStatus(); reloadPreview(); }
+}
+
+function setFontPreset(name) {
+  document.getElementById('fontFamily').value = name;
 }
 
 async function applyFont() {
@@ -804,6 +931,7 @@ async function runCleanup() {
   const body = {
     fonts: document.getElementById('cleanFonts').value.trim(),
     brand_text: document.getElementById('cleanBrand').value.trim(),
+    brand_old_name: document.getElementById('cleanBrandOld').value.trim(),
     logo_image: document.getElementById('cleanLogo').value.trim(),
     auto_logo: document.getElementById('cleanAutoLogo').checked,
     auto_logo_color: document.getElementById('cleanLogoColor').value.trim(),
@@ -889,6 +1017,66 @@ async function runCompressImages() {
   if (data.ok) reloadPreview();
 }
 
+async function runReplaceBrand() {
+  const old_name = document.getElementById('brandOld').value.trim();
+  const new_name = document.getElementById('brandNew').value.trim();
+  if (!old_name || !new_name) { showStatus('brandTextStatus', false, 'Укажи и старое, и новое имя'); return; }
+  showStatus('brandTextStatus', true, 'Меняю в тексте...');
+  const r = await fetch('/api/replace-brand-text', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({old_name, new_name})
+  });
+  const data = await r.json();
+  showStatus('brandTextStatus', data.ok, data.ok
+    ? `Заменено: в тексте ${data.text_replacements}, в атрибутах ${data.attr_replacements}`
+    : data.error);
+  if (data.ok) reloadPreview();
+}
+
+async function runStripTraces() {
+  const update_year = document.getElementById('tracesUpdateYear').checked;
+  showStatus('tracesStatus', true, 'Убираю следы владельца...');
+  const r = await fetch('/api/strip-owner-traces', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({update_year})
+  });
+  const data = await r.json();
+  showStatus('tracesStatus', data.ok, data.ok
+    ? `Удалено мет/блоков: ${data.removed.length}, обновлений года в ©: ${data.year_updates}` +
+      (data.removed.length ? '\n' + data.removed.join('\n') : '')
+    : data.error);
+  if (data.ok) reloadPreview();
+}
+
+async function runRevert() {
+  if (!confirm('Откатить index.html к последнему бэкапу? Текущее состояние сохранится в .pre-revert.')) return;
+  showStatus('revertStatus', true, 'Откатываю...');
+  const r = await fetch('/api/revert-backup', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+  const data = await r.json();
+  showStatus('revertStatus', data.ok, data.ok
+    ? `Восстановлено из ${data.restored_from}. Прежнее состояние сохранено в ${data.prev_saved_as}.`
+    : data.error);
+  if (data.ok) reloadPreview();
+}
+
+async function runFormat() {
+  const clean_unused = document.getElementById('fmtCleanUnused').checked;
+  if (!confirm('Форматировать папку? Удалятся бэкапы и папки _wayback_removed/_unused_removed целиком. Откат к бэкапу станет невозможен.')) return;
+  showStatus('fmtStatus', true, 'Форматирую папку...');
+  const r = await fetch('/api/format-dir', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({clean_unused})
+  });
+  const data = await r.json();
+  if (!data.ok) { showStatus('fmtStatus', false, data.error); return; }
+  const files = (data.removed_files || []).length;
+  const dirs = (data.removed_dirs || []);
+  let msg = `Готово. Удалено файлов: ${files}` + (dirs.length ? `, папок: ${dirs.join(', ')}` : '');
+  const details = [...(data.removed_files || []), ...dirs];
+  if (details.length) msg += '\n' + details.join('\n');
+  showStatus('fmtStatus', true, msg);
+}
+
 async function runCheckUrl() {
   const url = document.getElementById('checkUrl').value.trim();
   showStatus('checkStatus', true, 'Проверяю...');
@@ -900,6 +1088,7 @@ async function runCheckUrl() {
   showStatus('checkStatus', data.ok, data.ok ? data.report : data.error);
 }
 
+wrapSections();
 refreshStatus();
 </script>
 

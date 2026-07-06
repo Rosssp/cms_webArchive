@@ -662,3 +662,106 @@ def remove_asset_reference(html_path, needle):
     if not cleared:
         raise ValueError(f"'{needle}' не найден ни в HTML, ни в подключённых CSS-файлах")
     return cleared
+
+
+def replace_brand_text_everywhere(html_path, old_name, new_name):
+    """Standalone brand-name sweep for the studio: replace the old owner's name with the
+    new one EVERYWHERE it appears as a whole word - across every visible text node AND
+    the text-bearing attributes (alt/title/aria-label/placeholder/meta content/value) -
+    not just the logo element and <title> the way apply_brand_text does. Reuses the core
+    clean_wayback_site.replace_brand_in_text so the cleanup pass and this button share one
+    implementation."""
+    import clean_wayback_site as cw
+
+    old_name = (old_name or "").strip()
+    new_name = (new_name or "").strip()
+    if not old_name:
+        raise ValueError("укажи старое имя бренда (что заменить)")
+    if not new_name:
+        raise ValueError("укажи новое имя бренда")
+
+    soup = _read_soup(html_path)
+    result = cw.replace_brand_in_text(soup, old_name, new_name)
+    if result["text_replacements"] == 0 and result["attr_replacements"] == 0:
+        raise ValueError(f"'{old_name}' не встречается в тексте или атрибутах страницы")
+
+    _write_soup(html_path, soup)
+    return result
+
+
+def strip_owner_traces(html_path, update_year=True):
+    """Standalone owner-trace strip for the studio - delegates to the core
+    clean_wayback_site.strip_owner_traces so the cleanup pass and this button share one
+    implementation."""
+    import clean_wayback_site as cw
+
+    soup = _read_soup(html_path)
+    result = cw.strip_owner_traces(soup, update_year=update_year)
+    _write_soup(html_path, soup)
+    return result
+
+
+def revert_to_backup(html_path, which="auto"):
+    """Restore index.html from a backup. Two kinds exist: '.bak' (written by
+    clean_wayback_site before a full cleanup = the pre-cleanup original) and
+    '.studio-bak' (written before the first site_studio mutation this session). 'auto'
+    picks the most recently created one - i.e. the closest previous state, the natural
+    'undo last thing' target. The current file is snapshotted to '.pre-revert' first so
+    the revert itself is reversible. Only index.html is restored - moved assets and the
+    extracted CSS are not rolled back."""
+    candidates = {
+        "studio-bak": html_path.with_suffix(html_path.suffix + ".studio-bak"),
+        "bak": html_path.with_suffix(html_path.suffix + ".bak"),
+    }
+    existing = {k: p for k, p in candidates.items() if p.is_file()}
+    if not existing:
+        raise ValueError("бэкапов не найдено (.bak / .studio-bak рядом с index.html нет)")
+
+    if which in existing:
+        chosen_key = which
+    else:
+        chosen_key = max(existing, key=lambda k: existing[k].stat().st_mtime)
+    src = existing[chosen_key]
+
+    pre = html_path.with_suffix(html_path.suffix + ".pre-revert")
+    shutil.copyfile(html_path, pre)
+    shutil.copyfile(src, html_path)
+    return {"restored_from": src.name, "prev_saved_as": pre.name}
+
+
+_FORMAT_REMOVE_SUFFIXES = (".bak", ".studio-bak", ".pre-revert")
+_FORMAT_REMOVE_DIRS = ("_wayback_removed", "_unused_removed")
+
+
+def format_for_upload(html_path, clean_unused=True):
+    """Format the site folder in place so it's upload-ready - no zip, no copy, just the
+    live site left in the same directory. Deletes the backup files (.bak/.studio-bak/
+    .pre-revert), the leftover *.cleanup-report.txt, and the whole quarantine folders
+    (_wayback_removed/ and _unused_removed/) outright. With clean_unused=True the unused-
+    asset sweep runs first (moving orphans into _unused_removed) and then that folder is
+    deleted too - so unreferenced images end up gone for good, not just quarantined.
+    Destructive: after this, 'revert to backup' no longer has anything to restore from."""
+    site_dir = html_path.parent
+    result = {"removed_files": [], "removed_dirs": []}
+
+    if clean_unused:
+        try:
+            result["unused_swept"] = remove_unused_assets(html_path)
+        except Exception as e:  # noqa: BLE001 - formatting shouldn't die on a sweep hiccup
+            result["unused_swept_error"] = str(e)
+
+    for p in list(site_dir.rglob("*")):
+        if p.is_file() and (p.suffix.lower() in _FORMAT_REMOVE_SUFFIXES or p.name.endswith(".cleanup-report.txt")):
+            try:
+                p.unlink()
+                result["removed_files"].append(p.relative_to(site_dir).as_posix())
+            except OSError:
+                pass
+
+    for d in _FORMAT_REMOVE_DIRS:
+        dd = site_dir / d
+        if dd.is_dir():
+            shutil.rmtree(dd, ignore_errors=True)
+            result["removed_dirs"].append(d + "/")
+
+    return result

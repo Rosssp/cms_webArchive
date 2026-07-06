@@ -108,10 +108,12 @@ per-site if the default heuristics keep/drop the wrong thing.
 """
 
 import argparse
+import random
 import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -174,7 +176,12 @@ DATA_ATTR_KEEP_HINTS = (
 
 WAYBACK_TOOLBAR_CSS_NAMES = {"banner-styles.css", "iconochive.css"}
 
-DEFAULT_GOOGLE_FONTS = "Inter:wght@400;500;600;700"
+# Font handling: presets the cleanup picks a random one of, and the fixed set of
+# weights every font is linked at (kept to 3 - light/regular/bold covers a page's
+# hierarchy without bloating the Google Fonts request).
+FONT_WEIGHTS = "400;500;700"
+PRESET_FONTS = ("Jost", "Montserrat")
+DEFAULT_GOOGLE_FONTS = f"Jost:wght@{FONT_WEIGHTS}"
 
 # Standard .htaccess for every restored PBN site - gzip compression, serve
 # pre-gzipped .js.gz when available, correct headers/mime types for fonts and webp.
@@ -417,6 +424,9 @@ class Report:
         self.logo_candidates = []
         self.logo_replaced = 0
         self.brand_text_replaced = 0
+        self.brand_body_replacements = 0
+        self.removed_owner_traces = []
+        self.owner_trace_year_updates = 0
         self.favicon_present = False
         self.favicon_set = False
         self.favicon_auto_generated = False
@@ -527,6 +537,14 @@ class Report:
             lines.append(f"logo elements replaced with --logo-image: {self.logo_replaced}")
         if self.brand_text_replaced:
             lines.append(f"text-logo/title/meta elements replaced with --brand-text: {self.brand_text_replaced}")
+        if self.brand_body_replacements:
+            lines.append(f"old brand name swapped in body text/attrs (--brand-old): {self.brand_body_replacements}")
+        if self.removed_owner_traces:
+            lines.append(f"owner traces removed (verification/generator/GTM meta): {len(self.removed_owner_traces)}")
+            for t in self.removed_owner_traces:
+                lines.append(f"  - {t}")
+        if self.owner_trace_year_updates:
+            lines.append(f"© year bumped to current: {self.owner_trace_year_updates}")
         lines.append("")
         lines.append("--- flagged for manual review (not auto-removed) ---")
         if self.flagged_adult:
@@ -888,6 +906,33 @@ def normalize_font_family(family_param):
             name = name.title()
         parts.append(name + sep + rest)
     return ",".join(parts)
+
+
+def font_param_from_name(name):
+    """'Jost' -> 'Jost:wght@400;500;700' (the standard 3 weights). If the input already
+    carries ':wght@...' it's kept (just case-normalized); empty -> the default font."""
+    name = (name or "").strip()
+    if not name:
+        return DEFAULT_GOOGLE_FONTS
+    if ":" in name:
+        return normalize_font_family(name)
+    base = name.split(":")[0].strip()
+    return normalize_font_family(f"{base}:wght@{FONT_WEIGHTS}")
+
+
+def random_preset_font_param():
+    """A random preset font (Jost/Montserrat) at the standard weights - what the cleanup
+    pass drops in automatically so restored sites don't all share one typeface."""
+    return font_param_from_name(random.choice(PRESET_FONTS))
+
+
+def resolve_font_input(raw):
+    """UI helper: empty -> a random preset; a bare name ('Jost') -> that name at the 3
+    standard weights; an explicit 'Family:wght@...' -> kept as typed."""
+    raw = (raw or "").strip()
+    if not raw:
+        return random_preset_font_param()
+    return font_param_from_name(raw)
 
 
 def _primary_font_family(fonts_param):
@@ -1330,6 +1375,99 @@ def apply_brand_text(soup, brand_text, report):
             report.brand_text_replaced += 1
 
 
+BRAND_TEXT_ATTRS = ("alt", "title", "aria-label", "placeholder", "content", "value")
+BRAND_SKIP_PARENTS = {"script", "style"}
+
+
+def replace_brand_in_text(soup, old_name, new_name, report=None):
+    """Swap the old owner's brand name for the new one EVERYWHERE it appears as a whole
+    word - across every visible text node AND the text-bearing attributes
+    (alt/title/aria-label/placeholder/meta content/value). Unlike apply_brand_text
+    (which only overwrites the detected logo element, <title> and og/twitter title
+    meta), this reaches the running body text, headings, footer (©...), image alts and
+    so on - the places the old company name is actually scattered. Case-insensitive,
+    whole-word (so 'Sun' won't hit 'Sunday'); skips <script>/<style> bodies. Returns
+    {'text_replacements': int, 'attr_replacements': int}."""
+    old_name = (old_name or "").strip()
+    new_name = (new_name or "").strip()
+    if not old_name or not new_name:
+        return {"text_replacements": 0, "attr_replacements": 0}
+
+    pattern = re.compile(r"(?<!\w)" + re.escape(old_name) + r"(?!\w)", re.IGNORECASE)
+
+    text_hits = 0
+    for node in soup.find_all(string=True):
+        if node.parent is not None and node.parent.name in BRAND_SKIP_PARENTS:
+            continue
+        new_val, n = pattern.subn(new_name, str(node))
+        if n:
+            node.replace_with(new_val)
+            text_hits += n
+
+    attr_hits = 0
+    for tag in soup.find_all(True):
+        for attr in BRAND_TEXT_ATTRS:
+            val = tag.get(attr)
+            if isinstance(val, str) and val:
+                new_val, n = pattern.subn(new_name, val)
+                if n:
+                    tag[attr] = new_val
+                    attr_hits += n
+
+    if report is not None:
+        report.brand_body_replacements += text_hits + attr_hits
+    return {"text_replacements": text_hits, "attr_replacements": attr_hits}
+
+
+VERIFY_META_NAMES = {
+    "google-site-verification", "msvalidate.01", "yandex-verification",
+    "p:domain_verify", "norton-safeweb-site-verification", "alexaverifyid",
+    "facebook-domain-verification", "baidu-site-verification", "wot-verification",
+    "shopify-checkout-api-token", "csrf-token",
+}
+TRACE_META_NAMES = {"generator", "author", "copyright", "publisher"}
+VERIFY_META_PROPS = {"fb:app_id", "fb:admins", "fb:pages"}
+COPYRIGHT_YEAR_RE = re.compile(r"(©|copyright)\s*\d{4}(?:\s*[-–—]\s*\d{4})?", re.IGNORECASE)
+
+
+def strip_owner_traces(soup, update_year=True, report=None):
+    """Remove the previous owner's leftover fingerprints that the script-level cleanup
+    doesn't touch: search-console / social verification <meta> tags (google-site-
+    verification, yandex, bing msvalidate, fb domain verify, pinterest, ...),
+    fb:app_id/fb:admins, generator/author/copyright/publisher meta, and any GoogleTag-
+    Manager/Analytics <noscript> fallback still baked in. Optionally bumps a '© 20xx'
+    footer year to the current year. Returns the list of removed items."""
+    removed = []
+    for meta in list(soup.find_all("meta")):
+        name = (meta.get("name") or "").strip().lower()
+        prop = (meta.get("property") or "").strip().lower()
+        if name in VERIFY_META_NAMES or name in TRACE_META_NAMES or prop in VERIFY_META_PROPS:
+            removed.append(f'<meta {"property" if prop else "name"}="{prop or name}">')
+            meta.decompose()
+
+    for ns in list(soup.find_all("noscript")):
+        blob = str(ns)
+        if "googletagmanager.com" in blob or "google-analytics.com" in blob:
+            removed.append("<noscript> GTM/GA fallback")
+            ns.decompose()
+
+    year_updates = 0
+    if update_year:
+        current = str(datetime.now().year)
+        for node in soup.find_all(string=COPYRIGHT_YEAR_RE):
+            if node.parent is not None and node.parent.name in BRAND_SKIP_PARENTS:
+                continue
+            new_val, n = COPYRIGHT_YEAR_RE.subn(lambda m: f"{m.group(1)} {current}", str(node))
+            if n:
+                node.replace_with(new_val)
+                year_updates += n
+
+    if report is not None:
+        report.removed_owner_traces.extend(removed)
+        report.owner_trace_year_updates += year_updates
+    return {"removed": removed, "year_updates": year_updates}
+
+
 def _brand_name_from_domain(domain):
     """'best-coffee-shop.com' -> 'Best Coffee Shop'; 'mikatoronen.com' -> 'Mikatoronen'."""
     if not domain:
@@ -1593,10 +1731,13 @@ def ensure_favicon(soup, html_path, favicon_path, report, dry_run=False, brand_h
     report.favicon_auto_generated = True
 
 
-def ensure_local_seo_files(html_path, site_domain, report, dry_run=False):
+def ensure_local_seo_files(html_path, site_domain, report, dry_run=False, overwrite=False):
     """PBN checklist items 39/40: robots.txt and sitemap.xml must exist. Archivarix
     normally generates these; a plain wayback/browser export never does - so create
-    them ourselves if missing, rather than just flagging the gap."""
+    them ourselves if missing, rather than just flagging the gap. With overwrite=True
+    (the cleanup pass) they're (re)generated even if already present - both are
+    machine-generated, so replacing a stale one is safe and keeps them in sync with the
+    current domain/page set."""
     site_root = html_path.parent
     robots_path = site_root / "robots.txt"
     sitemap_path = site_root / "sitemap.xml"
@@ -1608,14 +1749,14 @@ def ensure_local_seo_files(html_path, site_domain, report, dry_run=False):
 
     domain = site_domain or "example.com"
 
-    if not report.robots_present:
+    if overwrite or not report.robots_present:
         robots_path.write_text(
             f"User-agent: *\nAllow: /\n\nSitemap: https://{domain}/sitemap.xml\n", encoding="utf-8"
         )
         report.robots_present = True
         report.robots_created = True
 
-    if not report.sitemap_present:
+    if overwrite or not report.sitemap_present:
         html_files = sorted(site_root.rglob("*.html"))
         urls = []
         for f in html_files:
@@ -1634,17 +1775,19 @@ def ensure_local_seo_files(html_path, site_domain, report, dry_run=False):
         report.sitemap_created = True
 
 
-def ensure_htaccess(html_path, report, dry_run=False):
+def ensure_htaccess(html_path, report, dry_run=False, overwrite=False):
     """Every restored PBN site gets the same standard .htaccess (gzip compression,
-    .js.gz serving, font/webp mime types) unless one is already present."""
+    .js.gz serving, font/webp mime types). Written unless one is already present, or
+    always (overwrite=True, the cleanup pass) - the block is a fixed standard, so
+    replacing a leftover export .htaccess with it is the intended behaviour."""
     site_root = html_path.parent
     htaccess_path = site_root / ".htaccess"
     report.htaccess_present = htaccess_path.is_file()
-    if report.htaccess_present or dry_run:
+    if dry_run or (report.htaccess_present and not overwrite):
         return
     htaccess_path.write_text(DEFAULT_HTACCESS, encoding="utf-8")
-    report.htaccess_present = True
     report.htaccess_created = True
+    report.htaccess_present = True
 
 
 def ensure_canonical(soup, html_path, site_domain, report, dry_run=False):
@@ -1752,6 +1895,7 @@ def clean_html_file(
     domain_override=None,
     auto_logo=False,
     auto_logo_color=None,
+    brand_old_name=None,
 ):
     original_text = read_text_safe(html_path)
     # A stray element between <html> and <head> (e.g. wayback/YUI's
@@ -1783,6 +1927,7 @@ def clean_html_file(
     clean_scripts(soup, report)
     clean_stylesheet_links(soup, report)
     strip_cms_meta_links(soup, report)
+    strip_owner_traces(soup, update_year=True, report=report)
     clean_head_styles(soup, report, html_path)
     promote_src(soup)
     add_lazy_loading(soup, report)
@@ -1808,10 +1953,16 @@ def clean_html_file(
             apply_logo_image(soup, html_path, logo_image, report, dry_run=dry_run)
         if brand_text:
             apply_brand_text(soup, brand_text, report)
+    # Sweep the OLD brand name out of the running body text/attrs too (headings, footer,
+    # alts, ...) - apply_brand_text above only touches the logo/title/social-meta spots.
+    if brand_old_name:
+        new_brand = effective_brand or brand_text
+        if new_brand:
+            replace_brand_in_text(soup, brand_old_name, new_brand, report)
     favicon_brand_hint = effective_brand or (site_domain.split(".")[0] if site_domain else None)
     ensure_favicon(soup, html_path, favicon, report, dry_run=dry_run, brand_hint=favicon_brand_hint)
-    ensure_local_seo_files(html_path, site_domain, report, dry_run=dry_run)
-    ensure_htaccess(html_path, report, dry_run=dry_run)
+    ensure_local_seo_files(html_path, site_domain, report, dry_run=dry_run, overwrite=True)
+    ensure_htaccess(html_path, report, dry_run=dry_run, overwrite=True)
     ensure_canonical(soup, html_path, site_domain, report, dry_run=dry_run)
     check_internal_link_targets(soup, html_path, report)
 
@@ -1899,6 +2050,12 @@ def main():
     parser.add_argument("--logo-image", help="Replace every detected logo image with this file")
     parser.add_argument("--brand-text", help="Replace every detected text-logo/title/meta with this string")
     parser.add_argument(
+        "--brand-old",
+        help="Old brand/company name to sweep out of the running body text and alt/title/aria "
+        "attributes as well (replaced with --brand-text). apply_brand_text only touches the "
+        "logo/title/social-meta; this reaches headings, footer (©...), image alts, etc.",
+    )
+    parser.add_argument(
         "--auto-logo",
         action="store_true",
         help=(
@@ -1966,6 +2123,7 @@ def main():
             domain_override=args.domain,
             auto_logo=args.auto_logo,
             auto_logo_color=args.auto_logo_color,
+            brand_old_name=args.brand_old,
         )
 
 
