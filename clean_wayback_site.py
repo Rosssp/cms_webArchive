@@ -264,7 +264,7 @@ RewriteCond %{REQUEST_FILENAME} !-d
 RewriteRule ^ / [R=301,L]
 
 # ----------------------------------------------------------
-# 5) Сжатие gzip (HTML, CSS, JS, шрифты и т.п.)
+# 5) Gzip compression (HTML, CSS, JS, fonts, etc.)
 # ----------------------------------------------------------
 <IfModule mod_deflate.c>
     # DeflateCompressionLevel 9
@@ -279,7 +279,7 @@ RewriteRule ^ / [R=301,L]
 </IfModule>
 
 # ----------------------------------------------------------
-# 6) Перезапись .js -> .js.gz, если доступно
+# 6) Rewrite .js -> .js.gz when available
 # ----------------------------------------------------------
 <IfModule mod_rewrite.c>
     RewriteEngine On
@@ -289,7 +289,7 @@ RewriteRule ^ / [R=301,L]
 </IfModule>
 
 # ----------------------------------------------------------
-# 7) Правильные заголовки для .js.gz
+# 7) Correct headers for .js.gz
 # ----------------------------------------------------------
 <IfModule mod_headers.c>
     <FilesMatch "\\.js\\.gz$">
@@ -299,7 +299,7 @@ RewriteRule ^ / [R=301,L]
 </IfModule>
 
 # ----------------------------------------------------------
-# 8) Добавляем типы шрифтов и webp
+# 8) Font and webp mime types
 # ----------------------------------------------------------
 AddType font/woff2 .woff2
 AddType font/woff .woff
@@ -2563,7 +2563,11 @@ def ensure_canonical(soup, html_path, site_domain, report, dry_run=False):
         rel = html_path.relative_to(site_root).as_posix()
     except ValueError:
         rel = html_path.name
-    loc = f"https://{site_domain}/" if rel == "index.html" else f"https://{site_domain}/{rel}"
+    if rel == "index.html":
+        loc = f"https://{site_domain}/"
+    else:
+        slug = rel[:-len(".html")] if rel.endswith(".html") else rel
+        loc = f"https://{site_domain}/{slug}"
 
     head = soup.find("head")
     if not head:
