@@ -159,7 +159,7 @@
   #preview-wrap { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #preview-bar {
     padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--border);
-    display: flex; gap: 12px; align-items: center;
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
   }
   #preview { flex: 1; border: none; background: #fff; }
   .path-pill {
@@ -167,6 +167,19 @@
     padding: 5px 11px; border-radius: var(--r); font-family: Consolas, monospace; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; max-width: 420px;
   }
+
+  #page-tabs {
+    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+  }
+  #page-tabs:empty { display: none; }
+  .page-tab {
+    width: auto; margin-top: 0; font-size: 11.5px; font-weight: 500; color: var(--text-dim);
+    background: var(--surface); border: 1px solid var(--border-strong); padding: 6px 12px;
+    border-radius: var(--r); cursor: pointer; text-transform: none; letter-spacing: normal;
+    transition: border-color .15s ease, color .15s ease, background .15s ease;
+  }
+  .page-tab:hover { border-color: var(--text); color: var(--text); }
+  .page-tab.active { background: var(--text); color: #fff; border-color: var(--text); }
 
   .picker-btn {
     background: transparent; color: var(--text-dim); border: 1px solid var(--border-strong);
@@ -254,31 +267,12 @@
       <span class="section-num">02</span>
       <div>
         <h2>Очистка</h2>
-        <div class="section-sub">Unwrap web.archive.org, снос тулбара/скриптов/меты, внешние ссылки и соцсети, случайный шрифт (Jost/Montserrat), data-*/on*, mailto/tel, favicon, следы владельца (метрики/verification/год ©), robots/sitemap/.htaccess (перезаписью), PBN-чеклист отчёт</div>
+        <div class="section-sub">Unwrap web.archive.org (и из HTML, и из любого подключённого CSS/JS/JSON/SVG-файла), снос тулбара/скриптов/меты, data-*/on*, mailto/tel, favicon, следы владельца (verification-меты/generator/год ©), robots/sitemap/.htaccess (перезаписью), внешние/соцсети ссылки остаются (только снимается web.archive.org-обёртка), шрифт - свой уже используемый на сайте (или случайный Jost/Montserrat, если не найден), картинки/шрифты/CSS-фоны восстанавливаются с web.archive.org, PBN-чеклист отчёт. Замена лого/бренда сюда не входит - смотри отдельные секции ниже</div>
       </div>
     </div>
 
-    <label>Шрифт для очистки (пусто = случайный)</label>
-    <input id="cleanFonts" placeholder="пусто — случайный Jost/Montserrat, или впиши название">
-
-    <label>Brand text (заменить логотип-текст/title)</label>
-    <input id="cleanBrand" placeholder="необязательно">
-
-    <label>Старое имя бренда (замена по всему тексту)</label>
-    <input id="cleanBrandOld" placeholder="необязательно - вычистит старое имя из заголовков/футера/alt на Brand text">
-
-    <label>Logo image (путь к файлу, заменить логотип)</label>
-    <input id="cleanLogo" placeholder="необязательно, игнорируется при авто-логотипе">
-
-    <div class="check"><input type="checkbox" id="cleanAutoLogo"><label for="cleanAutoLogo">Авто-логотип по домену - удалить картинку-лого, вписать своё имя по названию домена, размер шрифта сам подгонится под исходный слот</label></div>
-
-    <label>Цвет авто-логотипа</label>
-    <div class="row">
-      <div><button type="button" class="secondary" id="logoColorWhiteBtn" onclick="setLogoColorPreset('white')">⚪ Белый</button></div>
-      <div><button type="button" class="secondary" id="logoColorBlackBtn" onclick="setLogoColorPreset('black')">⚫ Чёрный</button></div>
-    </div>
-    <input id="cleanLogoColor" class="color-input" placeholder="или свой цвет: #ff6600 / rgb(255,102,0) - перебивает белый/чёрный">
-    <div class="hint">Пусто - цвет подберётся сам по названию. Кнопки выше просто вписывают white/black в поле - можно и стереть, и ввести любой hex/rgb руками.</div>
+    <label>Шрифт для очистки (пусто = взять с сайта / случайный)</label>
+    <input id="cleanFonts" placeholder="пусто — свой шрифт сайта или случайный Jost/Montserrat, или впиши название">
 
     <label>Favicon (путь к файлу)</label>
     <input id="cleanFavicon" placeholder="необязательно, иначе сгенерируется автоматически">
@@ -413,11 +407,20 @@
       <span class="section-num">08</span>
       <div>
         <h2>Убрать битый файл</h2>
-        <div class="section-sub">Красное в Network - вставь путь/URL файла, вычистит все ссылки на него из HTML и подключённых CSS</div>
+        <div class="section-sub">Красное в Network/Console - найти автоматически, вычистить ссылку вручную</div>
       </div>
     </div>
 
-    <label>Путь или URL файла</label>
+    <label>Найти / восстановить автоматически (грузит страницу в браузере, как DevTools)</label>
+    <div class="hint">Открывает страницу headless-браузером и собирает всё красное - failed-запросы, 4xx/5xx, CORS-ошибки шрифтов/картинок в консоли. Ничего не удаляет сама - только пытается восстановить (скачать реальный файл с web.archive.org и подключить локально); что не удалось восстановить - просто показывает списком, вычищай вручную полем ниже, если действительно не нужно.</div>
+    <div class="row">
+      <div><button type="button" class="secondary" onclick="runFindBroken()">Только найти</button></div>
+      <div><button type="button" class="secondary" onclick="runAutoCleanBroken()">Найти и восстановить</button></div>
+    </div>
+    <div id="brokenStatus" class="status" style="display:none"></div>
+
+    <label>Вручную</label>
+    <label class="hint" style="margin:0 0 6px">Путь или URL файла</label>
     <input id="assetRefPath" placeholder="картинка.jpg, index_files/foo.png или полный URL">
     <div class="hint">Ищет по точному совпадению, вхождению строки или просто имени файла - не обязательно вписывать целиком. Из подключённых CSS вырезает конкретное правило (background-image и т.п.), из HTML - src/srcset/href у &lt;img&gt;/&lt;source&gt;/&lt;link&gt;/&lt;script&gt; и инлайн background. Файл с диска не удаляет - если он локальный и стал не нужен, потом прогони «Очистить неиспользуемые картинки».</div>
     <button class="danger" onclick="runRemoveAssetReference()">Вычистить ссылки</button>
@@ -497,13 +500,64 @@
       <span class="section-num">13</span>
       <div>
         <h2>Форматировать папку</h2>
-        <div class="section-sub">Приводит саму папку к заливке: удаляет бэкапы и папки _wayback_removed / _unused_removed целиком. Без zip - чистит на месте</div>
+        <div class="section-sub">Приводит саму папку к заливке: удаляет бэкапы и папки _wayback_removed / _unused_removed целиком (ищет их по всему дереву, не только в корне), сплющивает *_recovered в родительскую папку. Без zip - чистит на месте</div>
       </div>
     </div>
     <div class="check"><input type="checkbox" id="fmtCleanUnused" checked><label for="fmtCleanUnused">Сначала вымести неиспользуемые картинки (удалятся насовсем)</label></div>
-    <div class="hint">Удаляет из папки: бэкапы (.bak/.studio-bak/.pre-revert), *.cleanup-report.txt и папки _wayback_removed/ и _unused_removed/ целиком. Ничего не архивирует - в папке остаётся только рабочий сайт. После этого «Откатить к бэкапу» уже не сработает.</div>
+    <div class="hint">Удаляет из папки: бэкапы (.bak/.studio-bak/.pre-revert), *.cleanup-report.txt и папки _wayback_removed/ и _unused_removed/ целиком (где бы они ни лежали). Папки *_recovered (реально скачанные картинки/шрифты) не удаляет, а сплющивает - переносит файлы в родительскую папку и переписывает ссылки в CSS/HTML, чтобы не оставалось служебных названий папок. Ничего не архивирует - в папке остаётся только рабочий сайт. После этого «Откатить к бэкапу» уже не сработает.</div>
     <button class="danger" onclick="runFormat()">Форматировать папку</button>
     <div id="fmtStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">14</span>
+      <div>
+        <h2>Ссылки меню/футера</h2>
+        <div class="section-sub">Автоматически привязывает битые (#) ссылки в &lt;header&gt;/&lt;nav&gt;/&lt;footer&gt; по всем страницам сайта разом - к реальным секциям страницы, переименовывая пункт меню под них</div>
+      </div>
+    </div>
+    <div class="hint">Логика от секций, а не от названия пункта меню (само название почти всегда ничего не значит - остаток потерянного JS-меню и т.п.): 1) если текст ссылки совпадает с именем загруженной страницы (Gallery → gallery.html, Home → всегда index.html) - линкует туда, текст не трогает; 2) иначе берёт СЛЕДУЮЩИЙ по порядку реальный заголовок (h1-h6) на этой же странице (не из хедера/футера), присваивает ему id если нет, ссылку ведёт туда - и переименовывает сам пункт меню под текст этого заголовка; 3) когда заголовки на странице закончились - остаток остаётся непривязанным и попадает в список, руками смотреть. Не трогает ссылки, которые уже куда-то ведут. Все ссылки относительные. Каждую изменённую страницу бэкапит (.studio-bak).</div>
+    <button class="danger" onclick="runAutoLinkMenu()">Привязать ссылки меню</button>
+    <div id="autoLinkStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">15</span>
+      <div>
+        <h2>ID секции (якорь)</h2>
+        <div class="section-sub">Кликни любой элемент на превью - подставит его текущий id (если есть), впиши новый и примени. Работает и для элементов без id (просто добавит), и для тех, у кого он уже есть (перезапишет)</div>
+      </div>
+    </div>
+    <label>Элемент</label>
+    <input id="idSelector" placeholder="кликни на превью или впиши CSS-селектор">
+    <button type="button" class="picker-btn" data-target="idSelector" onclick="togglePicker(this)"><span class="picker-btn-icon">◎</span><span class="picker-btn-text">Выбрать на превью</span></button>
+    <label>ID</label>
+    <input id="idValue" placeholder="напр. contact-us">
+    <div class="hint">Латиницей, цифрами и дефисами, без пробелов. Пригодится для ссылок из секции 14/16 (href="#этот-id") и для якорей меню вручную.</div>
+    <button onclick="runSetElementId()">Применить ID</button>
+    <div id="idStatus" class="status" style="display:none"></div>
+  </div>
+
+  <div class="section collapsed">
+    <div class="section-head" onclick="toggleSection(this)">
+      <span class="section-num">16</span>
+      <div>
+        <h2>Ссылка в хедере/футере</h2>
+        <div class="section-sub">Кликни ссылку меню на превью - подставит её текущие текст и href, отредактируй что нужно и примени</div>
+      </div>
+    </div>
+    <label>Ссылка</label>
+    <input id="linkSelector" placeholder="кликни на превью или впиши CSS-селектор">
+    <button type="button" class="picker-btn" data-target="linkSelector" onclick="togglePicker(this)"><span class="picker-btn-icon">◎</span><span class="picker-btn-text">Выбрать на превью</span></button>
+    <label>Текст ссылки</label>
+    <input id="linkText" placeholder="Contact Us">
+    <label>Href / якорь</label>
+    <input id="linkHref" placeholder="#contact-us или other.html">
+    <div class="hint">Можно поменять и то, и другое, и что-то одно - пустое поле оставит как было. Работает только с &lt;a&gt; - если кликнешь не по ссылке, будет ошибка.</div>
+    <button onclick="runSetNavLink()">Применить</button>
+    <div id="linkStatus" class="status" style="display:none"></div>
   </div>
 
 </div>
@@ -511,6 +565,7 @@
 <div id="preview-wrap">
   <div id="preview-bar">
     <button class="secondary" style="width:auto; margin-top:0;" onclick="reloadPreview()">↻ Обновить превью</button>
+    <div id="page-tabs"></div>
     <div id="pickerBanner" class="picker-banner"><span class="dot"></span>Кликни элемент на превью · Esc</div>
     <span class="path-pill" id="previewPath"></span>
   </div>
@@ -583,9 +638,37 @@ function showStatus(id, ok, text) {
   el.textContent = text;
 }
 
+let activePage = 'index.html';
+
 function reloadPreview() {
   const f = document.getElementById('preview');
-  f.src = '/preview/?_=' + Date.now();
+  f.src = '/preview/' + activePage + '?_=' + Date.now();
+}
+
+function renderPageTabs(pages, active) {
+  const wrap = document.getElementById('page-tabs');
+  wrap.innerHTML = '';
+  if (!pages || pages.length < 2) return;  // single page - no tabs needed
+  pages.forEach(p => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'page-tab' + (p === active ? ' active' : '');
+    btn.textContent = p;
+    btn.onclick = () => switchPage(p);
+    wrap.appendChild(btn);
+  });
+}
+
+async function switchPage(page) {
+  if (page === activePage) return;
+  const r = await fetch('/api/set-page', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({page})
+  });
+  const data = await r.json();
+  if (!data.ok) { showStatus('siteStatus', false, data.error); return; }
+  await refreshStatus();
+  reloadPreview();
 }
 
 async function refreshStatus() {
@@ -593,6 +676,8 @@ async function refreshStatus() {
   const data = await r.json();
   document.getElementById('siteDir').value = data.site_dir || '';
   document.getElementById('previewPath').textContent = data.site_dir ? data.site_dir : 'сайт не выбран';
+  activePage = data.active_page || 'index.html';
+  renderPageTabs(data.pages || [], activePage);
 }
 
 async function setSite() {
@@ -765,6 +850,12 @@ function pickerTargetFor(el) {
     const media = el.closest('img, svg, picture');
     if (media) return media.parentElement || media;
   }
+  // The link editor wants the <a> itself - clicking on an icon/span/text node
+  // nested inside the link (very common in nav markup) should still grab the <a>.
+  if (picker.targetInput && picker.targetInput.id === 'linkSelector') {
+    const link = el.closest('a');
+    if (link) return link;
+  }
   return el;
 }
 
@@ -849,11 +940,61 @@ function onPickerClick(e) {
   if (picker.targetInput) {
     picker.targetInput.value = cssPathFor(el);
     if (picker.targetInput.id === 'imgSelector') updateSelectorMatchInfo();
+    if (picker.targetInput.id === 'idSelector') fetchElementInfoInto(picker.targetInput.value, {id: 'idValue'});
+    if (picker.targetInput.id === 'linkSelector') fetchElementInfoInto(picker.targetInput.value, {text: 'linkText', href: 'linkHref'});
   }
   paintHighlight(el, '#7fe0a8', 'rgba(127,224,168,.22)');
   if (picker.tagEl) picker.tagEl.style.display = 'none';
   stopPickerListeners();
   setTimeout(() => { clearHighlight(el); }, 260);
+}
+
+// After picking for the id/link editors, pull the element's current id/text/href
+// from the server (via the just-picked selector) and pre-fill the edit fields, so
+// you're editing what's actually there instead of starting from a blank input.
+async function fetchElementInfoInto(selector, fieldMap) {
+  const r = await fetch('/api/element-info', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({selector})
+  });
+  const data = await r.json();
+  if (!data.ok) return;
+  if (fieldMap.id) document.getElementById(fieldMap.id).value = data.id || '';
+  if (fieldMap.text) document.getElementById(fieldMap.text).value = data.text || '';
+  if (fieldMap.href) document.getElementById(fieldMap.href).value = data.href || '';
+}
+
+async function runSetElementId() {
+  const selector = document.getElementById('idSelector').value.trim();
+  const id = document.getElementById('idValue').value.trim();
+  if (!selector) { showStatus('idStatus', false, 'Выбери элемент на превью или впиши селектор'); return; }
+  if (!id) { showStatus('idStatus', false, 'Впиши id'); return; }
+  const r = await fetch('/api/set-element-id', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({selector, id})
+  });
+  const data = await r.json();
+  showStatus('idStatus', data.ok, data.ok
+    ? (data.old_id ? `id изменён: "${data.old_id}" -> "${data.new_id}"` : `id добавлен: "${data.new_id}"`)
+    : data.error);
+  if (data.ok) reloadPreview();
+}
+
+async function runSetNavLink() {
+  const selector = document.getElementById('linkSelector').value.trim();
+  const text = document.getElementById('linkText').value.trim();
+  const href = document.getElementById('linkHref').value.trim();
+  if (!selector) { showStatus('linkStatus', false, 'Выбери ссылку на превью или впиши селектор'); return; }
+  if (!text && !href) { showStatus('linkStatus', false, 'Впиши новый текст и/или href'); return; }
+  const r = await fetch('/api/set-nav-link', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({selector, text: text || null, href: href || null})
+  });
+  const data = await r.json();
+  showStatus('linkStatus', data.ok, data.ok
+    ? `Готово: ${Object.entries(data).filter(([k]) => k !== 'ok').map(([k, v]) => `${k}="${v}"`).join(', ')}`
+    : data.error);
+  if (data.ok) reloadPreview();
 }
 
 function onPickerKey(e) {
@@ -923,18 +1064,9 @@ function stopPicker() {
   picker.targetInput = null;
 }
 
-function setLogoColorPreset(name) {
-  document.getElementById('cleanLogoColor').value = name;
-}
-
 async function runCleanup() {
   const body = {
     fonts: document.getElementById('cleanFonts').value.trim(),
-    brand_text: document.getElementById('cleanBrand').value.trim(),
-    brand_old_name: document.getElementById('cleanBrandOld').value.trim(),
-    logo_image: document.getElementById('cleanLogo').value.trim(),
-    auto_logo: document.getElementById('cleanAutoLogo').checked,
-    auto_logo_color: document.getElementById('cleanLogoColor').value.trim(),
     favicon: document.getElementById('cleanFavicon').value.trim(),
     domain: document.getElementById('cleanDomain').value.trim(),
     dry_run: document.getElementById('cleanDryRun').checked,
@@ -990,6 +1122,74 @@ async function runRemoveAssetReference() {
     ? `Вычищено:\n${data.cleared.join('\n')}`
     : data.error);
   if (data.ok) reloadPreview();
+}
+
+// Добавляет файл/ссылку в поле «Вручную» через запятую (без дублей).
+function addAssetRef(val) {
+  const input = document.getElementById('assetRefPath');
+  const parts = input.value.split(',').map(s => s.trim()).filter(Boolean);
+  if (!parts.includes(val)) parts.push(val);
+  input.value = parts.join(', ');
+  input.focus();
+}
+
+// Рисует статус-блок со списком битых файлов в виде кнопок: клик по кнопке
+// закидывает путь/ссылку в поле «Вручную» через запятую.
+function renderBrokenButtons(id, title, items, extraLines) {
+  const el = document.getElementById(id);
+  el.style.display = 'block';
+  el.className = 'status ok';
+  el.textContent = '';
+
+  const head = document.createElement('div');
+  head.textContent = title;
+  el.appendChild(head);
+
+  if (items.length) {
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:8px';
+    items.forEach(it => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'secondary';
+      b.style.cssText = 'width:auto;margin:0;padding:4px 10px';
+      b.textContent = it.label;
+      b.title = (it.reason || '') + ' - клик добавит в поле «Вручную» для вычистки';
+      b.onclick = () => addAssetRef(it.label);
+      wrap.appendChild(b);
+    });
+    el.appendChild(wrap);
+  }
+
+  if (extraLines && extraLines.length) {
+    const extra = document.createElement('div');
+    extra.style.cssText = 'margin-top:8px;white-space:pre-wrap';
+    extra.textContent = extraLines.join('\n');
+    el.appendChild(extra);
+  }
+}
+
+async function runFindBroken() {
+  showStatus('brokenStatus', true, 'Гружу страницу в браузере и смотрю Network/Console... (может занять до 30 сек)');
+  const r = await fetch('/api/find-broken-resources', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+  const data = await r.json();
+  if (!data.ok) { showStatus('brokenStatus', false, data.error); return; }
+  if (!data.found.length) { showStatus('brokenStatus', true, 'Красного не найдено.'); return; }
+  renderBrokenButtons('brokenStatus',
+    `Найдено ${data.found.length} (клик по файлу - добавить в поле «Вручную» для вычистки):`,
+    data.found.map(f => ({label: f.label || f.url, reason: f.reason})));
+}
+
+async function runAutoCleanBroken() {
+  showStatus('brokenStatus', true, 'Гружу страницу, ищу и восстанавливаю... (может занять минуту-две)');
+  const r = await fetch('/api/auto-clean-broken-resources', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+  const data = await r.json();
+  if (!data.ok) { showStatus('brokenStatus', false, data.error); return; }
+  if (!data.found) { showStatus('brokenStatus', true, 'Красного не найдено.'); return; }
+  const title = `Найдено: ${data.found}. Восстановлено: ${data.recovered.length}. Не удалось восстановить: ${data.not_recovered.length} (ничего не удалено - клик по файлу ниже добавит его в поле «Вручную»).`;
+  const items = (data.not_recovered_items || []).map(f => ({label: f.label, reason: f.reason}));
+  renderBrokenButtons('brokenStatus', title, items, data.recovered);
+  reloadPreview();
 }
 
 async function runRemoveUnusedAssets() {
@@ -1071,10 +1271,26 @@ async function runFormat() {
   if (!data.ok) { showStatus('fmtStatus', false, data.error); return; }
   const files = (data.removed_files || []).length;
   const dirs = (data.removed_dirs || []);
-  let msg = `Готово. Удалено файлов: ${files}` + (dirs.length ? `, папок: ${dirs.join(', ')}` : '');
-  const details = [...(data.removed_files || []), ...dirs];
+  const flattened = (data.flattened_recovered || []);
+  let msg = `Готово. Удалено файлов: ${files}` + (dirs.length ? `, папок: ${dirs.join(', ')}` : '')
+    + (flattened.length ? `, сплющено: ${flattened.join(', ')}` : '');
+  const details = [...(data.removed_files || []), ...dirs, ...flattened];
   if (details.length) msg += '\n' + details.join('\n');
   showStatus('fmtStatus', true, msg);
+}
+
+async function runAutoLinkMenu() {
+  if (!confirm('Привязать все битые ссылки в header/nav/footer по всем страницам сайта? Изменённые страницы будут забэкаплены (.studio-bak).')) return;
+  showStatus('autoLinkStatus', true, 'Привязываю ссылки по всем страницам...');
+  const r = await fetch('/api/auto-link-menu', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+  const data = await r.json();
+  if (!data.ok) { showStatus('autoLinkStatus', false, data.error); return; }
+  const linked = data.linked || [], relabeled = data.relabeled || [], unresolved = data.unresolved || [];
+  let msg = `Готово. На страницы: ${linked.length}. Переименовано под секции: ${relabeled.length}. Не привязано: ${unresolved.length}.`;
+  const details = [...linked, ...relabeled, ...unresolved];
+  if (details.length) msg += '\n' + details.join('\n');
+  showStatus('autoLinkStatus', true, msg);
+  reloadPreview();
 }
 
 async function runCheckUrl() {
@@ -1089,7 +1305,7 @@ async function runCheckUrl() {
 }
 
 wrapSections();
-refreshStatus();
+refreshStatus().then(reloadPreview);
 </script>
 
 </body>

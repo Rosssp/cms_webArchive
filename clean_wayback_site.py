@@ -137,6 +137,36 @@ FONT_SERVICE_DOMAINS = {
     "cloud.typography.com", "typekit.net",
 }
 
+# Font detection: generic CSS keywords and classic OS/browser default-stack names are
+# never "the site's font" - if that's all a page declares, there's nothing worth
+# keeping and the cleanup falls back to a random preset instead.
+GENERIC_FONT_KEYWORDS = {
+    "sans-serif", "serif", "monospace", "cursive", "fantasy", "system-ui",
+    "-apple-system", "blinkmacsystemfont", "ui-sans-serif", "ui-serif",
+    "ui-monospace", "ui-rounded", "emoji", "math", "fangsong",
+    "inherit", "initial", "unset", "revert",
+}
+SYSTEM_FONT_NAMES = {
+    "arial", "helvetica", "helvetica neue", "segoe ui", "tahoma", "verdana",
+    "times new roman", "times", "georgia", "courier new", "courier",
+    "trebuchet ms", "lucida sans unicode", "lucida grande", "impact",
+    "comic sans ms", "ms sans serif", "consolas", "monaco",
+}
+# Icon fonts (Bootstrap glyphicons, Font Awesome, Material Icons, ...) turn up in a
+# font-family: declaration same as a real webfont would, but aren't a body-text
+# typeface choice at all and don't exist on Google Fonts under that name - loading
+# "Glyphicons Halflings" from the css2 API 404s/gets ORB-blocked. Filtered by an
+# explicit name AND a substring hint (icon fonts overwhelmingly have "icon" in the
+# name somewhere) so unlisted ones are still caught.
+ICON_FONT_NAMES = {
+    "glyphicons halflings", "fontawesome", "font awesome", "font awesome 5 free",
+    "font awesome 5 brands", "font awesome 6 free", "font awesome 6 brands",
+    "ionicons", "material icons", "material icons outlined", "material symbols",
+    "icomoon", "simple-line-icons", "themify", "flaticon", "linearicons",
+    "et-line", "pe-icon-7-stroke", "elegant-icons", "et-icons",
+}
+ICON_FONT_HINTS = ("icon", "glyphicon", "awesome")
+
 SOCIAL_DOMAINS = {
     "facebook.com", "fb.com", "twitter.com", "x.com", "instagram.com",
     "youtube.com", "youtu.be", "pinterest.com", "pinterest.fi", "linkedin.com",
@@ -168,6 +198,18 @@ SCRIPT_KEEP_KEYWORDS = (
     "modal",
 )
 
+# jQuery/Bootstrap bundles are foundational UI libraries, not CMS/analytics cruft -
+# the generic "-min."/".min." entry in SCRIPT_DROP_KEYWORDS (aimed at minified
+# analytics bundles) would otherwise catch "bootstrap.min.js" too, and a plain
+# "jquery.js" has no drop/keep keyword at all so it fell through to "ambiguous" ->
+# dropped. Both are extremely common as the actual thing driving data-toggle=
+# "collapse" navbar burgers / dropdowns in old templates - dropping them silently
+# breaks the mobile menu. Matched by filename stem, so kept unconditionally.
+FOUNDATIONAL_JS_STEMS = {
+    "jquery", "jquery.min", "jquery.slim", "jquery.slim.min",
+    "bootstrap", "bootstrap.min", "bootstrap.bundle", "bootstrap.bundle.min",
+}
+
 DATA_ATTR_KEEP_HINTS = (
     "toggle", "target", "dismiss", "slide", "ride", "interval", "menu", "nav",
     "collapse", "tab", "accordion", "carousel", "swiper", "slick", "lightbox",
@@ -187,6 +229,40 @@ DEFAULT_GOOGLE_FONTS = f"Jost:wght@{FONT_WEIGHTS}"
 # pre-gzipped .js.gz when available, correct headers/mime types for fonts and webp.
 DEFAULT_HTACCESS = """RewriteEngine On
 RewriteBase /
+
+# Redirect www to non-www
+# RewriteCond %{HTTP_HOST} ^www\\.(.*)$ [NC]
+# RewriteRule ^(.*)$ https://%1/$1 [R=301,L]
+
+# Redirect non-www to www
+# RewriteCond %{HTTP_HOST} !^www\\. [NC]
+# RewriteRule ^(.*)$ https://www.%{HTTP_HOST}/$1 [R=301,L]
+
+# Clean URLs: /about -> about.html
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteCond %{REQUEST_FILENAME}\\.html -f
+RewriteRule ^(.*?)/?$ $1.html [L]
+
+# Remove .html from URL
+RewriteCond %{THE_REQUEST} \\s/+([^\\s]+?)\\.html[\\s?] [NC]
+RewriteRule ^ %1 [R=301,L]
+
+# Strip query string from /
+RewriteCond %{REQUEST_URI} ^/$
+RewriteCond %{QUERY_STRING} .+
+RewriteRule ^ https://%{HTTP_HOST}/? [R=301,L,NE]
+
+# Non-existent path with query string -> /
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteCond %{QUERY_STRING} .+
+RewriteRule ^ https://%{HTTP_HOST}/? [R=301,L,NE]
+
+# Non-existent path -> /
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ / [R=301,L]
+
 # ----------------------------------------------------------
 # 5) Сжатие gzip (HTML, CSS, JS, шрифты и т.п.)
 # ----------------------------------------------------------
@@ -230,6 +306,28 @@ AddType font/woff .woff
 AddType font/ttf .ttf
 AddType font/otf .otf
 AddType image/webp .webp
+
+# Block bots
+RewriteCond %{HTTP_USER_AGENT} SemrushBot
+RewriteRule (.*) - [F,L]
+RewriteCond %{HTTP_USER_AGENT} MJ12bot
+RewriteRule (.*) - [F,L]
+RewriteCond %{HTTP_USER_AGENT} Riddler
+RewriteRule (.*) - [F,L]
+RewriteCond %{HTTP_USER_AGENT} aiHitBot
+RewriteRule (.*) - [F,L]
+RewriteCond %{HTTP_USER_AGENT} trovitBot
+RewriteRule (.*) - [F,L]
+RewriteCond %{HTTP_USER_AGENT} Detectify
+RewriteRule (.*) - [F,L]
+RewriteCond %{HTTP_USER_AGENT} BLEXBot
+RewriteRule (.*) - [F,L]
+RewriteCond %{HTTP_USER_AGENT} LinkpadBot
+RewriteRule (.*) - [F,L]
+RewriteCond %{HTTP_USER_AGENT} dotbot
+RewriteRule (.*) - [F,L]
+RewriteCond %{HTTP_USER_AGENT} FlipboardProxy
+RewriteRule (.*) - [F,L]
 """
 
 _CHARSET_META_RE = re.compile(rb'charset\s*=\s*["\']?\s*([a-zA-Z0-9_-]+)', re.IGNORECASE)
@@ -283,9 +381,59 @@ def normalize_charset_meta(soup):
             meta["content"] = re.sub(r"charset=[^;]+", "charset=utf-8", content, flags=re.IGNORECASE)
 
 
-WAYBACK_PREFIX_RE = re.compile(r"(?:https?:)?//web\.archive\.org/web/\d{1,14}[a-zA-Z_]*/")
+WAYBACK_PREFIX_RE = re.compile(
+    r"(?:(?:https?:)?//web\.archive\.org)?/web/\d{1,14}[a-zA-Z_]*/(?=https?://|//)"
+)
 FONT_FAMILY_RE = re.compile(r"font-family\s*:\s*([^;{}]+)", re.IGNORECASE)
+# @import of an old font service - kept CSS text gets this stripped out (rather than
+# the whole block dropped, the way an @font-face hit does) since it's typically one
+# harmless standalone line pulling in a font we're about to replace anyway.
+FONT_IMPORT_RE = re.compile(
+    r"@import\s+(?:url\(\s*)?['\"]?(?:https?:)?//"
+    r"(?:fonts\.googleapis\.com|fonts\.gstatic\.com|use\.typekit\.net|p\.typekit\.net|"
+    r"fonts\.com|fast\.fonts\.net|cloud\.typography\.com)[^;]*;?",
+    re.IGNORECASE,
+)
 PRECLEAN_STRAY_TAG_RE = re.compile(r'<div id="yui3-css-stamp"[^>]*>\s*</div>', re.IGNORECASE)
+
+# The Wayback Machine appends its own notice + a "playback timings" debug block to
+# the END of every CSS/JS file it serves through the live player - "FILE ARCHIVED
+# ON... AND RETRIEVED FROM THE INTERNET ARCHIVE ON...", "JAVASCRIPT APPENDED BY
+# WAYBACK MACHINE, COPYRIGHT INTERNET ARCHIVE...", then a second block with
+# "playback timings (ms): capture_cache.get: ..." etc. Neither is part of the real
+# site - they're artifacts of viewing/saving THROUGH web.archive.org, and unlike a
+# URL wrapper they're not something unwayback() (which only touches URL text)
+# touches at all. Matched by the /* ... */ (or <!-- ... -->) block that CONTAINS the
+# distinctive phrase, not by exact wording, so minor formatting differences between
+# captures still get caught.
+#   BUG HISTORY: the first version of these used a plain ".*?" between the comment
+#   opener and the trigger phrase - `.` (even non-greedy, even with DOTALL) matches
+#   a literal "*/" as ordinary characters, so if the file had ANY earlier, unrelated
+#   /* ... */ comment before the wayback notice, the match spanned from THAT much
+#   earlier "/*" all the way to the wayback notice's closing "*/", deleting every
+#   real rule in between - gutted bootstrap.min.css/theme.css/etc down to a few
+#   bytes on a real site before this was caught. Fixed with "(?:(?!\*/).)*?" - "any
+#   character, as long as we're not standing at the start of */" - which keeps the
+#   match inside the ONE unbroken comment that actually contains the phrase.
+WAYBACK_ARCHIVE_NOTICE_RE = re.compile(
+    r"/\*(?:(?!\*/).)*?FILE ARCHIVED ON(?:(?!\*/).)*?\*/"
+    r"|<!--(?:(?!-->).)*?FILE ARCHIVED ON(?:(?!-->).)*?-->",
+    re.DOTALL | re.IGNORECASE,
+)
+WAYBACK_TIMINGS_COMMENT_RE = re.compile(
+    r"/\*(?:(?!\*/).)*?playback timings \(ms\):(?:(?!\*/).)*?\*/"
+    r"|<!--(?:(?!-->).)*?playback timings \(ms\):(?:(?!-->).)*?-->",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_wayback_appended_comments(text):
+    """Remove the Wayback-injected archive-notice and playback-timings comment
+    blocks (see WAYBACK_ARCHIVE_NOTICE_RE above) from arbitrary text - safe to run
+    on any file, a no-op if neither phrase is present."""
+    text = WAYBACK_ARCHIVE_NOTICE_RE.sub("", text)
+    text = WAYBACK_TIMINGS_COMMENT_RE.sub("", text)
+    return text
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 # Phone-ish text: a run of digits/spaces/dashes/parens/leading "+" (deliberately NOT
@@ -387,6 +535,16 @@ def matches_suffix(domain, domain_set):
     return any(domain == d or domain.endswith("." + d) for d in domain_set)
 
 
+def _bare_domain(domain):
+    """domain_of() always strips a leading 'www.' off any URL it looks at, but
+    site_domain (when it comes from the export folder's own name, e.g.
+    'www.example.com') often still has it - so a same-site 'www.example.com' link
+    compared against domain_of()'s bare 'example.com' output never matched anything
+    and got misclassified as external. Strip it here too before any such comparison."""
+    domain = (domain or "").lower()
+    return domain[4:] if domain.startswith("www.") else domain
+
+
 def looks_hashed(stem):
     compact = stem.replace("-", "").replace("_", "")
     return len(compact) >= 24 and compact.isalnum()
@@ -406,8 +564,8 @@ class Report:
         self.ambiguous_scripts_dropped = []
         self.removed_links_css = []
         self.removed_cms_meta = []
-        self.removed_a_external = []
-        self.removed_a_social = []
+        self.kept_a_external = []
+        self.kept_a_social = []
         self.kept_a_internal = 0
         self.font_families_found = set()
         self.moved_assets = []
@@ -467,11 +625,11 @@ class Report:
         for s in self.removed_cms_meta:
             lines.append(f"  - {s}")
         lines.append("")
-        lines.append(f"social <a> links removed: {len(self.removed_a_social)}")
-        for s in self.removed_a_social:
+        lines.append(f"social <a> links kept (wayback wrapper unwrapped only): {len(self.kept_a_social)}")
+        for s in self.kept_a_social:
             lines.append(f"  - {s}")
-        lines.append(f"other external <a> links removed: {len(self.removed_a_external)}")
-        for s in self.removed_a_external[:50]:
+        lines.append(f"other external <a> links kept (wayback wrapper unwrapped only): {len(self.kept_a_external)}")
+        for s in self.kept_a_external[:50]:
             lines.append(f"  - {s}")
         lines.append(f"internal <a> links kept (rewritten relative): {self.kept_a_internal}")
         lines.append("")
@@ -605,8 +763,6 @@ class Report:
     def verdict(self):
         """PBN-restoration-checklist-style BLOCKER/MEDIUM/MINOR verdict."""
         blockers = []
-        if self.removed_a_external or self.removed_a_social:
-            blockers.append("внешние ссылки/соцсети были на странице (уже вычищены - проверь визуально)")
         if self.removed_contact_links or self.redacted_emails or self.redacted_phones or self.redacted_addresses:
             blockers.append("контакты/адреса (телефон/email/физический адрес) были на странице (уже вычищены - проверь визуально)")
         if self.redacted_domain_mentions:
@@ -683,17 +839,32 @@ def get_site_domain(soup):
     return ""
 
 
+RECOVERY_FETCH_TIMEOUT = 10  # seconds - was 30; a page with many broken images turned
+# "try every candidate" into multi-minute hangs (N images x up to 2 attempts x 30s
+# worst case). Fails fast instead so a handful of genuinely-gone assets don't stall
+# the whole cleanup - a real download rarely needs anywhere near 10s anyway.
+
+
 def recover_missing_local_images(soup, html_path, report, dry_run=False):
     """PBN checklist item 9/10: no missing key images. Wayback/Archivarix exports very
     often reference local image files that were never actually saved (Squarespace's
     responsive srcset only captures some sizes). The wayback-archived absolute URL is
     still sitting in data-image/data-src/src at this point in the pipeline (must run
     BEFORE unwayback_all_attrs/clean_data_and_event_attrs strip it) - use it to
-    re-download the exact bytes that were live at capture time."""
+    re-download the exact bytes that were live at capture time. Downloads run
+    concurrently (a page can easily have 20-30 of these) and print progress as each
+    one finishes, since a page with several genuinely-unrecoverable images used to
+    make the whole cleanup look hung for minutes with zero feedback."""
     import urllib.error
     import urllib.request
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    cache = {}
+    def _fetch(url):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (image-recovery-bot)"})
+        with urllib.request.urlopen(req, timeout=RECOVERY_FETCH_TIMEOUT) as resp:
+            return resp.read()
+
+    jobs = []  # (tag_src_label, local_path, candidate_url)
     for tag in soup.find_all(["img", "source"]):
         src = tag.get("src") or tag.get("data-src")
         if not src or is_external(src):
@@ -717,20 +888,39 @@ def recover_missing_local_images(soup, html_path, report, dry_run=False):
         if dry_run:
             report.recovered_images.append(f"{src} (would fetch from {candidate})")
             continue
-        try:
-            if candidate not in cache:
-                req = urllib.request.Request(candidate, headers={"User-Agent": "Mozilla/5.0 (image-recovery-bot)"})
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    cache[candidate] = resp.read()
-            data = cache[candidate]
-            if not _looks_like_image_bytes(data):
-                report.failed_image_recovery.append(f"{src}: downloaded content isn't a valid image (got {candidate})")
-                continue
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            local_path.write_bytes(data)
-            report.recovered_images.append(src)
-        except (urllib.error.URLError, OSError) as e:
-            report.failed_image_recovery.append(f"{src}: {e}")
+        jobs.append((src, local_path, candidate))
+
+    if not jobs:
+        return
+
+    unique_candidates = sorted({c for _, _, c in jobs})
+    print(f"[image-recovery] {len(jobs)} missing image(s), {len(unique_candidates)} unique URL(s) to fetch...")
+    results = {}  # candidate -> bytes or Exception
+    done_count = 0
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        future_to_candidate = {pool.submit(_fetch, c): c for c in unique_candidates}
+        for future in as_completed(future_to_candidate):
+            candidate = future_to_candidate[future]
+            done_count += 1
+            try:
+                results[candidate] = future.result()
+                print(f"[image-recovery] {done_count}/{len(unique_candidates)} ok: {candidate}")
+            except (urllib.error.URLError, OSError, Exception) as e:  # noqa: BLE001
+                results[candidate] = e
+                print(f"[image-recovery] {done_count}/{len(unique_candidates)} FAILED: {candidate} ({e})")
+
+    for src, local_path, candidate in jobs:
+        outcome = results[candidate]
+        if isinstance(outcome, Exception):
+            report.failed_image_recovery.append(f"{src}: {outcome}")
+            continue
+        data = outcome
+        if not _looks_like_image_bytes(data):
+            report.failed_image_recovery.append(f"{src}: downloaded content isn't a valid image (got {candidate})")
+            continue
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(data)
+        report.recovered_images.append(src)
 
 
 def _looks_like_image_bytes(data):
@@ -762,6 +952,8 @@ def classify_script(tag):
         return "drop"
     if is_external(src) and domain_of(src) not in LIBRARY_DOMAINS:
         return "drop"
+    if src and Path(urlsplit(src).path).stem.lower() in FOUNDATIONAL_JS_STEMS:
+        return "keep"
     if any(k in combined for k in SCRIPT_DROP_KEYWORDS):
         return "drop"
     if any(k in combined for k in SCRIPT_KEEP_KEYWORDS):
@@ -865,12 +1057,22 @@ def strip_url_meta_tags(soup, report):
 
 
 def clean_head_styles(soup, report, html_path):
+    """Extract the site's OWN surviving inline <head><style> blocks into a standalone
+    -custom.css. Must skip any <style> this tool injected itself (data-site-studio-
+    font/-img) - those are regenerated fresh by their own step later in THIS SAME
+    run, so sweeping them up here on a repeat cleanup pass would (a) overwrite
+    -custom.css with just that leftover marker content, permanently losing whatever
+    real site CSS was extracted from it the first time, and (b) still get a fresh
+    copy re-added by inject_google_fonts/inject_image_object_fit_style right after -
+    net result, real layout CSS silently destroyed on every re-run past the first."""
     head = soup.find("head")
     if not head:
         return
     kept_css_chunks = []
     for style_tag in head.find_all("style"):
-        css_text = unwayback(style_tag.get_text())
+        if style_tag.get("data-site-studio-font") or style_tag.get("data-site-studio-img"):
+            continue
+        css_text = FONT_IMPORT_RE.sub("", unwayback(style_tag.get_text()))
         for m in FONT_FAMILY_RE.finditer(css_text):
             report.font_families_found.add(m.group(1).strip().strip('"\''))
         if "@font-face" in css_text or "use.typekit.net" in css_text:
@@ -887,8 +1089,11 @@ def clean_head_styles(soup, report, html_path):
         css_path = html_path.with_name(f"{html_path.stem}-custom.css")
         css_path.write_text("\n\n".join(kept_css_chunks), encoding="utf-8")
         report.custom_css_written = css_path.name
-        link_tag = soup.new_tag("link", rel="stylesheet", type="text/css", href=css_path.name)
-        head.append(link_tag)
+        # A repeat run with fresh content to extract shouldn't pile up a second
+        # <link> alongside the one a prior run already added for the same file.
+        if not head.find("link", href=css_path.name):
+            link_tag = soup.new_tag("link", rel="stylesheet", type="text/css", href=css_path.name)
+            head.append(link_tag)
 
 
 def normalize_font_family(family_param):
@@ -926,13 +1131,86 @@ def random_preset_font_param():
     return font_param_from_name(random.choice(PRESET_FONTS))
 
 
-def resolve_font_input(raw):
-    """UI helper: empty -> a random preset; a bare name ('Jost') -> that name at the 3
+def _local_stylesheet_paths(soup, html_path):
+    paths = []
+    for link in soup.find_all("link", rel=lambda v: v and "stylesheet" in v):
+        href = link.get("href", "")
+        if not href or is_external(href):
+            continue
+        css_path = (html_path.parent / href).resolve()
+        if css_path.is_file() and css_path.suffix.lower() == ".css":
+            paths.append(css_path)
+    return paths
+
+
+def _collect_font_family_tokens(css_text, out):
+    for m in FONT_FAMILY_RE.finditer(css_text):
+        first = m.group(1).split(",")[0].strip().strip("'\"")
+        if first:
+            out.append(first)
+
+
+def detect_site_font(soup, html_path):
+    """Look at the page's OWN css (surviving inline <head><style> blocks, plus every
+    locally linked stylesheet - the theme's main CSS is almost always there, not just
+    in <head>) for a font-family it already declares, so the cleanup keeps whatever
+    typeface the site actually shipped with instead of dropping in an unrelated random
+    preset. Only the first (non-fallback) name of each declaration is considered, and
+    generic CSS keywords / classic OS-default stack fonts (Arial, Helvetica, Segoe UI,
+    ...) are skipped - those aren't a deliberate brand choice, so if that's all a page
+    has this returns None and the caller should fall back to a random preset."""
+    tokens = []
+    head = soup.find("head")
+    if head:
+        for style_tag in head.find_all("style"):
+            _collect_font_family_tokens(unwayback(style_tag.get_text()), tokens)
+    for css_path in _local_stylesheet_paths(soup, html_path):
+        _collect_font_family_tokens(read_text_safe(css_path), tokens)
+
+    for name in tokens:
+        key = name.lower()
+        if key in GENERIC_FONT_KEYWORDS or key in SYSTEM_FONT_NAMES or key in ICON_FONT_NAMES:
+            continue
+        if any(hint in key for hint in ICON_FONT_HINTS):
+            continue
+        # A blocklist can't enumerate every OS-default/icon-font name a theme might
+        # use - ask Google Fonts itself whether this family actually exists there
+        # before committing to it (avoids repeating the Glyphicons/Menlo mistake for
+        # whatever the next unlisted one turns out to be).
+        if _google_font_exists(name):
+            return font_param_from_name(name)
+    return None
+
+
+def _google_font_exists(name):
+    """True if Google Fonts' css2 API actually serves this family - a made-up/system/
+    icon-font name 400s or comes back without any @font-face rule."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    try:
+        url = f"https://fonts.googleapis.com/css2?family={urllib.parse.quote(name)}&display=swap"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200 and b"@font-face" in resp.read(500)
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def resolve_font_input(raw, soup=None, html_path=None):
+    """UI/CLI helper: empty -> try to detect a font already used on the page (needs
+    soup+html_path; falls back to a random preset if nothing usable is found, or if
+    no soup/html_path was given at all); a bare name ('Jost') -> that name at the 3
     standard weights; an explicit 'Family:wght@...' -> kept as typed."""
     raw = (raw or "").strip()
-    if not raw:
-        return random_preset_font_param()
-    return font_param_from_name(raw)
+    if raw:
+        return font_param_from_name(raw)
+    if soup is not None and html_path is not None:
+        detected = detect_site_font(soup, html_path)
+        if detected:
+            return detected
+    return random_preset_font_param()
 
 
 def _primary_font_family(fonts_param):
@@ -942,7 +1220,62 @@ def _primary_font_family(fonts_param):
     return first.split(":")[0].strip()
 
 
-def inject_google_fonts(soup, fonts_param):
+_FONT_FACE_URL_RE = re.compile(r"url\(([^)]+)\)\s*format\(\s*['\"]?([\w-]+)['\"]?\s*\)", re.IGNORECASE)
+_FONT_FORMAT_EXTS = {"woff2": ".woff2", "woff": ".woff", "truetype": ".ttf", "opentype": ".otf"}
+
+
+def _fetch_google_font_css(fonts_param):
+    """Fetch the Google Fonts css2 API response for `fonts_param` with a modern-
+    desktop-browser User-Agent, so it serves woff2 (the smallest/most broadly
+    supported format) rather than a legacy fallback."""
+    import urllib.request
+
+    families = "&".join(f"family={fam.strip()}" for fam in fonts_param.split(",") if fam.strip())
+    url = f"https://fonts.googleapis.com/css2?{families}&display=swap"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read().decode("utf-8")
+
+
+def download_google_font_locally(fonts_param, dest_dir, html_root):
+    """Download every font FILE the Google Fonts css2 API response for `fonts_param`
+    references - one per weight x unicode-range subset, e.g. Latin/Cyrillic/Greek
+    variants each get their own file - into `dest_dir`, and return the @font-face CSS
+    text with every url() rewritten to the local file's path (relative to
+    `html_root`, so it can be dropped straight into an inline <style> in the HTML
+    document). Fully self-hosted: once this returns, nothing at request time ever
+    touches fonts.googleapis.com/fonts.gstatic.com again. Raises on total failure
+    (network down, Google 4xx, ...) - the caller decides the fallback."""
+    css_text = _fetch_google_font_css(fonts_param)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    rel_dir = dest_dir.relative_to(html_root).as_posix()
+    primary_slug = re.sub(r"[^a-z0-9]+", "-", _primary_font_family(fonts_param).lower()).strip("-") or "font"
+    counter = 0
+
+    def _sub(m):
+        nonlocal counter
+        url = m.group(1).strip("'\" ")
+        fmt = m.group(2).lower()
+        ext = _FONT_FORMAT_EXTS.get(fmt, ".woff2")
+        data = _fetch_url_bytes(url)
+        fname = f"{primary_slug}-{counter}{ext}"
+        counter += 1
+        (dest_dir / fname).write_bytes(data)
+        return f"url('{rel_dir}/{fname}') format('{fmt}')"
+
+    new_css, n = _FONT_FACE_URL_RE.subn(_sub, css_text)
+    if n == 0:
+        raise ValueError("Google Fonts response had no @font-face url() to download")
+    return new_css
+
+
+def inject_google_fonts(soup, fonts_param, html_path=None):
     fonts_param = normalize_font_family(fonts_param)
     head = soup.find("head")
     if not head:
@@ -951,29 +1284,87 @@ def inject_google_fonts(soup, fonts_param):
     for tag in head.find_all(attrs={"data-site-studio-font": True}):
         tag.decompose()
 
-    preconnect1 = soup.new_tag("link", rel="preconnect", href="https://fonts.googleapis.com")
-    preconnect1["data-site-studio-font"] = "link"
-    preconnect2 = soup.new_tag("link", rel="preconnect", href="https://fonts.gstatic.com")
-    preconnect2["crossorigin"] = ""
-    preconnect2["data-site-studio-font"] = "link"
-    families = "&".join(f"family={fam.strip()}" for fam in fonts_param.split(",") if fam.strip())
-    font_link = soup.new_tag(
-        "link", rel="stylesheet", href=f"https://fonts.googleapis.com/css2?{families}&display=swap"
-    )
-    font_link["data-site-studio-font"] = "link"
-    head.append(preconnect1)
-    head.append(preconnect2)
-    head.append(font_link)
+    # Any OLD font connection still left in <head> - not just ones this tool added
+    # before - gets dropped too, so the page never ends up double-loading two font
+    # services at once (the original theme's own Google Fonts/Typekit/etc <link>,
+    # which clean_stylesheet_links leaves alone because fonts.googleapis.com/
+    # fonts.gstatic.com are "library" domains, plus any leftover preconnect hints).
+    # This also covers a LOCAL mirror - wayback often saves the Google Fonts CSS
+    # *response* itself as a local file (named just "css", no extension - the source
+    # URL is "fonts.googleapis.com/css?family=..." with no ".css" in the path) and
+    # rewrites the <link> to point at that local copy instead of the live URL, so a
+    # plain href substring check for "fonts.googleapis.com" never catches it.
+    for link in list(head.find_all("link")):
+        href = link.get("href") or ""
+        rel = link.get("rel") or []
+        rel = " ".join(rel) if isinstance(rel, list) else str(rel)
+        if not ("stylesheet" in rel or "preconnect" in rel or "dns-prefetch" in rel):
+            continue
+        is_font_host = any(
+            host in href.lower() for host in ("fonts.googleapis.com", "fonts.gstatic.com", *FONT_SERVICE_DOMAINS)
+        )
+        local_mirror_path = None
+        if not is_font_host and html_path is not None and href and not is_external(href):
+            local_path = (html_path.parent / href).resolve()
+            if local_path.is_file() and local_path.stat().st_size < UNWAYBACK_SWEEP_MAX_BYTES:
+                sniff = read_text_safe(local_path)[:2000]
+                is_font_host = "@font-face" in sniff and (
+                    "fonts.gstatic.com" in sniff or "fonts.googleapis.com" in sniff
+                )
+                if is_font_host:
+                    local_mirror_path = local_path
+        if is_font_host:
+            link.decompose()
+            if local_mirror_path is not None:
+                # Quarantine the mirror file right away instead of leaving it for the
+                # later "unused assets" text-search sweep to rediscover - a short,
+                # generic filename like the "css" a saved Google Fonts response gets
+                # saved as is too easy to false-positive-match as "still referenced"
+                # inside some unrelated comment/URL elsewhere on the page.
+                assets_dir = html_path.with_name(html_path.stem + "_files")
+                try:
+                    rel = local_mirror_path.relative_to(assets_dir)
+                    dest = assets_dir / "_wayback_removed" / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(local_mirror_path), str(dest))
+                except (ValueError, OSError):
+                    pass  # outside assets_dir, or a move hiccup - leave it for the later sweep
 
+    # Self-hosted, not CDN: download the actual font FILES from Google Fonts into the
+    # project and rewrite @font-face to local paths, instead of a live <link> to
+    # fonts.googleapis.com that hits Google on every single page load. Falls back to
+    # the live CDN link only if the download itself fails (offline, blocked, ...) or
+    # no html_path was given to know where to save files - some connection is better
+    # than the page silently rendering in a fallback font with no explanation.
+    primary = _primary_font_family(fonts_param)
+    local_css = None
+    if html_path is not None:
+        try:
+            dest_dir = html_path.with_name(html_path.stem + "_files") / "fonts"
+            local_css = download_google_font_locally(fonts_param, dest_dir, html_path.parent)
+        except Exception:
+            local_css = None
+
+    style_tag = soup.new_tag("style")
+    style_tag["data-site-studio-font"] = "local"
+    parts = []
+    if local_css:
+        parts.append(local_css.strip())
+    else:
+        families = "&".join(f"family={fam.strip()}" for fam in fonts_param.split(",") if fam.strip())
+        font_link = soup.new_tag(
+            "link", rel="stylesheet", href=f"https://fonts.googleapis.com/css2?{families}&display=swap"
+        )
+        font_link["data-site-studio-font"] = "link"
+        head.append(font_link)
     # Loading the font isn't enough - the site's own CSS still references whatever
     # font-family the original theme used, so nothing would actually render in the
     # new font without a global override.
-    primary = _primary_font_family(fonts_param)
     if primary:
-        force_style = soup.new_tag("style")
-        force_style["data-site-studio-font"] = "force"
-        force_style.string = f"* {{ font-family: '{primary}', sans-serif !important; }}"
-        head.append(force_style)
+        parts.append(f"* {{ font-family: '{primary}', sans-serif !important; }}")
+    if parts:
+        style_tag.string = "\n".join(parts)
+        head.append(style_tag)
 
 
 def inject_image_object_fit_style(soup):
@@ -999,6 +1390,40 @@ def clean_data_and_event_attrs(soup):
             if attr.startswith("data-"):
                 if not any(hint in attr for hint in DATA_ATTR_KEEP_HINTS):
                     del tag[attr]
+
+
+_EMPTY_STYLE_DECL_RE = re.compile(r"[a-zA-Z-]+\s*:\s*(?=;|$)")
+_STRAY_STYLE_SEMI_RE = re.compile(r";\s*;+")
+
+
+def strip_empty_style_declarations(soup):
+    """Various earlier passes (unwrapping a wayback URL out of an inline
+    background-image, remove_asset_reference, CSS asset recovery, ...) can leave a
+    style attribute with an empty declaration behind - 'background-color:;' if
+    something followed it, or 'height:' with nothing at all if it was the last one
+    (no trailing ';' to anchor on). Sweeps every style= attribute clean of these
+    regardless of which step produced them, dropping the attribute entirely if
+    nothing real is left."""
+    for tag in soup.find_all(style=True):
+        original = tag["style"]
+        new_val = _EMPTY_STYLE_DECL_RE.sub("", original)
+        new_val = _STRAY_STYLE_SEMI_RE.sub(";", new_val).strip().strip(";").strip()
+        if new_val:
+            if new_val != original:
+                tag["style"] = new_val
+        else:
+            del tag["style"]
+
+
+_EXCESS_BLANK_LINES_RE = re.compile(r"\n[ \t]*\n(?:[ \t]*\n)+")
+
+
+def collapse_blank_lines(text):
+    """Removing tags (decompose()) leaves their surrounding whitespace/newlines
+    behind - re-running cleanup on an already-cleaned file compounds this into
+    longer and longer runs of blank lines each pass. Collapse any run of 2+ blank
+    lines down to a single one."""
+    return _EXCESS_BLANK_LINES_RE.sub("\n\n", text)
 
 
 def promote_src(soup):
@@ -1027,6 +1452,10 @@ def unwayback_all_attrs(soup):
 
 
 def clean_links_a(soup, site_domain, report):
+    """Unwrap the wayback wrapper off every <a href> and rewrite same-domain links as
+    relative paths. External/social links are NOT deleted anymore - just unwaybacked
+    and left in place as-is (the site owner may want them kept); only mailto:/tel: are
+    still removed outright (that's contact-info stripping, a separate concern)."""
     for a in soup.find_all("a", href=True):
         raw_href = a["href"]
         href = unwayback(raw_href)
@@ -1039,20 +1468,16 @@ def clean_links_a(soup, site_domain, report):
             report.kept_a_internal += 1
             continue
         d = domain_of(href)
-        if site_domain and matches_suffix(d, {site_domain}):
+        if site_domain and matches_suffix(d, {_bare_domain(site_domain)}):
             a["href"] = to_relative(href, site_domain)
             report.kept_a_internal += 1
             continue
         if matches_suffix(d, SOCIAL_DOMAINS):
-            report.removed_a_social.append(href)
-            _remove_a_and_empty_parent(a)
-            continue
-        if d in LIBRARY_DOMAINS:
             a["href"] = href
-            report.kept_a_internal += 1
+            report.kept_a_social.append(href)
             continue
-        report.removed_a_external.append(href)
-        _remove_a_and_empty_parent(a)
+        a["href"] = href
+        report.kept_a_external.append(href)
 
 
 def _old_domain_mention_re(old_domain):
@@ -1164,6 +1589,22 @@ def move_orphaned_wayback_assets(html_path, cleaned_html_text, report):
             report.moved_assets.append(f.name)
 
 
+def _asset_name_referenced(name, haystack):
+    """A plain 'name in haystack' substring check false-positives hard on short/
+    generic filenames - a file literally called "css" (a saved Google Fonts CSS
+    response commonly ends up named just that, no extension) matches inside
+    "landing-page.css", "text/css", any font-family mentioning nothing at all, ...
+    i.e. it always "looks referenced" and never gets swept. Require it to appear as
+    its own path/filename token instead - not immediately preceded or followed by a
+    word/dot/hyphen character, which is what actually separates a real reference
+    ("/index_files/css\"") from a fragment inside an unrelated longer name."""
+    pattern = re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])")
+    return bool(pattern.search(haystack))
+
+
+_TYPE_ATTR_RE = re.compile(r"""type\s*=\s*(["'])[^"']*\1""", re.IGNORECASE)
+
+
 def remove_unused_local_assets(html_path, cleaned_html_text, report, dry_run=False, extra_texts=None):
     """Any file left in the assets folder that the final cleaned HTML - or any of its
     linked local stylesheets (extra_texts), e.g. a CSS background-image - no longer
@@ -1173,13 +1614,20 @@ def remove_unused_local_assets(html_path, cleaned_html_text, report, dry_run=Fal
     assets_dir = html_path.with_name(html_path.stem + "_files")
     if not assets_dir.is_dir():
         return
-    haystack = cleaned_html_text + "\n" + "\n".join(extra_texts or [])
+    # A mime type attribute value (type="text/css", type="text/javascript", ...) is
+    # not a path reference, but for a short/generic asset name (a saved Google Fonts
+    # response gets saved as literally "css", no extension) it reads as one to
+    # _asset_name_referenced's boundary check - "text/css" has "css" right after a
+    # non-word "/". Blank those out before matching so this whole class of
+    # short-name false positives (css/js/json/xml/svg all appear in MIME types too)
+    # can't keep an orphaned file "referenced" forever.
+    haystack = _TYPE_ATTR_RE.sub("", cleaned_html_text + "\n" + "\n".join(extra_texts or []))
     trash_dir = assets_dir / "_unused_removed"
     quarantine_dirs = (trash_dir, assets_dir / "_wayback_removed")
     for f in sorted(assets_dir.rglob("*")):
         if not f.is_file() or any(q in f.parents for q in quarantine_dirs):
             continue
-        if f.name in haystack:
+        if _asset_name_referenced(f.name, haystack):
             continue
         rel = f.relative_to(assets_dir)
         report.removed_unused_assets.append(str(rel))
@@ -1189,17 +1637,331 @@ def remove_unused_local_assets(html_path, cleaned_html_text, report, dry_run=Fal
             shutil.move(str(f), str(dest))
 
 
-def clean_local_css_files(html_path, soup):
-    for link in soup.find_all("link", rel=lambda v: v and "stylesheet" in v):
-        href = link.get("href", "")
-        if is_external(href):
+UNWAYBACK_SWEEP_EXTS = {".css", ".js", ".json", ".svg", ".xml", ".txt", ".webmanifest"}
+# Extension-only filtering misses e.g. a saved Google Fonts CSS response, which a
+# browser/crawler often names just "css" with no extension at all (the source URL is
+# "fonts.googleapis.com/css?family=..." - a query string, not a ".css" path). Skip
+# only the extensions that are DEFINITELY binary; sniff everything else by content.
+UNWAYBACK_SWEEP_SKIP_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tiff", ".tif",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp4", ".webm", ".mp3", ".wav", ".ogg", ".pdf", ".zip", ".gz", ".7z", ".rar",
+    ".swf", ".exe", ".dll",
+}
+UNWAYBACK_SWEEP_MAX_BYTES = 4_000_000
+CSS_CONTENT_SNIFF_RE = re.compile(r"^\s*@(?:font-face|import|charset|media)\b", re.IGNORECASE)
+
+
+def _looks_like_text_bytes(data):
+    if not data:
+        return True
+    if b"\x00" in data[:2048]:
+        return False
+    sample = data[:2048]
+    printable = sum(1 for b in sample if b in (9, 10, 13) or 32 <= b <= 126 or b >= 128)
+    return printable / len(sample) > 0.85
+
+
+def _looks_like_css(text, suffix):
+    return suffix == ".css" or bool(CSS_CONTENT_SNIFF_RE.match(text)) or ("{" in text and "url(" in text and "@font-face" in text)
+QUARANTINE_DIR_NAMES = {"_wayback_removed", "_unused_removed"}
+CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)", re.IGNORECASE)
+CSS_BG_RASTER_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+CSS_FONT_EXTS = {".woff", ".woff2", ".ttf", ".otf", ".eot"}
+CSS_SVG_EXTS = {".svg"}
+CSS_RECOVERABLE_EXTS = CSS_BG_RASTER_EXTS | CSS_FONT_EXTS | CSS_SVG_EXTS
+FONT_MAGIC_PREFIXES = (b"wOFF", b"wOF2", b"OTTO", b"true", b"\x00\x01\x00\x00")
+# Matches BOTH forms a wayback rewrite leaves behind: the absolute
+# "https://web.archive.org/web/<ts><flags>/<original-url>" and the root-relative
+# "/web/<ts><flags>/<original-url>" that CSS url() rewriting sometimes produces
+# (no domain - assumes the CSS is served from archive.org's own origin, which breaks
+# the moment it's exported to a static local file).
+WAYBACK_ASSET_URL_RE = re.compile(
+    r"^(?:(?:https?:)?//web\.archive\.org)?/web/(\d{1,14})[a-zA-Z_]*/(https?://.+)$"
+)
+
+
+def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT):
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (image-recovery-bot)"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _looks_like_valid_asset_bytes(data, ext=""):
+    """_looks_like_image_bytes only recognizes image magic bytes - fonts need their
+    own check, and anything else just needs to not obviously be an HTML error/
+    redirect page (wayback and dead domains alike tend to hand those back with a 200)."""
+    if not data or len(data) < 32:
+        return False
+    ext = (ext or "").lower()
+    if ext in CSS_BG_RASTER_EXTS:
+        return _looks_like_image_bytes(data)
+    if ext in CSS_FONT_EXTS:
+        return data[:4] in FONT_MAGIC_PREFIXES or data[:2] == b"\x00\x01"
+    if ext in CSS_SVG_EXTS:
+        head = data.lstrip()[:100].lower()
+        return head.startswith((b"<?xml", b"<svg"))
+    return not data.lstrip()[:15].lower().startswith((b"<!doctype", b"<html"))
+
+
+def _wayback_nearest_snapshot_url(original_url, timestamp):
+    """The exact timestamp embedded in a rewritten reference sometimes 404s (the page
+    around it was captured, this one asset wasn't, at that exact crawl) - ask the CDX
+    API for every capture of that exact original URL and pick the best one: nearest to
+    `timestamp` if one was given (a wayback-wrapped reference has one), else (a bare
+    reference back to the site's own domain has no timestamp to go by) the MOST
+    RECENT successful capture. Returns a raw-bytes ('id_') fetch URL, or None."""
+    import json
+    import urllib.parse
+
+    api = "https://web.archive.org/cdx/search/cdx?" + urllib.parse.urlencode(
+        {"url": original_url, "output": "json", "filter": "statuscode:200"}
+    )
+    try:
+        rows = json.loads(_fetch_url_bytes(api).decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if len(rows) < 2:
+        return None
+    header, entries = rows[0], rows[1:]
+    ts_i = header.index("timestamp")
+    if timestamp:
+        best = min(entries, key=lambda r: abs(int(r[ts_i]) - int(timestamp)))
+    else:
+        best = max(entries, key=lambda r: int(r[ts_i]))
+    return f"https://web.archive.org/web/{best[ts_i]}id_/{original_url}"
+
+
+def recover_asset_bytes(original_url, timestamp=None):
+    """Try to fetch the real bytes of `original_url` from the Wayback Machine - the
+    exact-timestamp raw fetch first if a timestamp hint is available, then the CDX
+    best-match snapshot of that same URL either way. Returns (bytes, ext) on success,
+    or (None, ext) if nothing could be recovered. Shared by the CSS asset recovery
+    below and the broken-resource auto-cleanup in site_edit.py."""
+    ext = Path(urlsplit(original_url).path).suffix.lower()
+    candidates = []
+    if timestamp:
+        candidates.append(f"https://web.archive.org/web/{timestamp}id_/{original_url}")
+    nearest = _wayback_nearest_snapshot_url(original_url, timestamp)
+    if nearest and nearest not in candidates:
+        candidates.append(nearest)
+    for candidate in candidates:
+        try:
+            data = _fetch_url_bytes(candidate)
+        except Exception:
             continue
-        css_path = (html_path.parent / href).resolve()
-        if css_path.is_file() and css_path.suffix == ".css":
-            text = read_text_safe(css_path)
-            new_text = unwayback(text)
-            if new_text != text:
-                css_path.write_text(new_text, encoding="utf-8")
+        if _looks_like_valid_asset_bytes(data, ext):
+            return data, ext
+    return None, ext
+
+
+def _css_asset_recovery_target(raw_url, site_domain):
+    """What to try recovering `raw_url` from, if anything: a wayback-wrapped
+    reference (any timestamp) - or a bare absolute reference straight back to the
+    site's OWN (now presumably abandoned) domain, no wrapper at all - a common shape
+    for vendor CSS bundles (Bootstrap's glyphicon @font-face etc.) whose relative
+    url() got resolved to an absolute one against the live site during capture,
+    without ever picking up the full /web/<ts>/ wrapper the rest of the page got.
+    Returns (timestamp_or_None, original_url), or None if raw_url is neither."""
+    m = WAYBACK_ASSET_URL_RE.match(raw_url)
+    if m:
+        return m.group(1), m.group(2)
+    if site_domain and is_external(raw_url) and matches_suffix(domain_of(raw_url), {_bare_domain(site_domain)}):
+        return None, raw_url
+    return None
+
+
+def _recover_css_asset(raw_url, css_path, report, site_domain):
+    """raw_url is a candidate asset reference found inside a local CSS file's
+    url(...) - PBN checklist item 9/10 territory, for CSS background-image AND
+    @font-face src (woff/woff2/ttf/otf/eot, plus the legacy .svg font format some
+    @font-face blocks still ship - Bootstrap's glyphicons among them) alike. A
+    '#fragment' on an .svg reference (selects a specific <glyph>/<font> element
+    inside the file) is stripped before fetching but re-attached to the final local
+    reference, since it's meaningless to the HTTP request but load-bearing for the
+    browser. On success, saves the recovered file next to the CSS file and returns
+    the new local relative path. On total failure: if this was merely a BARE
+    same-domain reference (no wayback wrapper at all - just an absolute URL back to
+    the site's own now-abandoned domain), it's downgraded to root-relative instead of
+    left as a hardcoded absolute URL (nothing "external" should survive, recoverable
+    or not); a wayback-wrapped reference falls back to the bare filename - a clearly-
+    broken local reference, but one site_studio's image-slot picker can still find
+    and fill in later (it needs SOME non-empty url() text to detect the slot at all -
+    a truly empty url() is invisible to it)."""
+    target = _css_asset_recovery_target(raw_url, site_domain)
+    if target is None:
+        return None  # not a recoverable reference - let the plain unwayback pass handle it
+    timestamp, original_url = target
+    fragment = ""
+    if "#" in original_url:
+        original_url, fragment = original_url.split("#", 1)
+        fragment = "#" + fragment
+    name = Path(urlsplit(original_url).path).name or "asset"
+    if Path(name).suffix.lower() not in CSS_RECOVERABLE_EXTS:
+        if timestamp is None:
+            # Bare same-domain absolute URL, not an asset type we know how to fetch -
+            # still shouldn't stay hardcoded-absolute. Downgrade to root-relative.
+            return to_relative(raw_url, site_domain)
+        return None  # a wayback-wrapped non-asset url - leave to the plain unwayback pass
+
+    print(f"[css-recovery] fetching {original_url} (referenced in {css_path.name})...")
+    data, _ext = recover_asset_bytes(original_url, timestamp)
+    if data is not None:
+        print(f"[css-recovery] ok: {original_url}")
+        assets_dir = css_path.parent / f"{css_path.stem}_recovered"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        dest = assets_dir / name
+        i = 1
+        while dest.exists() and dest.read_bytes() != data:
+            dest = assets_dir / f"{Path(name).stem}_{i}{Path(name).suffix}"
+            i += 1
+        if not dest.exists():
+            dest.write_bytes(data)
+        report.recovered_images.append(f"{original_url} -> {dest.relative_to(css_path.parent).as_posix()} (CSS {Path(name).suffix.lstrip('.')})")
+        return dest.relative_to(css_path.parent).as_posix() + fragment
+
+    print(f"[css-recovery] FAILED: {original_url}")
+    report.failed_image_recovery.append(f"{original_url}: could not recover from web.archive.org (CSS asset in {css_path.name})")
+    if timestamp is None:
+        return to_relative(raw_url, site_domain)
+    return name
+
+
+def clean_local_linked_files(html_path, report=None, site_domain=None):
+    """Strip every remaining web.archive.org time-travel wrapper out of EVERY local
+    text-based asset file next to the site - not just the HTML page and its <link
+    rel=stylesheet> CSS (that used to be all clean_local_css_files touched). A wayback
+    wrapper can end up embedded in a JS string, an SVG xlink:href, a JSON config
+    value, a sitemap.xml URL, etc. - files that are never parsed as HTML, so the DOM-
+    level unwayback passes never reach them. NOT gated on a fixed extension list - a
+    saved Google Fonts CSS response is commonly named just "css" with no extension at
+    all (the source URL is a query string, "fonts.googleapis.com/css?family=...", not
+    a ".css" path), so it would otherwise slip through untouched. Known-binary
+    extensions are skipped outright; everything else under 4MB is sniffed by content
+    (byte-level printable-ratio check) rather than trusted/distrusted by name. Also
+    strips any leftover @import of an old font service, and (if `report` is given)
+    tries to actually recover any CSS background-image/@font-face asset that's still
+    a wayback reference OR a bare reference back to `site_domain` - downloading the
+    real bytes and relinking to a local file, rather than just unwrapping down to a
+    dead/live-original-domain URL. Skips the quarantine folders (_wayback_removed/
+    _unused_removed) - dead files already, no point cleaning them. Returns the list
+    of files actually changed."""
+    site_root = html_path.parent
+    changed = []
+    for path in site_root.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in QUARANTINE_DIR_NAMES for part in path.parts):
+            continue
+        suffix = path.suffix.lower()
+        if suffix in UNWAYBACK_SWEEP_SKIP_EXTS:
+            continue
+        try:
+            if path.stat().st_size > UNWAYBACK_SWEEP_MAX_BYTES:
+                continue
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        if suffix not in UNWAYBACK_SWEEP_EXTS and not _looks_like_text_bytes(raw):
+            continue
+
+        text = read_text_safe(path)
+        working = text
+        is_css = _looks_like_css(text, suffix)
+        if is_css and report is not None:
+            def _sub_css_url(m):
+                quote, raw_url = m.group(1), m.group(2)
+                new_ref = _recover_css_asset(raw_url, path, report, site_domain)
+                if new_ref is None:
+                    return m.group(0)
+                q = quote or "'"
+                return f"url({q}{new_ref}{q})"
+
+            working = CSS_URL_RE.sub(_sub_css_url, working)
+        new_text = strip_wayback_appended_comments(unwayback(working))
+        if is_css:
+            new_text = FONT_IMPORT_RE.sub("", new_text)
+        if new_text != text:
+            path.write_text(new_text, encoding="utf-8")
+            changed.append(path.relative_to(site_root).as_posix())
+    return changed
+
+
+CORRUPTED_ASSET_MARKERS = (
+    "file archived on",
+    "retrieved from the",
+    "internet archive",
+    "wayback machine",
+    "__wm.init",
+    "petaboxloader",
+)
+
+
+def _looks_like_corrupted_wayback_asset(data):
+    """A local 'image' file whose actual bytes are the Wayback Machine's own HTML
+    interstitial/error/toolbar page, not real image data at all - happens when the
+    real resource request failed or got redirected during capture, and the crawler
+    saved wayback's own page under the asset's filename instead of a 404. Genuine
+    image bytes never contain readable English text this early in the file, so a
+    cheap decode-and-substring-search is enough to tell them apart."""
+    if not data or _looks_like_image_bytes(data):
+        return False
+    sample = data[:4000].decode("utf-8", "ignore").lower()
+    return any(marker in sample for marker in CORRUPTED_ASSET_MARKERS)
+
+
+def recover_corrupted_local_assets(html_path, report, site_domain=None):
+    """Sweep every local raster-image file anywhere under the site folder for the
+    wayback-html-masquerading-as-image problem (see _looks_like_corrupted_wayback_asset)
+    and try to recover the REAL file. Unlike the CSS-url() wayback-wrapper case, a
+    corrupted file carries no trace of its original URL anymore - so this guesses it
+    lived at "<site_domain>/<filename>", the flat-URL layout every other recovery in
+    this pipeline has consistently found for this kind of export, and asks the CDX
+    API for the closest real capture of that guess. Overwrites the corrupted file
+    in place on success (every existing local reference keeps working, nothing to
+    rewrite); quarantines it into "<its own folder>/_wayback_removed/" on failure,
+    so a broken reference is at least visibly broken instead of silently serving
+    fake HTML mislabeled as an image."""
+    if not site_domain:
+        return
+    site_root = html_path.parent
+    bare_domain = _bare_domain(site_domain)
+    for path in sorted(site_root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in CSS_BG_RASTER_EXTS:
+            continue
+        if any(part in QUARANTINE_DIR_NAMES for part in path.relative_to(site_root).parts):
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if not _looks_like_corrupted_wayback_asset(data):
+            continue
+
+        rel = path.relative_to(site_root).as_posix()
+        guess_url = f"http://{bare_domain}/{path.name}"
+        print(f"[corrupted-asset] {rel} looks like a wayback error page, not an image - trying {guess_url}")
+        new_data, _ext = recover_asset_bytes(guess_url)
+        if new_data is not None:
+            path.write_bytes(new_data)
+            report.recovered_images.append(f"{guess_url} -> {rel} (corrupted local file replaced with the real image)")
+            print(f"[corrupted-asset] recovered: {rel}")
+            continue
+
+        trash_dir = path.parent / "_wayback_removed"
+        dest = trash_dir / path.name
+        i = 1
+        while dest.exists():
+            dest = trash_dir / f"{path.stem}_{i}{path.suffix}"
+            i += 1
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(dest))
+        report.failed_image_recovery.append(
+            f"{rel}: was a wayback error page saved as a local image, could not recover the real file - quarantined"
+        )
+        print(f"[corrupted-asset] FAILED, quarantined: {rel}")
 
 
 def clean_iframes(soup, report):
@@ -1427,7 +2189,7 @@ VERIFY_META_NAMES = {
 }
 TRACE_META_NAMES = {"generator", "author", "copyright", "publisher"}
 VERIFY_META_PROPS = {"fb:app_id", "fb:admins", "fb:pages"}
-COPYRIGHT_YEAR_RE = re.compile(r"(©|copyright)\s*\d{4}(?:\s*[-–—]\s*\d{4})?", re.IGNORECASE)
+COPYRIGHT_YEAR_RE = re.compile(r"(©|copyright)(\s*[-–—]?\s*)\d{4}(?:\s*[-–—]\s*\d{4})?", re.IGNORECASE)
 
 
 def strip_owner_traces(soup, update_year=True, report=None):
@@ -1457,7 +2219,7 @@ def strip_owner_traces(soup, update_year=True, report=None):
         for node in soup.find_all(string=COPYRIGHT_YEAR_RE):
             if node.parent is not None and node.parent.name in BRAND_SKIP_PARENTS:
                 continue
-            new_val, n = COPYRIGHT_YEAR_RE.subn(lambda m: f"{m.group(1)} {current}", str(node))
+            new_val, n = COPYRIGHT_YEAR_RE.subn(lambda m: f"{m.group(1)}{m.group(2)}{current}", str(node))
             if n:
                 node.replace_with(new_val)
                 year_updates += n
@@ -1841,7 +2603,9 @@ def check_and_fix_redirect(soup, site_domain, report):
         m = re.search(r"url\s*=\s*([^;]+)", meta["content"], re.I)
         if m:
             target = unwayback(m.group(1).strip().strip("'\""))
-            if is_external(target) and not matches_suffix(domain_of(target), {site_domain} if site_domain else set()):
+            if is_external(target) and not matches_suffix(
+                domain_of(target), {_bare_domain(site_domain)} if site_domain else set()
+            ):
                 report.external_redirect_found = target
         meta.decompose()
 
@@ -1850,7 +2614,9 @@ def check_and_fix_redirect(soup, site_domain, report):
         m = JS_REDIRECT_RE.search(text)
         if m:
             target = unwayback(m.group(1))
-            if is_external(target) and not matches_suffix(domain_of(target), {site_domain} if site_domain else set()):
+            if is_external(target) and not matches_suffix(
+                domain_of(target), {_bare_domain(site_domain)} if site_domain else set()
+            ):
                 report.external_redirect_found = report.external_redirect_found or target
                 script.decompose()
 
@@ -1888,14 +2654,9 @@ def clean_html_file(
     dry_run,
     backup,
     keep_contact_info=False,
-    logo_image=None,
-    brand_text=None,
     favicon=None,
     recover_images=True,
     domain_override=None,
-    auto_logo=False,
-    auto_logo_color=None,
-    brand_old_name=None,
 ):
     original_text = read_text_safe(html_path)
     # A stray element between <html> and <head> (e.g. wayback/YUI's
@@ -1932,7 +2693,9 @@ def clean_html_file(
     promote_src(soup)
     add_lazy_loading(soup, report)
     clean_data_and_event_attrs(soup)
-    inject_google_fonts(soup, fonts_param)
+    # Empty fonts_param -> try to detect a font already used on this page (falls back
+    # to a random preset if the page only declares generic/system-default fonts).
+    inject_google_fonts(soup, resolve_font_input(fonts_param, soup=soup, html_path=html_path), html_path=html_path)
     inject_image_object_fit_style(soup)
     clean_links_a(soup, site_domain, report)
     if not keep_contact_info:
@@ -1940,33 +2703,15 @@ def clean_html_file(
     clean_iframes(soup, report)
     scan_content_flags(soup, report)
     detect_and_report_logo(soup, report)
-    effective_brand = brand_text
-    if auto_logo:
-        derived = apply_auto_logo(
-            soup, html_path, site_domain, report, brand_text=brand_text, dry_run=dry_run,
-            color=parse_color(auto_logo_color),
-        )
-        effective_brand = brand_text or derived or _brand_name_from_domain(site_domain) or "Site"
-        apply_brand_text(soup, effective_brand, report)
-    else:
-        if logo_image:
-            apply_logo_image(soup, html_path, logo_image, report, dry_run=dry_run)
-        if brand_text:
-            apply_brand_text(soup, brand_text, report)
-    # Sweep the OLD brand name out of the running body text/attrs too (headings, footer,
-    # alts, ...) - apply_brand_text above only touches the logo/title/social-meta spots.
-    if brand_old_name:
-        new_brand = effective_brand or brand_text
-        if new_brand:
-            replace_brand_in_text(soup, brand_old_name, new_brand, report)
-    favicon_brand_hint = effective_brand or (site_domain.split(".")[0] if site_domain else None)
+    favicon_brand_hint = _bare_domain(site_domain).split(".")[0] if site_domain else None
     ensure_favicon(soup, html_path, favicon, report, dry_run=dry_run, brand_hint=favicon_brand_hint)
     ensure_local_seo_files(html_path, site_domain, report, dry_run=dry_run, overwrite=True)
     ensure_htaccess(html_path, report, dry_run=dry_run, overwrite=True)
     ensure_canonical(soup, html_path, site_domain, report, dry_run=dry_run)
     check_internal_link_targets(soup, html_path, report)
+    strip_empty_style_declarations(soup)
 
-    new_text = str(soup)
+    new_text = collapse_blank_lines(str(soup))
 
     print(f"\n### {html_path} (site domain detected: {site_domain or 'unknown'}) ###")
     print(report.render())
@@ -1979,7 +2724,8 @@ def clean_html_file(
         html_path.with_suffix(html_path.suffix + ".bak").write_text(original_text, encoding="utf-8")
     html_path.write_text(new_text, encoding="utf-8")
 
-    clean_local_css_files(html_path, soup)
+    clean_local_linked_files(html_path, report=report, site_domain=site_domain)
+    recover_corrupted_local_assets(html_path, report, site_domain=site_domain)
     move_orphaned_wayback_assets(html_path, new_text, report)
     local_css_texts = []
     for link in soup.find_all("link", rel=lambda v: v and "stylesheet" in v):
@@ -2046,28 +2792,12 @@ def main():
     parser.add_argument(
         "target", nargs="?", help="Path to a site folder (recurses for *.html) or a single .html file"
     )
-    parser.add_argument("--fonts", default=DEFAULT_GOOGLE_FONTS, help="Google Fonts families to link in")
-    parser.add_argument("--logo-image", help="Replace every detected logo image with this file")
-    parser.add_argument("--brand-text", help="Replace every detected text-logo/title/meta with this string")
     parser.add_argument(
-        "--brand-old",
-        help="Old brand/company name to sweep out of the running body text and alt/title/aria "
-        "attributes as well (replaced with --brand-text). apply_brand_text only touches the "
-        "logo/title/social-meta; this reaches headings, footer (©...), image alts, etc.",
-    )
-    parser.add_argument(
-        "--auto-logo",
-        action="store_true",
-        help=(
-            "Don't ask for a logo file - remove the detected image logo and generate a text "
-            "wordmark instead, named after the domain (or --brand-text if given) and auto-sized "
-            "to fit the box the original logo occupied. Overrides --logo-image."
-        ),
-    )
-    parser.add_argument(
-        "--auto-logo-color",
-        help="Color for --auto-logo's wordmark: 'white', 'black', '#rrggbb', or 'r,g,b'. "
-        "Default is a deterministic color derived from the name.",
+        "--fonts",
+        default=None,
+        help="Google Fonts families to link in. Left unset, the cleanup tries to detect a font "
+        "already used on the page (its own <style>/linked CSS) and keep that; falls back to a "
+        "random Jost/Montserrat preset if nothing usable is found.",
     )
     parser.add_argument("--favicon", help="Copy this file in and set it as the favicon")
     parser.add_argument("--dry-run", action="store_true")
@@ -2116,14 +2846,9 @@ def main():
             args.dry_run,
             backup=not args.no_backup,
             keep_contact_info=args.keep_contact_info,
-            logo_image=args.logo_image,
-            brand_text=args.brand_text,
             favicon=args.favicon,
             recover_images=not args.no_image_recovery,
             domain_override=args.domain,
-            auto_logo=args.auto_logo,
-            auto_logo_color=args.auto_logo_color,
-            brand_old_name=args.brand_old,
         )
 
 

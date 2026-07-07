@@ -44,14 +44,40 @@ app = Flask(__name__)
 
 STATE = {"site_dir": None, "html_path": None}
 
+_PAGE_SKIP_DIR_NAMES = {"_wayback_removed", "_unused_removed", "node_modules"}
+
+
+def list_html_pages(site_dir):
+    """Every .html file in the site folder (recursive - a page can sit in a
+    subfolder, e.g. agb.html at the root next to an about/index.html), relative to
+    site_dir, index.html first if present, then alphabetically. Skips the
+    quarantine/tooling folders - never real pages."""
+    pages = []
+    for p in site_dir.rglob("*.html"):
+        if any(part in _PAGE_SKIP_DIR_NAMES for part in p.relative_to(site_dir).parts):
+            continue
+        pages.append(p.relative_to(site_dir).as_posix())
+    pages.sort(key=lambda rel: (rel != "index.html", rel.lower()))
+    return pages
+
 
 def set_site(site_dir_str):
     site_dir = Path(site_dir_str).resolve()
-    html_path = site_dir / "index.html"
-    if not html_path.is_file():
-        raise ValueError(f"no index.html found in {site_dir}")
+    pages = list_html_pages(site_dir)
+    if not pages:
+        raise ValueError(f"no .html files found in {site_dir}")
     STATE["site_dir"] = site_dir
-    STATE["html_path"] = html_path
+    STATE["html_path"] = site_dir / pages[0]
+
+
+def set_page(rel_path_str):
+    if not STATE["site_dir"]:
+        raise ValueError("select a site folder first")
+    site_dir = STATE["site_dir"]
+    candidate = (site_dir / rel_path_str).resolve()
+    if site_dir not in candidate.parents or not candidate.is_file() or candidate.suffix.lower() != ".html":
+        raise ValueError(f"'{rel_path_str}' is not an .html file inside the current site folder")
+    STATE["html_path"] = candidate
 
 
 @app.route("/")
@@ -61,7 +87,19 @@ def index():
 
 @app.route("/api/status")
 def api_status():
-    return jsonify({"site_dir": str(STATE["site_dir"]) if STATE["site_dir"] else None})
+    active_page = None
+    pages = []
+    if STATE["site_dir"]:
+        pages = list_html_pages(STATE["site_dir"])
+        if STATE["html_path"]:
+            active_page = STATE["html_path"].relative_to(STATE["site_dir"]).as_posix()
+    return jsonify(
+        {
+            "site_dir": str(STATE["site_dir"]) if STATE["site_dir"] else None,
+            "pages": pages,
+            "active_page": active_page,
+        }
+    )
 
 
 @app.route("/api/set-site", methods=["POST"])
@@ -69,6 +107,15 @@ def api_set_site():
     try:
         set_site(request.json["site_dir"])
         return jsonify({"ok": True, "site_dir": str(STATE["site_dir"])})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/set-page", methods=["POST"])
+def api_set_page():
+    try:
+        set_page((request.json or {}).get("page") or "")
+        return jsonify({"ok": True, "page": STATE["html_path"].relative_to(STATE["site_dir"]).as_posix()})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
@@ -203,6 +250,50 @@ def api_remove_elements():
         return jsonify({"ok": False, "error": str(e)}), 400
 
 
+@app.route("/api/element-info", methods=["POST"])
+def api_element_info():
+    if not STATE["html_path"]:
+        return jsonify({"ok": False, "error": "select a site folder first"}), 400
+    selector = ((request.json or {}).get("selector") or "").strip()
+    if not selector:
+        return jsonify({"ok": False, "error": "selector is required"}), 400
+    try:
+        info = site_edit.get_element_info(STATE["html_path"], selector)
+        return jsonify({"ok": True, **info})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/set-element-id", methods=["POST"])
+def api_set_element_id():
+    if not STATE["html_path"]:
+        return jsonify({"ok": False, "error": "select a site folder first"}), 400
+    body = request.json or {}
+    selector = (body.get("selector") or "").strip()
+    if not selector:
+        return jsonify({"ok": False, "error": "selector is required"}), 400
+    try:
+        result = site_edit.set_element_id(STATE["html_path"], selector, body.get("id"))
+        return jsonify({"ok": True, **result})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/set-nav-link", methods=["POST"])
+def api_set_nav_link():
+    if not STATE["html_path"]:
+        return jsonify({"ok": False, "error": "select a site folder first"}), 400
+    body = request.json or {}
+    selector = (body.get("selector") or "").strip()
+    if not selector:
+        return jsonify({"ok": False, "error": "selector is required"}), 400
+    try:
+        result = site_edit.set_nav_link(STATE["html_path"], selector, text=body.get("text"), href=body.get("href"))
+        return jsonify({"ok": True, **result})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
 @app.route("/api/remove-asset-reference", methods=["POST"])
 def api_remove_asset_reference():
     if not STATE["html_path"]:
@@ -214,6 +305,28 @@ def api_remove_asset_reference():
         cleared = site_edit.remove_asset_reference(STATE["html_path"], needle)
         return jsonify({"ok": True, "cleared": cleared})
     except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/find-broken-resources", methods=["POST"])
+def api_find_broken_resources():
+    if not STATE["html_path"]:
+        return jsonify({"ok": False, "error": "select a site folder first"}), 400
+    try:
+        found = site_edit.find_broken_resources(STATE["html_path"])
+        return jsonify({"ok": True, "found": found})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/auto-clean-broken-resources", methods=["POST"])
+def api_auto_clean_broken_resources():
+    if not STATE["html_path"]:
+        return jsonify({"ok": False, "error": "select a site folder first"}), 400
+    try:
+        result = site_edit.auto_clean_broken_resources(STATE["html_path"])
+        return jsonify({"ok": True, **result})
+    except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
 
@@ -254,10 +367,7 @@ def api_cleanup():
         return jsonify({"ok": False, "error": "select a site folder first"}), 400
     body = request.json or {}
 
-    logo_image = (body.get("logo_image") or "").strip() or None
     favicon = (body.get("favicon") or "").strip() or None
-    if logo_image and not Path(logo_image).is_file():
-        return jsonify({"ok": False, "error": f"logo image not found: {logo_image}"}), 400
     if favicon and not Path(favicon).is_file():
         return jsonify({"ok": False, "error": f"favicon file not found: {favicon}"}), 400
 
@@ -266,18 +376,13 @@ def api_cleanup():
         with contextlib.redirect_stdout(buf):
             clean_wayback_site.clean_html_file(
                 STATE["html_path"],
-                clean_wayback_site.resolve_font_input(body.get("fonts")),
+                (body.get("fonts") or "").strip() or None,
                 dry_run=bool(body.get("dry_run")),
                 backup=not body.get("no_backup"),
                 keep_contact_info=bool(body.get("keep_contact_info")),
-                logo_image=logo_image,
-                brand_text=(body.get("brand_text") or "").strip() or None,
                 favicon=favicon,
                 recover_images=not body.get("no_image_recovery"),
                 domain_override=(body.get("domain") or "").strip() or None,
-                auto_logo=bool(body.get("auto_logo")),
-                auto_logo_color=(body.get("auto_logo_color") or "").strip() or None,
-                brand_old_name=(body.get("brand_old_name") or "").strip() or None,
             )
     except Exception as e:
         return jsonify({"ok": False, "error": f"{e}\n\n{buf.getvalue()}"}), 400
@@ -384,6 +489,17 @@ def api_format_dir():
             STATE["html_path"],
             clean_unused=bool(body.get("clean_unused", True)),
         )
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/auto-link-menu", methods=["POST"])
+def api_auto_link_menu():
+    if not STATE["site_dir"]:
+        return jsonify({"ok": False, "error": "select a site folder first"}), 400
+    try:
+        result = site_edit.auto_link_menu(STATE["site_dir"])
         return jsonify({"ok": True, **result})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
