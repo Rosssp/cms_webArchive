@@ -1681,12 +1681,28 @@ WAYBACK_ASSET_URL_RE = re.compile(
 )
 
 
-def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT):
+RECOVERY_FETCH_RETRIES = 2  # web.archive.org routinely throttles / responds slowly when a
+# run recovers several assets back-to-back - a file that's genuinely present in the archive
+# (fetchable fine on its own) was being lost permanently to a single transient timeout, then
+# downgraded to a bare filename that loses the archive URL so it can't be re-recovered later.
+# Retry with a short backoff before giving up, so only genuinely-gone assets actually fail.
+
+
+def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH_RETRIES):
+    import time
     import urllib.request
 
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (image-recovery-bot)"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception as e:  # noqa: BLE001 - retry any transient network/HTTP failure
+            last_err = e
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_err
 
 
 def _looks_like_valid_asset_bytes(data, ext=""):
@@ -1792,7 +1808,21 @@ def _recover_css_asset(raw_url, css_path, report, site_domain):
     a truly empty url() is invisible to it)."""
     target = _css_asset_recovery_target(raw_url, site_domain)
     if target is None:
-        return None  # not a recoverable reference - let the plain unwayback pass handle it
+        # Bare relative reference the wayback/same-domain rules don't cover. If it points at
+        # a recoverable asset type that's genuinely MISSING locally - e.g. a background a
+        # previous run downgraded to a bare filename after a transient recovery failure, so
+        # the archive URL provenance is gone - and we know the site domain, guess
+        # "<domain>/<filename>" (the flat-URL layout these exports consistently use) and
+        # recover that. This is what lets a re-run pick up what a slow/throttled first pass
+        # dropped, instead of the reference staying permanently broken.
+        if site_domain and not is_external(raw_url) and not raw_url.startswith(("data:", "#")):
+            clean = raw_url.split("?")[0].split("#")[0].lstrip("/")
+            name0 = Path(clean).name
+            local = (css_path.parent / clean).resolve()
+            if name0 and Path(name0).suffix.lower() in CSS_RECOVERABLE_EXTS and not local.is_file():
+                target = (None, f"http://{_bare_domain(site_domain)}/{name0}")
+        if target is None:
+            return None  # not a recoverable reference - let the plain unwayback pass handle it
     timestamp, original_url = target
     fragment = ""
     if "#" in original_url:
