@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1044,12 +1045,20 @@ def flatten_recovered_assets(html_path):
 
 NAV_CONTAINER_TAGS = ("header", "nav", "footer")
 HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
-_NAV_UNRESOLVED_HREFS = {"#", "", "javascript:void(0)", "javascript:void(0);", "javascript:;"}
+_NAV_UNRESOLVED_HREFS = {"#", "", "/", "#!", "javascript:void(0)", "javascript:void(0);", "javascript:;"}
+_HEADER_MAX_LINKS = 4
+_NAV_CLASS_RE = re.compile(r"(?:^|[\s_-])(?:nav|navbar|menu|topnav|nav-links|main-menu|primary-menu|navigation|header)(?:[\s_-]|$)", re.I)
+_MOBILE_CLASS_RE = re.compile(r"(?:mobile|burger|hamburger|offcanvas|drawer)", re.I)
+_SOCIAL_CLASS_RE = re.compile(r"(?:social|share)", re.I)
+_LABEL_TRAILING_DROP = {"us", "now", "more", "info", "page", "here", "section"}
+_LABEL_STOPWORDS = {"the", "a", "an", "of", "to", "and", "or", "it", "in", "on", "for", "with", "your", "our", "my"}
 
 
 def _slug_words(text, max_words=None):
     text = (text or "").strip().lower().replace("’", "'")
-    words = re.findall(r"[a-z0-9]+", text)
+    # [^\W_] = unicode letters/digits (not just a-z) so matching works for ANY language -
+    # Cyrillic, Greek, etc. - not only Latin.
+    words = re.findall(r"[^\W_]+", text, re.UNICODE)
     if max_words:
         words = words[:max_words]
     return words
@@ -1068,136 +1077,289 @@ def _is_dropdown_toggle(a):
     return "dropdown-toggle" in classes or a.get("data-toggle") == "dropdown"
 
 
-def _collect_nav_links(soup):
-    """Every <a> inside <header>/<nav>/<footer> - the "menu items that almost always
-    lead nowhere in a wayback export" the user means, as opposed to a random <a> in
-    the middle of body content (which auto_link_menu should never touch) - except a
-    dropdown-toggle button, whose '#' is functional, not broken."""
-    seen, links = set(), []
-    for tag_name in NAV_CONTAINER_TAGS:
-        for container in soup.find_all(tag_name):
-            for a in container.find_all("a"):
-                if id(a) not in seen and not _is_dropdown_toggle(a):
-                    seen.add(id(a))
-                    links.append(a)
-    return links
+def _cls(tag):
+    c = tag.get("class")
+    return " ".join(c) if isinstance(c, list) else (c or "")
 
 
-def _page_sections(soup):
-    """Real content section headings (h1-h6) on the page, in document order -
-    excludes anything inside <header>/<nav>/<footer> itself (a nav label is not a
-    "section" to link other nav labels to). These are the ONLY valid link targets
-    for auto_link_menu's relabeling pass: real content that actually exists,
-    as opposed to whatever arbitrary label a lost JS-driven menu used to carry."""
-    nav_descendant_ids = set()
-    for tag_name in NAV_CONTAINER_TAGS:
-        for c in soup.find_all(tag_name):
-            nav_descendant_ids.update(id(x) for x in c.find_all(True))
+def _set_link_text(a, text):
+    for c in list(a.contents):
+        c.extract()
+    a.append(text)
+
+
+def _remove_nav_item(a):
+    """Remove a nav link, and its wrapping <li> if that leaves the <li> empty."""
+    li = a.find_parent("li")
+    a.decompose()
+    if li is not None and not li.get_text(strip=True) and not li.find(True):
+        li.decompose()
+
+
+def _nav_menu_links(container):
+    """The real menu <a> items in a nav container - skips dropdown toggles, social/share
+    links, and icon-only links (no visible text), which aren't page-section menu items."""
     out = []
-    for h in soup.find_all(HEADING_TAGS):
-        if id(h) in nav_descendant_ids:
+    for a in container.find_all("a"):
+        if _is_dropdown_toggle(a) or _SOCIAL_CLASS_RE.search(_cls(a)):
             continue
-        text = re.sub(r"\s+", " ", h.get_text(" ", strip=True)).strip()
-        words = _slug_words(text)
-        if not words or all(w.isdigit() for w in words):
-            # A bare number is a slide/carousel counter badge ("1", "2", "4"...),
-            # not a real section title - a menu item pointing at "4" would be nonsense.
+        if not a.get_text(strip=True):
             continue
-        out.append((h, text))
+        out.append(a)
     return out
 
 
+def _find_header_nav(soup):
+    """The site's primary top navigation: a <header>/<nav> if present, else the first
+    nav-classed <div>/<ul> holding 2+ menu links (many exports drop the semantic tag and use
+    <div class="navbar">). None if the page genuinely has no top menu (just a hero)."""
+    for tn in ("nav", "header"):
+        el = soup.find(tn)
+        if el and _nav_menu_links(el):
+            return el
+    for el in soup.find_all(["div", "ul"]):
+        if (_NAV_CLASS_RE.search(_cls(el)) and not _MOBILE_CLASS_RE.search(_cls(el))
+                and not el.find_parent("footer") and len(_nav_menu_links(el)) >= 2):
+            return el
+    return None
+
+
+def _find_mobile_navs(soup, exclude_ids):
+    """Duplicate/mobile nav containers (class hints mobile/burger/offcanvas/drawer) to mirror
+    the header's decisions into, so the mobile menu gets the same anchors and labels."""
+    out = []
+    for el in soup.find_all(["div", "ul", "nav"]):
+        if id(el) in exclude_ids:
+            continue
+        if _MOBILE_CLASS_RE.search(_cls(el)) and _nav_menu_links(el):
+            out.append(el)
+    return out
+
+
+def _looks_like_footer_nav(footer):
+    """True if the footer actually has a block of site-nav-style links (2+ text links that
+    aren't social icons) - if it's just a copyright line, we add nothing to it."""
+    links = [a for a in footer.find_all("a")
+             if a.get_text(strip=True) and not _SOCIAL_CLASS_RE.search(_cls(a))]
+    return len(links) >= 2
+
+
+def _content_sections(soup):
+    """Real content sections a nav item can point to - <section> blocks NOT inside a
+    header/nav/footer, each carrying a heading. Each entry knows its anchor element, heading
+    text and a set of match-keys (words from its heading, class, id and any .section-tag) so a
+    link can be matched to the right section by meaning (e.g. "About Us" -> .about-us), not
+    just document order."""
+    nav_desc = set()
+    for tn in NAV_CONTAINER_TAGS:
+        for c in soup.find_all(tn):
+            nav_desc.add(id(c))
+            nav_desc.update(id(x) for x in c.find_all(True))
+    out = []
+    for sec in soup.find_all("section"):
+        if id(sec) in nav_desc:
+            continue
+        if re.search(r"(?:^|[\s_-])(?:hero|banner|masthead|jumbotron)(?:[\s_-]|$)", _cls(sec), re.I):
+            continue  # the top hero/banner band isn't a content section to link a menu item to
+        # Title source, in order of how good a menu label it makes: the eyebrow/.section-tag
+        # (usually the cleanest short descriptor, e.g. "Our Services"), else the first heading
+        # (an h2, or - when the section has no heading of its own, just a card grid - the first
+        # card's h3), else a title made from the section's own class name.
+        tag_el = sec.find(class_=re.compile(r"section-tag|eyebrow|overline|subtitle|kicker|label", re.I))
+        tag_text = re.sub(r"\s+", " ", tag_el.get_text(" ", strip=True)).strip() if tag_el else ""
+        h = sec.find(HEADING_TAGS)
+        h_text = re.sub(r"\s+", " ", h.get_text(" ", strip=True)).strip() if h else ""
+        cls_words = [w for w in _slug_words(_cls(sec))
+                     if w not in ("section", "container", "wrapper", "row", "col", "content", "grid")]
+        title = tag_text or h_text or " ".join(w.capitalize() for w in cls_words[:3])
+        keys = (set(_slug_words(h_text)) | set(_slug_words(tag_text))
+                | set(cls_words) | set(_slug_words(sec.get("id") or "")))
+        out.append({"el": sec, "text": title, "keys": keys})
+    return out
+
+
+def _ensure_section_anchor(sec):
+    """Anchor id for a section: its existing id if present, else a fresh contextual slug (max
+    3 words, from the heading or the section class) added to the section element."""
+    if sec["el"].get("id"):
+        return sec["el"]["id"]
+    words = _slug_words(sec["text"])
+    while words and words[-1] in _LABEL_STOPWORDS:  # trim trailing filler for a clean anchor
+        words.pop()
+    slug = "-".join(words[:3])
+    if not slug:
+        slug = "-".join(_slug_words(_cls(sec))[:3])
+    if not slug:
+        slug = "section-" + str(abs(id(sec["el"])) % 10000)
+    sec["el"]["id"] = slug
+    return slug
+
+
+def _best_section(link_text, sections, used):
+    """The section a nav link should point to: the unused section whose match-keys overlap the
+    link text the most; zero-overlap falls back to the next unused section in order. None if
+    every section is already claimed."""
+    avail = [(i, s) for i, s in enumerate(sections) if id(s["el"]) not in used]
+    if not avail:
+        return None
+    lw = set(_slug_words(link_text))
+    best = max(avail, key=lambda it: (len(lw & it[1]["keys"]), -it[0]))
+    return best[1]
+
+
+def _short_label(text):
+    """A brief header-style label from a link's text: drop trailing filler ('Us', 'Now'...) and
+    stopwords, cap at 2 words. 'About Us' -> 'About', 'How It Works' -> 'How Works'."""
+    words = re.findall(r"[A-Za-z0-9]+", text or "")
+    while words and words[-1].lower() in _LABEL_TRAILING_DROP:
+        words.pop()
+    sig = [w for w in words if w.lower() not in _LABEL_STOPWORDS] or words
+    return " ".join(sig[:2]) if sig else (text or "").strip()
+
+
 def auto_link_menu(site_dir):
-    """Header/footer/nav <a> links in a wayback export overwhelmingly just point at
-    '#' - matching their OWN (often meaningless, sometimes lost-JS-menu) label
-    against page content almost never finds anything real. So this goes the other
-    way: (1) if the link's text happens to match an uploaded page's filename (e.g.
-    "Gallery" matches gallery.html, "Home" always falls back to index.html) - link
-    there, relative, keeping the label as-is, since that IS a real, correctly-named
-    target; (2) otherwise, claim the next unused real content section (h1-h6, in
-    document order, never one from inside a nav/header/footer itself) on the SAME
-    page - assign it an id if it doesn't have one, point the link there, and RENAME
-    the link's text to that section's actual heading text, since the menu item
-    should describe what it now points to, not the other way around; (3) once a
-    page runs out of sections, anything left just stays unresolved rather than
-    reusing/guessing - logged so it's obvious what still needs real content. Every
-    resulting href is relative - no hardcoded absolute URL, ever. Only touches
-    already-broken links (#, empty, javascript:void(0) and the like) - never
-    disturbs a link that already goes somewhere. Backs up every page it touches
-    (.studio-bak, same convention as every other studio edit). Returns a summary."""
+    """Deterministically wire up header/footer/mobile nav across every page (no AI):
+      - HEADER: keep at most 4 menu links (remove the rest); point each broken one (#, /,
+        javascript:void, empty) at the best-matching page section - matched by word overlap
+        between the link text and the section's heading/class/id/.section-tag, else the next
+        unused section; ensure that section has an anchor id (reuse an existing id, else add a
+        contextual <=3-word slug); give the link a SHORT label (About, How...).
+      - MOBILE nav (duplicate menu): mirror the header's href+label onto links with the same
+        original text, so the mobile menu matches.
+      - FOOTER: only if it actually holds a nav-style link block - attach its broken links to
+        sections the same way, but keep the FULLER label (footers aren't cramped).
+    Every href is relative/anchor - never an absolute URL. Only touches broken links; backs up
+    each edited page (.studio-bak). Returns a summary."""
     html_paths = sorted(site_dir.rglob("*.html"))
     if not html_paths:
-        return {"linked": [], "relabeled": [], "unresolved": []}
+        return {"linked": [], "relabeled": [], "removed": [], "unresolved": []}
 
-    soups = {}
-    page_index = []  # (words, rel_path)
-    for p in html_paths:
-        rel = p.relative_to(site_dir).as_posix()
-        soup = _read_soup(p)
-        soups[p] = soup
-        stem_words = _slug_words(re.sub(r"[_-]", " ", p.stem))
-        if stem_words:
-            page_index.append((stem_words, rel))
+    page_index = []
+    for pp in html_paths:
+        w = _slug_words(re.sub(r"[_-]", " ", pp.stem))
+        if w:
+            page_index.append((w, pp.relative_to(site_dir).as_posix()))
 
-    def _find_page_match(words):
+    def _page_match(words):
         for pw, rel in page_index:
             if pw == words:
                 return rel
+        if words == ["home"]:
+            return next((rel for _, rel in page_index if rel.lower() == "index.html"), None)
         return None
 
-    linked, relabeled, unresolved = [], [], []
-    dirty = set()
+    linked, relabeled, removed, unresolved = [], [], [], []
+
+    import clean_wayback_site as cw
 
     for p in html_paths:
-        soup = soups[p]
+        soup = _read_soup(p)
         rel_self = p.relative_to(site_dir).as_posix()
-        sections = _page_sections(soup)  # consumed left-to-right as this page's links claim them
-        section_i = 0
+        bare = cw._bare_domain(cw._domain_from_folder_name(p) or cw.get_site_domain(soup) or "")
+        sections = _content_sections(soup)
+        used = set()
+        dirty = False
+        header_map = {}  # slug(original text) -> (href, label)
 
-        for a in _collect_nav_links(soup):
+        def _broken(a, _bare=bare):
             href = (a.get("href") or "").strip()
-            if href.lower() not in _NAV_UNRESOLVED_HREFS:
-                continue
-            orig_text = a.get_text(" ", strip=True)
-            words_full = _slug_words(orig_text)
-            if not words_full:
-                continue
+            low = href.lower()
+            if low in _NAV_UNRESOLVED_HREFS or low.startswith("javascript"):
+                return True
+            parts = urlsplit(href)
+            netloc = parts.netloc.lower()
+            if netloc.startswith("www."):
+                netloc = netloc[4:]
+            if netloc and _bare and netloc != _bare:
+                return False  # a real external (other-domain) link - not ours to touch
+            # points at the site root / itself with no real target (/, /#, https://site/,
+            # https://site/#) - a placeholder nav item, treat as broken. A real "#anchor"
+            # (non-empty fragment) or a "/page" path is left alone.
+            if (parts.path or "") in ("", "/") and (parts.fragment or "") in ("", "#") and not parts.query:
+                return True
+            return False
 
-            page_match = _find_page_match(words_full)
-            if not page_match and words_full == ["home"]:
-                # "Home" is such a universal nav-link convention for "the site's own
-                # index page" that it's worth a hardcoded fallback even when no page
-                # is literally named home.html.
-                index_rel = next((rel for _, rel in page_index if rel.lower() == "index.html"), None)
-                if index_rel:
-                    page_match = index_rel
-            if page_match:
-                new_href = os.path.relpath(site_dir / page_match, p.parent).replace(os.sep, "/")
-                a["href"] = new_href
-                linked.append(f'{rel_self}: "{orig_text}" -> {new_href}')
-                dirty.add(p)
-                continue
+        def _resolve(a, short):
+            orig = a.get_text(" ", strip=True)
+            words = _slug_words(orig)
+            if not words:
+                return None
+            pm = _page_match(words)
+            if pm:
+                a["href"] = os.path.relpath(site_dir / pm, p.parent).replace(os.sep, "/")
+                return a.get_text(" ", strip=True)
+            sec = _best_section(orig, sections, used)
+            if not sec:
+                return None
+            used.add(id(sec["el"]))
+            a["href"] = "#" + _ensure_section_anchor(sec)
+            # Label the menu item after the SECTION it now points to (its eyebrow/heading) -
+            # the section title describes the destination better than a lost link's own text.
+            # Header gets the short form, footer the fuller one; fall back to the link's own
+            # text only if the section has no title at all.
+            title = sec["text"] or orig
+            label = _short_label(title) if short else title
+            _set_link_text(a, label)
+            return label
 
-            if section_i < len(sections):
-                h, section_text = sections[section_i]
-                section_i += 1
-                anchor_id = h.get("id") or _slugify(section_text, max_words=3) or f"section-{section_i}"
-                if not h.get("id"):
-                    h["id"] = anchor_id
-                a["href"] = "#" + anchor_id
-                for child in list(a.contents):
-                    child.extract()
-                a.append(section_text)
-                relabeled.append(f'{rel_self}: "{orig_text}" -> "{section_text}" (#{anchor_id})')
-                dirty.add(p)
-                continue
+        # --- header: cap at 4, resolve the broken ones, drop the excess/unresolvable ---
+        header_nav = _find_header_nav(soup)
+        if header_nav is not None:
+            kept = 0
+            for a in _nav_menu_links(header_nav):
+                orig = a.get_text(" ", strip=True)
+                key = " ".join(_slug_words(orig))
+                if kept >= _HEADER_MAX_LINKS:
+                    _remove_nav_item(a)
+                    removed.append(f'{rel_self}: header "{orig}" (over {_HEADER_MAX_LINKS})')
+                    dirty = True
+                    continue
+                if not _broken(a):
+                    kept += 1
+                    header_map[key] = (a.get("href"), a.get_text(" ", strip=True))
+                    continue
+                label = _resolve(a, short=True)
+                if label is not None:
+                    kept += 1
+                    header_map[key] = (a["href"], label)
+                    linked.append(f'{rel_self}: header "{orig}" -> {a["href"]} ("{label}")')
+                    dirty = True
+                else:
+                    _remove_nav_item(a)
+                    removed.append(f'{rel_self}: header "{orig}" (no section to point at)')
+                    dirty = True
 
-            unresolved.append(f'{rel_self}: "{orig_text}" - на странице закончились реальные секции, не привязано')
+        # --- mobile navs: mirror header decisions onto matching links ---
+        exclude = {id(header_nav)} if header_nav is not None else set()
+        footer = soup.find("footer")
+        if footer is not None:
+            exclude.add(id(footer))
+        for mn in _find_mobile_navs(soup, exclude):
+            for a in _nav_menu_links(mn):
+                key = " ".join(_slug_words(a.get_text(" ", strip=True)))
+                if key in header_map and header_map[key][0]:
+                    a["href"] = header_map[key][0]
+                    _set_link_text(a, header_map[key][1])
+                    relabeled.append(f'{rel_self}: mobile "{key}" -> {header_map[key][0]}')
+                    dirty = True
 
-    for p in dirty:
-        _write_soup(p, soups[p])
+        # --- footer: only if it has a real nav block; fuller labels ---
+        if footer is not None and _looks_like_footer_nav(footer):
+            for a in _nav_menu_links(footer):
+                if not _broken(a):
+                    continue
+                orig = a.get_text(" ", strip=True)
+                label = _resolve(a, short=False)
+                if label is not None:
+                    linked.append(f'{rel_self}: footer "{orig}" -> {a["href"]}')
+                    dirty = True
+                else:
+                    unresolved.append(f'{rel_self}: footer "{orig}" - секции закончились, не привязано')
 
-    return {"linked": linked, "relabeled": relabeled, "unresolved": unresolved}
+        if dirty:
+            _write_soup(p, soup)
+
+    return {"linked": linked, "relabeled": relabeled, "removed": removed, "unresolved": unresolved}
 
 
 def format_for_upload(html_path, clean_unused=True):

@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Site Studio — веб-архив в готовый сайт</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Jost:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#f6f4ef; --panel:#fbfaf7; --surface:#ffffff; --border:#e3ded2; --border-strong:#c8c0ad;
+    --text:#1c1b17; --text-dim:#6e6a5f; --text-faint:#9d978a; --green:#1c8a4c; --green-2:#4fd18a;
+    --green-dim:rgba(28,138,76,.09); --red:#b5433a; --amber:#b7791f; --r:14px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:radial-gradient(1200px 620px at 50% -220px, #fffdf8, var(--bg)); color:var(--text);
+    font-family:'Jost',-apple-system,'Segoe UI',sans-serif; font-size:14px; -webkit-font-smoothing:antialiased;
+    padding:40px 20px 90px;
+  }
+  .wrap{width:100%; max-width:1040px; margin:0 auto}
+
+  /* ---- hero / composer ---- */
+  .brand{display:flex; align-items:center; gap:13px; justify-content:center; margin-bottom:22px}
+  .brand-mark{width:42px; height:42px; border-radius:12px; background:linear-gradient(135deg,var(--green),var(--green-2));
+    display:grid; place-items:center; color:#fff; font-weight:700; font-size:20px; box-shadow:0 8px 22px rgba(28,138,76,.28)}
+  .brand h1{margin:0; font-size:19px; font-weight:600; letter-spacing:.4px}
+  .brand p{margin:1px 0 0; color:var(--text-faint); font-size:12px; letter-spacing:.4px}
+
+  .composer{background:var(--surface); border:1px solid var(--border); border-radius:var(--r);
+    box-shadow:0 20px 50px rgba(28,27,23,.07); padding:20px; max-width:760px; margin:0 auto}
+  .composer textarea{width:100%; font-family:inherit; font-size:14.5px; color:var(--text); background:#fff;
+    border:1px solid var(--border); border-radius:10px; padding:13px 14px; min-height:78px; resize:vertical;
+    line-height:1.55; transition:border-color .15s,box-shadow .15s}
+  .composer textarea::placeholder{color:var(--text-faint)}
+  .composer textarea:focus{outline:none; border-color:var(--green); box-shadow:0 0 0 3px var(--green-dim)}
+  .row{display:flex; gap:10px; margin-top:12px; align-items:stretch}
+  .dest-field{flex:1; display:flex; align-items:center; gap:9px; background:#fff; border:1px solid var(--border);
+    border-radius:10px; padding:0 4px 0 13px; transition:border-color .15s,box-shadow .15s}
+  .dest-field:focus-within{border-color:var(--green); box-shadow:0 0 0 3px var(--green-dim)}
+  .dest-field svg{flex:none; color:var(--text-faint)}
+  .dest-field input{flex:1; border:0; background:transparent; font-family:inherit; font-size:13.5px; color:var(--text);
+    padding:11px 0; min-width:0}
+  .dest-field input:focus{outline:none}
+  .dest-field input::placeholder{color:var(--text-faint)}
+  button{font:inherit; cursor:pointer; border-radius:10px; border:1px solid transparent; font-weight:600;
+    transition:background .15s,border-color .15s,color .15s,transform .07s}
+  button:active{transform:translateY(1px)}
+  .btn-pick{background:#f3efe5; color:var(--text-dim); border-color:var(--border); padding:0 14px; font-size:12.5px;
+    display:inline-flex; align-items:center; gap:7px; white-space:nowrap}
+  .btn-pick:hover{color:var(--text); border-color:var(--border-strong)}
+  .btn-go{background:var(--text); color:var(--bg); padding:0 24px; text-transform:uppercase; letter-spacing:1px;
+    font-size:12px; white-space:nowrap; display:inline-flex; align-items:center; gap:8px}
+  .btn-go:hover{background:#3a3830}
+  .btn-go:disabled{opacity:.5; cursor:default}
+  .hint{color:var(--text-faint); font-size:11.5px; margin-top:11px; line-height:1.5; text-align:center}
+  .err-top{color:var(--red); font-weight:600; font-size:12.5px; margin:11px 2px 0; text-align:center}
+
+  /* ---- cards grid ---- */
+  .grid-head{display:flex; align-items:baseline; gap:10px; max-width:1040px; margin:38px 4px 14px}
+  .grid-head h2{font-size:12px; text-transform:uppercase; letter-spacing:1.4px; color:var(--text-faint);
+    font-weight:600; margin:0}
+  .grid-head .count{font-size:11.5px; color:var(--text-faint)}
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:16px}
+
+  .card{background:var(--surface); border:1px solid var(--border); border-radius:var(--r); overflow:hidden;
+    box-shadow:0 12px 30px rgba(28,27,23,.06); display:flex; flex-direction:column;
+    transition:box-shadow .18s,border-color .18s}
+  .card:hover{box-shadow:0 18px 42px rgba(28,27,23,.10); border-color:var(--border-strong)}
+  .thumb{position:relative; aspect-ratio:16/10; background:#eeeae0; overflow:hidden; cursor:pointer}
+  .thumb img{width:100%; height:100%; object-fit:cover; object-position:top; display:block}
+  .thumb.empty{display:grid; place-items:center; color:var(--text-faint); font-size:12px; letter-spacing:.5px}
+  .thumb .open-hint{position:absolute; inset:0; background:rgba(28,27,23,.42); color:#fff; display:flex;
+    align-items:center; justify-content:center; gap:8px; font-size:12.5px; font-weight:600; letter-spacing:.5px;
+    opacity:0; transition:opacity .16s}
+  .thumb:hover .open-hint{opacity:1}
+  .thumb .badge{position:absolute; top:10px; left:10px; background:rgba(255,255,255,.94); color:var(--green);
+    font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.8px; padding:4px 9px; border-radius:20px;
+    box-shadow:0 3px 10px rgba(0,0,0,.12)}
+  .thumb .badge.amber{color:var(--amber)} .thumb .badge.red{color:var(--red)}
+
+  .body{padding:14px 15px 15px; display:flex; flex-direction:column; gap:10px; flex:1}
+  .dom{font-size:15px; font-weight:600; letter-spacing:.2px; word-break:break-all; line-height:1.25}
+  .url{font-size:11.5px; color:var(--text-faint); word-break:break-all; line-height:1.4;
+    display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden}
+
+  /* progress */
+  .prog{margin-top:2px}
+  .prog .track{height:7px; background:#efeadf; border-radius:20px; overflow:hidden}
+  .prog .fill{height:100%; border-radius:20px; background:linear-gradient(90deg,var(--green),var(--green-2));
+    width:0; transition:width .35s ease}
+  .prog.dl .fill{background:linear-gradient(90deg,#7c6df0,#a99bff)}
+  .prog .lbl{display:flex; justify-content:space-between; gap:8px; margin-top:7px; font-size:11.5px; color:var(--text-dim)}
+  .prog .lbl .pct{font-variant-numeric:tabular-nums; color:var(--text-faint); font-weight:600}
+  .prog .fill.pulse{background-size:200% 100%; animation:sh 1.4s linear infinite}
+  @keyframes sh{0%{background-position:200% 0}100%{background-position:-200% 0}}
+  .card-err{font-size:12px; color:var(--red); font-weight:600; line-height:1.4}
+
+  /* action buttons */
+  .acts{display:flex; flex-wrap:wrap; gap:7px; margin-top:auto; padding-top:4px}
+  .b{padding:8px 12px; font-size:12px; font-weight:600; display:inline-flex; align-items:center; gap:6px;
+    border-radius:9px; white-space:nowrap}
+  .b svg{width:14px; height:14px}
+  .b-clean{background:var(--green); color:#fff; flex:1; justify-content:center}
+  .b-clean:hover{background:#177a41}
+  .b-cancel{background:#fff; color:var(--red); border:1px solid #e6c6c1; flex:1; justify-content:center}
+  .b-cancel:hover{background:#fdf3f1}
+  .b-ghost{background:#fff; color:var(--text-dim); border:1px solid var(--border)}
+  .b-ghost:hover{color:var(--text); border-color:var(--border-strong)}
+  .b-studio{background:var(--text); color:var(--bg); flex:1; justify-content:center}
+  .b-studio:hover{background:#3a3830}
+  .b-icon{padding:8px 10px}
+  .spin{width:13px; height:13px; border:2px solid rgba(255,255,255,.4); border-top-color:#fff; border-radius:50%;
+    animation:sp .7s linear infinite}
+  .b-cancel .spin{border-color:rgba(181,67,58,.3); border-top-color:var(--red)}
+  @keyframes sp{to{transform:rotate(360deg)}}
+
+  .empty-state{text-align:center; color:var(--text-faint); font-size:13px; padding:34px 0; letter-spacing:.3px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="brand">
+    <div class="brand-mark">S</div>
+    <div>
+      <h1>Site Studio</h1>
+      <p>веб-архив → готовый сайт</p>
+    </div>
+  </div>
+
+  <div class="composer">
+    <textarea id="urls" placeholder="Вставь ссылки с web.archive.org — по одной на строку&#10;https://web.archive.org/web/2023…/https://example.com/"></textarea>
+    <div class="row">
+      <div class="dest-field">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        <input id="dest" placeholder="Папка для скачивания" autocomplete="off">
+        <button class="btn-pick" id="pickBtn" type="button">Выбрать…</button>
+      </div>
+      <button class="btn-go" id="goBtn" type="button">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+        Скачать
+      </button>
+    </div>
+    <div class="hint">Каждая страница откроется в браузере, прокрутится до конца (для ленивой загрузки) и сохранится локально.</div>
+    <div class="err-top" id="errTop" style="display:none"></div>
+  </div>
+
+  <div class="grid-head" id="gridHead" style="display:none">
+    <h2>Сайты</h2><span class="count" id="cardCount"></span>
+  </div>
+  <div class="grid" id="grid"></div>
+
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+async function api(path, body){
+  // every api() endpoint is POST (GET is only used for the polling/preview reads below)
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
+  return r.json();
+}
+function showErr(msg){ const e=$('#errTop'); if(!msg){e.style.display='none';return;} e.textContent=msg; e.style.display='block'; }
+
+async function pickDest(){
+  const r = await api('/api/pick-folder');
+  if(r.ok){ $('#dest').value = r.path; adoptDest(); }
+  else if(r.error) showErr(r.error);
+}
+
+// Pull in every site already sitting in the chosen folder as cards (survives server restarts).
+async function adoptDest(){
+  const dest = $('#dest').value.trim();
+  if(!dest) return;
+  await api('/api/wayback/adopt', {dest});
+  poll();
+}
+
+async function startDownload(){
+  showErr('');
+  const urls = $('#urls').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  const dest = $('#dest').value.trim();
+  if(!urls.length){ showErr('Вставь хотя бы одну ссылку'); return; }
+  if(!dest){ showErr('Укажи папку для скачивания'); return; }
+  const btn = $('#goBtn'); btn.disabled = true;
+  const r = await api('/api/wayback/start', {urls, dest});
+  btn.disabled = false;
+  if(!r.ok){ showErr(r.error||'ошибка'); return; }
+  $('#urls').value = '';
+  poll();
+}
+
+// ---- rendering ----
+const SVG = {
+  folder:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+  trash:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>',
+  broom:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19.4 4.6 12 12"/><path d="M14 9l-8.5 8.5a2.1 2.1 0 0 0 0 3 2.1 2.1 0 0 0 3 0L17 12"/><path d="M9 20l-5-5"/></svg>',
+  x:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+  studio:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z"/></svg>',
+};
+function esc(s){ return (s||'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function cardHTML(e){
+  const cleaning = e.clean_running;
+  const cleaned = e.clean_done;
+  const dlErr = e.dl_error;
+  const cleanErr = e.clean_error;
+
+  // thumbnail
+  let thumb;
+  if(e.preview && e.site_dir){
+    thumb = `<div class="thumb" data-open="${e.id}">
+      <img src="/api/entry/preview?id=${e.id}&v=${e._v||0}" alt="">
+      <div class="open-hint">${SVG.studio}<span>Открыть в студии</span></div>`;
+  } else {
+    thumb = `<div class="thumb empty"${e.site_dir&&!dlErr?` data-open="${e.id}"`:''}>
+      <span>${dlErr?'нет превью':(e.dl_done?'нет превью':'загрузка…')}</span>`;
+  }
+  // status badge
+  let badge = '';
+  if(cleaned) badge = '<div class="badge">очищено</div>';
+  else if(cleaning) badge = '<div class="badge amber">очистка…</div>';
+  else if(e.clean_cancelled) badge = '<div class="badge amber">отменено</div>';
+  else if(dlErr||cleanErr) badge = '<div class="badge red">ошибка</div>';
+  else if(e.dl_done) badge = '<div class="badge">скачано</div>';
+  thumb += badge + '</div>';
+
+  // progress / status area
+  let mid = '';
+  if(dlErr){
+    mid = `<div class="card-err">${esc(dlErr)}</div>`;
+  } else if(!e.dl_done){
+    mid = `<div class="prog dl"><div class="track"><div class="fill pulse" style="width:${e.dl_pct}%"></div></div>
+      <div class="lbl"><span>${esc(e.dl_phase||'…')}</span><span class="pct">${e.dl_pct}%</span></div></div>`;
+  } else if(cleaning){
+    mid = `<div class="prog"><div class="track"><div class="fill pulse" style="width:${e.clean_pct}%"></div></div>
+      <div class="lbl"><span>${esc(e.clean_action||'…')}</span><span class="pct">${e.clean_pct}%</span></div></div>`;
+  } else if(cleanErr){
+    mid = `<div class="card-err">${esc(cleanErr)}</div>`;
+  }
+
+  // actions
+  let acts = '';
+  if(!e.dl_done && !dlErr){
+    acts = `<button class="b b-ghost b-icon" data-remove="${e.id}" title="Удалить">${SVG.trash}</button>`;
+  } else if(cleaning){
+    acts = `<button class="b b-cancel" data-cancel="${e.id}"><span class="spin"></span>Отменить</button>`;
+  } else {
+    const cleanLabel = (cleaned||e.clean_cancelled||cleanErr) ? 'Очистить снова' : 'Очистить';
+    const canClean = e.dl_done && !dlErr;
+    acts = '';
+    if(canClean) acts += `<button class="b b-clean" data-clean="${e.id}">${SVG.broom}${cleanLabel}</button>`;
+    if(cleaned) acts += `<button class="b b-studio" data-open="${e.id}">${SVG.studio}В студию</button>`;
+    if(e.site_dir) acts += `<button class="b b-ghost b-icon" data-folder="${e.id}" title="Открыть папку">${SVG.folder}</button>`;
+    acts += `<button class="b b-ghost b-icon" data-remove="${e.id}" title="Удалить карточку">${SVG.trash}</button>`;
+  }
+
+  return `<div class="card" data-id="${e.id}">
+    ${thumb}
+    <div class="body">
+      <div class="dom">${esc(e.domain||'—')}</div>
+      <div class="url">${esc(e.url)}</div>
+      ${mid}
+      <div class="acts">${acts}</div>
+    </div>
+  </div>`;
+}
+
+// keep a small per-card cache-buster so the preview <img> reloads when clean finishes
+const _pv = {};
+function render(entries){
+  const head = $('#gridHead'), grid = $('#grid');
+  if(!entries.length){ head.style.display='none'; grid.innerHTML=''; return; }
+  head.style.display='flex';
+  $('#cardCount').textContent = entries.length + (entries.length===1?' сайт':' сайт(ов)');
+  entries.forEach(e=>{
+    // bump preview version when a cleanup just completed, so the thumb refreshes
+    const key = e.id;
+    const stamp = (e.clean_done?1:0)+':'+(e.preview?1:0);
+    if(_pv[key]?.stamp !== stamp){ _pv[key] = {stamp, v:(_pv[key]?.v||0)+1}; }
+    e._v = _pv[key].v;
+  });
+  grid.innerHTML = entries.map(cardHTML).join('');
+}
+
+function openStudio(id, e){
+  api('/api/set-site', {site_dir: e.site_dir}).then(r=>{
+    if(r.ok) location.href = '/studio';
+    else alert(r.error||'не удалось открыть студию');
+  });
+}
+
+let _entries = [];
+document.addEventListener('click', ev=>{
+  const t = ev.target.closest('[data-clean],[data-cancel],[data-remove],[data-folder],[data-open]');
+  if(!t) return;
+  const find = id => _entries.find(x=>x.id===id);
+  if(t.dataset.clean){ api('/api/entry/clean',{id:t.dataset.clean}).then(r=>{ if(!r.ok) alert(r.error||''); poll(); }); }
+  else if(t.dataset.cancel){ api('/api/entry/cancel',{id:t.dataset.cancel}).then(poll); }
+  else if(t.dataset.remove){ api('/api/entry/remove',{id:t.dataset.remove}).then(poll); }
+  else if(t.dataset.folder){ api('/api/entry/open-folder',{id:t.dataset.folder}).then(r=>{ if(!r.ok) alert(r.error||''); }); }
+  else if(t.dataset.open){ const e=find(t.dataset.open); if(e&&e.site_dir) openStudio(t.dataset.open, e); }
+});
+
+// ---- polling: single source of truth, survives refresh ----
+let _timer = null, _adopted = false;
+async function poll(){
+  let data;
+  try{ data = await (await fetch('/api/entries')).json(); }
+  catch(_){ return; }
+  _entries = data.entries || [];
+  if(data.dest && !$('#dest').value) $('#dest').value = data.dest;
+  render(_entries);
+  // first time we learn a folder, pull whatever's already downloaded in it into cards
+  if(data.dest && !_adopted){ _adopted = true; adoptDest(); }
+  const busy = _entries.some(e => !e.dl_done || e.clean_running);
+  clearTimeout(_timer);
+  _timer = setTimeout(poll, busy ? 900 : 3000);
+}
+
+$('#pickBtn').addEventListener('click', pickDest);
+$('#goBtn').addEventListener('click', startDownload);
+$('#dest').addEventListener('change', adoptDest);  // typed/pasted a path -> load its sites
+poll();  // restore full state on load / after refresh
+</script>
+</body>
+</html>

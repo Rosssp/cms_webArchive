@@ -118,6 +118,20 @@
   .preset-row button { margin-top: 0; }
   .color-input { margin-top: 12px; }
 
+  /* live cleanup progress: spinner + shimmer bar + percent + current action */
+  .cln-prog { margin-top: 12px; padding: 11px 13px; border-radius: var(--r); background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--green); }
+  .cln-top { display: flex; align-items: center; gap: 8px; }
+  .cln-spin { width: 13px; height: 13px; border-radius: 50%; border: 2px solid var(--border-strong); border-top-color: var(--green); animation: cln-spin .7s linear infinite; flex-shrink: 0; }
+  @keyframes cln-spin { to { transform: rotate(360deg); } }
+  .cln-name { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: var(--text); }
+  .cln-pct { margin-left: auto; font-size: 12px; font-weight: 700; color: var(--green); font-variant-numeric: tabular-nums; }
+  .cln-bar { height: 6px; margin-top: 9px; border-radius: 4px; background: var(--border); overflow: hidden; }
+  .cln-fill { height: 100%; width: 0%; border-radius: 4px; background: var(--green); transition: width .35s ease; position: relative; overflow: hidden; }
+  .cln-fill::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,.55), transparent); animation: cln-shimmer 1.1s linear infinite; }
+  @keyframes cln-shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+  .cln-act { margin-top: 7px; font-size: 11px; color: var(--text-dim); line-height: 1.4; }
+  .cln-sub { margin-top: 3px; font-size: 10.5px; color: var(--text-faint); font-family: Consolas, monospace; line-height: 1.4; }
+
   .status {
     font-size: 11.5px; margin-top: 12px; padding: 10px 12px; border-radius: var(--r);
     white-space: pre-wrap; max-height: 260px; overflow-y: auto;
@@ -267,18 +281,15 @@
       <span class="section-num">02</span>
       <div>
         <h2>Очистка</h2>
-        <div class="section-sub">Unwrap web.archive.org (и из HTML, и из любого подключённого CSS/JS/JSON/SVG-файла), снос тулбара/скриптов/меты, data-*/on*, mailto/tel, favicon, следы владельца (verification-меты/generator/год ©), robots/sitemap/.htaccess (перезаписью), внешние/соцсети ссылки остаются (только снимается web.archive.org-обёртка), шрифт - свой уже используемый на сайте (или случайный Jost/Montserrat, если не найден), картинки/шрифты/CSS-фоны восстанавливаются с web.archive.org, PBN-чеклист отчёт. Замена лого/бренда сюда не входит - смотри отдельные секции ниже</div>
+        <div class="section-sub">Unwrap web.archive.org (и из HTML, и из любого подключённого CSS/JS/JSON/SVG-файла), снос тулбара/скриптов/меты, data-*/on*, mailto/tel, favicon, следы владельца (verification-меты/generator/год ©), robots/sitemap/.htaccess (перезаписью), внешние/соцсети ссылки остаются (только снимается web.archive.org-обёртка), шрифт - свой уже используемый на сайте (или случайный Jost/Montserrat, если не найден), картинки/шрифты/CSS-фоны восстанавливаются с web.archive.org, PBN-чеклист отчёт. Логотип/бренд — отдельные секции ниже; либо укажи Domain override, тогда логотип поставится по домену</div>
       </div>
     </div>
-
-    <label>Шрифт для очистки (пусто = взять с сайта / случайный)</label>
-    <input id="cleanFonts" placeholder="пусто — свой шрифт сайта или случайный Jost/Montserrat, или впиши название">
 
     <label>Favicon (путь к файлу)</label>
     <input id="cleanFavicon" placeholder="необязательно, иначе сгенерируется автоматически">
 
-    <label>Domain override</label>
-    <input id="cleanDomain" placeholder="необязательно">
+    <label>Domain override (+ авто-логотип по домену)</label>
+    <input id="cleanDomain" placeholder="необязательно; если указать — ещё и поставит текст-логотип из домена (example.com → Example)">
 
     <div class="check"><input type="checkbox" id="cleanDryRun"><label for="cleanDryRun">Dry-run (только отчёт, ничего не менять)</label></div>
     <div class="check"><input type="checkbox" id="cleanKeepContact"><label for="cleanKeepContact">Оставить mailto/tel/email/телефоны</label></div>
@@ -286,6 +297,16 @@
     <div class="check"><input type="checkbox" id="cleanNoImageRecovery"><label for="cleanNoImageRecovery">Не восстанавливать картинки из web.archive.org</label></div>
 
     <button onclick="runCleanup()">Запустить очистку</button>
+    <div id="cleanProgress" class="cln-prog" style="display:none">
+      <div class="cln-top">
+        <span class="cln-spin"></span>
+        <span class="cln-name">Очистка</span>
+        <span class="cln-pct" id="clnPct">0%</span>
+      </div>
+      <div class="cln-bar"><div class="cln-fill" id="clnFill"></div></div>
+      <div class="cln-act" id="clnAct">Запускаю…</div>
+      <div class="cln-sub" id="clnSub" style="display:none"></div>
+    </div>
     <div id="cleanStatus" class="status" style="display:none"></div>
 
     <details>
@@ -514,7 +535,7 @@
       <span class="section-num">14</span>
       <div>
         <h2>Ссылки меню/футера</h2>
-        <div class="section-sub">Автоматически привязывает битые (#) ссылки в &lt;header&gt;/&lt;nav&gt;/&lt;footer&gt; по всем страницам сайта разом - к реальным секциям страницы, переименовывая пункт меню под них</div>
+        <div class="section-sub">Хедер: максимум 4 пункта (лишние удаляет), битые (#, /, javascript) привязывает к реальным секциям с короткой подписью и якорем. Моб.меню — то же зеркалом. Футер — только если там есть навигация, подписи полнее. Находит навигацию и в &lt;div class="navbar"&gt;, не только в семантических тегах</div>
       </div>
     </div>
     <div class="hint">Логика от секций, а не от названия пункта меню (само название почти всегда ничего не значит - остаток потерянного JS-меню и т.п.): 1) если текст ссылки совпадает с именем загруженной страницы (Gallery → gallery.html, Home → всегда index.html) - линкует туда, текст не трогает; 2) иначе берёт СЛЕДУЮЩИЙ по порядку реальный заголовок (h1-h6) на этой же странице (не из хедера/футера), присваивает ему id если нет, ссылку ведёт туда - и переименовывает сам пункт меню под текст этого заголовка; 3) когда заголовки на странице закончились - остаток остаётся непривязанным и попадает в список, руками смотреть. Не трогает ссылки, которые уже куда-то ведут. Все ссылки относительные. Каждую изменённую страницу бэкапит (.studio-bak).</div>
@@ -1064,9 +1085,10 @@ function stopPicker() {
   picker.targetInput = null;
 }
 
+let cleanPollTimer = null;
+
 async function runCleanup() {
   const body = {
-    fonts: document.getElementById('cleanFonts').value.trim(),
     favicon: document.getElementById('cleanFavicon').value.trim(),
     domain: document.getElementById('cleanDomain').value.trim(),
     dry_run: document.getElementById('cleanDryRun').checked,
@@ -1074,14 +1096,57 @@ async function runCleanup() {
     no_backup: document.getElementById('cleanNoBackup').checked,
     no_image_recovery: document.getElementById('cleanNoImageRecovery').checked,
   };
-  showStatus('cleanStatus', true, 'Чищу...');
-  const r = await fetch('/api/cleanup', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body)
-  });
-  const data = await r.json();
-  showStatus('cleanStatus', data.ok, data.ok ? data.report : data.error);
-  if (data.ok && !body.dry_run) reloadPreview();
+  document.getElementById('cleanStatus').style.display = 'none';
+  setCleanProgress(0, 'Запускаю…');
+  document.getElementById('cleanProgress').style.display = 'block';
+  let data;
+  try {
+    const r = await fetch('/api/cleanup', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+    });
+    data = await r.json();
+  } catch (e) {
+    document.getElementById('cleanProgress').style.display = 'none';
+    showStatus('cleanStatus', false, 'Не удалось запустить: ' + e);
+    return;
+  }
+  if (!data.ok) {
+    document.getElementById('cleanProgress').style.display = 'none';
+    showStatus('cleanStatus', false, data.error);
+    return;
+  }
+  pollCleanup(!!body.dry_run);
+}
+
+function setCleanProgress(pct, action) {
+  document.getElementById('clnFill').style.width = pct + '%';
+  document.getElementById('clnPct').textContent = Math.round(pct) + '%';
+  if (action) document.getElementById('clnAct').textContent = action;
+}
+
+function pollCleanup(dryRun) {
+  if (cleanPollTimer) clearInterval(cleanPollTimer);
+  cleanPollTimer = setInterval(async () => {
+    let d;
+    try { d = await (await fetch('/api/cleanup-progress')).json(); } catch (e) { return; }
+    setCleanProgress(d.percent, d.action);
+    const sub = document.getElementById('clnSub');
+    if (d.detail) { sub.textContent = d.detail; sub.style.display = 'block'; }
+    else { sub.style.display = 'none'; }
+    if (d.error) {
+      clearInterval(cleanPollTimer); cleanPollTimer = null;
+      document.getElementById('cleanProgress').style.display = 'none';
+      showStatus('cleanStatus', false, d.error);
+      return;
+    }
+    if (!d.running && d.report != null) {
+      clearInterval(cleanPollTimer); cleanPollTimer = null;
+      setCleanProgress(100, 'Готово');
+      setTimeout(() => { document.getElementById('cleanProgress').style.display = 'none'; }, 600);
+      showStatus('cleanStatus', true, d.report);
+      if (!dryRun) reloadPreview();
+    }
+  }, 350);
 }
 
 async function runEnsureSeo() {
@@ -1285,9 +1350,9 @@ async function runAutoLinkMenu() {
   const r = await fetch('/api/auto-link-menu', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
   const data = await r.json();
   if (!data.ok) { showStatus('autoLinkStatus', false, data.error); return; }
-  const linked = data.linked || [], relabeled = data.relabeled || [], unresolved = data.unresolved || [];
-  let msg = `Готово. На страницы: ${linked.length}. Переименовано под секции: ${relabeled.length}. Не привязано: ${unresolved.length}.`;
-  const details = [...linked, ...relabeled, ...unresolved];
+  const linked = data.linked || [], relabeled = data.relabeled || [], removed = data.removed || [], unresolved = data.unresolved || [];
+  let msg = `Готово. Привязано: ${linked.length}. Зеркалировано в моб.меню: ${relabeled.length}. Удалено лишних (хедер >4): ${removed.length}. Не привязано: ${unresolved.length}.`;
+  const details = [...linked, ...relabeled, ...removed, ...unresolved];
   if (details.length) msg += '\n' + details.join('\n');
   showStatus('autoLinkStatus', true, msg);
   reloadPreview();

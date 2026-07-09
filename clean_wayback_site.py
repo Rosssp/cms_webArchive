@@ -108,11 +108,13 @@ per-site if the default heuristics keep/drop the wrong thing.
 """
 
 import argparse
+import os
 import random
 import re
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -166,6 +168,19 @@ ICON_FONT_NAMES = {
     "et-line", "pe-icon-7-stroke", "elegant-icons", "et-icons",
 }
 ICON_FONT_HINTS = ("icon", "glyphicon", "awesome")
+
+# Third-party CDNs that serve web fonts / framework assets - these never lived at the site's own
+# domain, and the cleaner re-injects Google Fonts (and self-hosts icon fonts) fresh anyway, so
+# hitting web.archive.org to "recover" one of their files is pure wasted time: each is a slow,
+# always-failing CDX round-trip, and a Google-Fonts CSS references DOZENS of them (every Inter/
+# Roboto subset) - the single biggest stall when cleaning, and it multiplies under parallel
+# cleanups (archive.org throttles the burst, every request then hangs to its full timeout).
+_FONT_CDN_HOSTS = {
+    "fonts.gstatic.com", "fonts.googleapis.com", "gstatic.com", "googleapis.com",
+    "use.typekit.net", "typekit.net", "p.typekit.net", "use.fontawesome.com", "fontawesome.com",
+    "cdnjs.cloudflare.com", "maxcdn.bootstrapcdn.com", "stackpath.bootstrapcdn.com",
+    "netdna.bootstrapcdn.com", "cdn.jsdelivr.net", "fonts.bunny.net",
+}
 
 SOCIAL_DOMAINS = {
     "facebook.com", "fb.com", "twitter.com", "x.com", "instagram.com",
@@ -585,6 +600,10 @@ class Report:
         self.brand_body_replacements = 0
         self.removed_owner_traces = []
         self.owner_trace_year_updates = 0
+        self.icon_font_selfhosted = False
+        self.glyphicons_rewritten = 0
+        self.localized_media = []
+        self.detached_media = []
         self.favicon_present = False
         self.favicon_set = False
         self.favicon_auto_generated = False
@@ -703,6 +722,18 @@ class Report:
                 lines.append(f"  - {t}")
         if self.owner_trace_year_updates:
             lines.append(f"© year bumped to current: {self.owner_trace_year_updates}")
+        if self.icon_font_selfhosted:
+            lines.append("icons: self-hosted a working Font Awesome locally (broken icon webfont replaced)")
+        if self.glyphicons_rewritten:
+            lines.append(f"icons: Bootstrap glyphicons remapped to Font Awesome: {self.glyphicons_rewritten}")
+        if self.localized_media:
+            lines.append(f"media: same-domain absolute refs made local: {len(self.localized_media)}")
+            for s in self.localized_media:
+                lines.append(f"  - {s}")
+        if self.detached_media:
+            lines.append(f"media: dead/unrecoverable refs detached: {len(self.detached_media)}")
+            for s in self.detached_media:
+                lines.append(f"  - {s}")
         lines.append("")
         lines.append("--- flagged for manual review (not auto-removed) ---")
         if self.flagged_adult:
@@ -1275,6 +1306,53 @@ def download_google_font_locally(fonts_param, dest_dir, html_root):
     return new_css
 
 
+# Icon-font elements (Font Awesome / glyphicons) must be excluded from any global
+# "* { font-family: ... !important }" reset - both the one this tool injects AND the site
+# theme's own - or the icon's element gets the body font forced onto it, its glyph codepoint
+# doesn't exist in that font, and every icon renders as a blank tofu box. The glyph is drawn
+# in the ::before pseudo, so the universal ::before/::after resets have to be shielded too
+# (the :not() goes on the element part, before the pseudo: `*:not(.fas)::before`).
+_ICON_EXCLUDE_SEL = (
+    ":not(.fa):not(.fas):not(.far):not(.fab):not(.fal):not(.fad)"
+    ":not(.fa-solid):not(.fa-brands):not(.fa-regular):not(.glyphicon)"
+    ':not([class^="fa-"]):not([class*=" fa-"])'
+)
+_FONT_RESET_RULE_RE = re.compile(r"([^{}]+)\{([^{}]*)\}")
+
+
+def _shield_sel_part(ps):
+    """A universal selector a font reset hits every element/pseudo through (`*`, `*::before`,
+    `*::after`) -> the same with icon exclusions inserted after the `*`; else None."""
+    if ps == "*":
+        return "*" + _ICON_EXCLUDE_SEL
+    if ps in ("*::before", "*::after", "*:before", "*:after"):
+        return "*" + _ICON_EXCLUDE_SEL + ps[1:]
+    return None
+
+
+def _shield_icons_from_font_resets(css_text):
+    """Add icon exclusions to any universal `* { font-family: ... !important }` reset in
+    `css_text` - not just the one this tool injects, but the site theme's own bare reset,
+    which otherwise blanks every Font Awesome / glyphicon icon. Idempotent, returns the
+    (possibly unchanged) text."""
+    def repl(m):
+        selector, body = m.group(1), m.group(2)
+        low = body.lower()
+        if "font-family" not in low or "!important" not in low:
+            return m.group(0)
+        shielded, changed = [], False
+        for p in (part.strip() for part in selector.split(",")):
+            sh = _shield_sel_part(p) if _ICON_EXCLUDE_SEL not in p else None
+            if sh is not None:
+                shielded.append(sh)
+                changed = True
+            else:
+                shielded.append(p)
+        return (",".join(shielded) + "{" + body + "}") if changed else m.group(0)
+
+    return _FONT_RESET_RULE_RE.sub(repl, css_text)
+
+
 def inject_google_fonts(soup, fonts_param, html_path=None):
     fonts_param = normalize_font_family(fonts_param)
     head = soup.find("head")
@@ -1361,7 +1439,9 @@ def inject_google_fonts(soup, fonts_param, html_path=None):
     # font-family the original theme used, so nothing would actually render in the
     # new font without a global override.
     if primary:
-        parts.append(f"* {{ font-family: '{primary}', sans-serif !important; }}")
+        # Exclude icon-font elements from the global override (see _ICON_EXCLUDE_SEL) so this
+        # !important doesn't clobber their font-family and blank every icon.
+        parts.append(f"*{_ICON_EXCLUDE_SEL} {{ font-family: '{primary}', sans-serif !important; }}")
     if parts:
         style_tag.string = "\n".join(parts)
         head.append(style_tag)
@@ -1379,6 +1459,247 @@ def inject_image_object_fit_style(soup):
     style_tag["data-site-studio-img"] = "cover"
     style_tag.string = "img { object-fit: cover; }"
     head.append(style_tag)
+
+
+# --- icon fonts -----------------------------------------------------------------------
+# Old wayback exports almost always ship BROKEN icons: the icon webfont files (Font
+# Awesome's fontawesome-webfont.*, Bootstrap's glyphicons-halflings-regular.*) weren't
+# captured, so every icon renders as an empty box. Fix: self-host a known-good Font Awesome
+# 4.7 (whose "fa fa-*" markup is exactly what these templates use - FA5+ split it into
+# fas/fab and would break the existing markup) locally from cdnjs, and remap Bootstrap
+# glyphicons onto the same Font Awesome classes so they share that one working font.
+FA_CDN = "https://cdnjs.cloudflare.com/ajax/libs/font-awesome"
+# Match the Font Awesome MAJOR to the markup: v4 uses one base class "fa" (fa fa-home);
+# v5/6 split it into style prefixes (fas/far/fab). Self-hosting the wrong major leaves icons
+# blank because the base class the CSS keys on (.fa vs .fas) doesn't match the elements.
+FA_VARIANTS = {
+    "fa4": {"version": "4.7.0", "css": "css/font-awesome.min.css", "glyph_prefix": "fa"},
+    "fa6": {"version": "6.5.2", "css": "css/all.min.css", "glyph_prefix": "fas"},
+}
+_FA_ICON_TOKEN_RE = re.compile(r"^fa-[a-z0-9-]+$", re.I)
+_FA4_BASE_RE = re.compile(r"^fa$", re.I)
+_FA5_PREFIX_RE = re.compile(
+    r"^(fas|far|fab|fal|fad|fass|fa-solid|fa-brands|fa-regular|fa-light|fa-duotone)$", re.I)
+# Icon webfont FILE names - never try to recover these from the archive (they're framework/
+# CDN assets that were never captured; a burst of failing lookups is exactly what made
+# icon-heavy sites crawl). Covers FA4 (fontawesome-webfont), FA5/6 (fa-solid-900/
+# fa-brands-400/fa-v4compatibility/...) and Bootstrap glyphicons.
+_ICON_WEBFONT_RE = re.compile(
+    r"(glyphicons?-halflings|fontawesome|font-awesome|fa-solid-\d|fa-brands-\d"
+    r"|fa-regular-\d|fa-light-\d|fa-duotone-\d|fa-v4compat)", re.I)
+
+_FONTFACE_BLOCK_RE = re.compile(r"@font-face\s*\{([^{}]*)\}", re.I)
+_SRC_DECL_RE = re.compile(r"src\s*:[^;{}]*;?", re.I)
+_WOFF2_URL_RE = re.compile(r"url\(\s*['\"]?([^'\")?]+\.woff2)[^'\")]*['\"]?\s*\)", re.I)
+_DBL_SEMI_RE = re.compile(r";\s*;+")
+
+
+def _fontface_woff2_only(css):
+    """Rewrite every @font-face in `css` to reference ONLY its woff2 url (dropping any eot/
+    svg/woff/ttf), so we ship just woff2 files - covers every modern browser, tiny download,
+    zero console 404s. Works across FA4 (one @font-face) and FA5/6 (several)."""
+    def repl(m):
+        body = m.group(1)
+        w = _WOFF2_URL_RE.search(body)
+        if not w:
+            return m.group(0)
+        new_body = _DBL_SEMI_RE.sub(";", _SRC_DECL_RE.sub("", body)).strip().strip(";").strip()
+        src = f"src:url('{w.group(1)}') format('woff2')"
+        return "@font-face{" + (new_body + ";" if new_body else "") + src + "}"
+    return _FONTFACE_BLOCK_RE.sub(repl, css)
+
+GLYPHICON_TO_FA = {
+    "ok": "check", "remove": "times", "plus-sign": "plus-circle", "minus-sign": "minus-circle",
+    "remove-sign": "times-circle", "ok-sign": "check-circle", "question-sign": "question-circle",
+    "info-sign": "info-circle", "exclamation-sign": "exclamation-circle", "warning-sign": "warning",
+    "ok-circle": "check-circle-o", "remove-circle": "times-circle-o", "ban-circle": "ban",
+    "zoom-in": "search-plus", "zoom-out": "search-minus", "off": "power-off", "trash": "trash-o",
+    "time": "clock-o", "star-empty": "star-o", "heart-empty": "heart-o", "eye-open": "eye",
+    "eye-close": "eye-slash", "picture": "picture-o", "facetime-video": "video-camera",
+    "edit": "pencil-square-o", "share": "share-square-o", "check": "check-square-o",
+    "move": "arrows", "resize-full": "expand", "resize-small": "compress",
+    "resize-vertical": "arrows-v", "resize-horizontal": "arrows-h", "fullscreen": "arrows-alt",
+    "screenshot": "crosshairs", "menu-hamburger": "bars", "menu-left": "chevron-left",
+    "menu-right": "chevron-right", "menu-up": "chevron-up", "menu-down": "chevron-down",
+    "option-vertical": "ellipsis-v", "option-horizontal": "ellipsis-h",
+    "triangle-right": "caret-right", "triangle-left": "caret-left", "triangle-top": "caret-up",
+    "triangle-bottom": "caret-down", "log-in": "sign-in", "log-out": "sign-out",
+    "new-window": "external-link", "folder-close": "folder", "floppy-disk": "floppy-o",
+    "floppy-save": "floppy-o", "save": "floppy-o", "open": "folder-open-o", "saved": "check",
+    "send": "paper-plane", "import": "sign-in", "export": "sign-out", "transfer": "exchange",
+    "list-alt": "list-alt", "indent-left": "outdent", "indent-right": "indent",
+    "hand-right": "hand-o-right", "hand-left": "hand-o-left", "hand-up": "hand-o-up",
+    "hand-down": "hand-o-down", "circle-arrow-right": "arrow-circle-right",
+    "circle-arrow-left": "arrow-circle-left", "circle-arrow-up": "arrow-circle-up",
+    "circle-arrow-down": "arrow-circle-down", "play-circle": "play-circle-o",
+    "unchecked": "square-o", "pushpin": "thumb-tack", "dashboard": "tachometer",
+    "stats": "bar-chart", "sort-by-alphabet": "sort-alpha-asc", "flash": "bolt",
+    "earphone": "phone", "phone-alt": "phone", "tower": "building-o",
+    "registration-mark": "registered", "grain": "th", "header": "header",
+    "compressed": "file-archive-o", "tree-conifer": "tree", "tree-deciduous": "tree",
+    "cd": "circle-o-notch", "sd-video": "video-camera", "hd-video": "video-camera",
+    "subtitles": "cc",
+}
+
+
+def _class_tokens(tag):
+    c = tag.get("class")
+    if not c:
+        return []
+    return list(c) if isinstance(c, list) else str(c).split()
+
+
+def _detect_icon_font(soup):
+    """('fa4'|'fa6'|None, glyphicon_tags): which Font Awesome major the page's icon markup
+    uses (fas/far/fab = v5/6 -> 'fa6'; plain 'fa fa-*' = v4 -> 'fa4'), plus every element
+    using Bootstrap glyphicons. Prefers fa6 if both styles somehow appear."""
+    fa4 = fa6 = False
+    glyph_tags = []
+    for tag in soup.find_all(True):
+        toks = _class_tokens(tag)
+        if not toks:
+            continue
+        if any(_FA_ICON_TOKEN_RE.match(t) for t in toks):
+            if any(_FA5_PREFIX_RE.match(t) for t in toks):
+                fa6 = True
+            elif any(_FA4_BASE_RE.match(t) for t in toks):
+                fa4 = True
+        if "glyphicon" in toks:
+            glyph_tags.append(tag)
+    ver = "fa6" if fa6 else ("fa4" if fa4 else None)
+    return ver, glyph_tags
+
+
+def rewrite_glyphicons_to_fa(soup, glyph_tags, report, prefix="fa"):
+    """Rewrite Bootstrap glyphicon classes to Font Awesome in place (base 'glyphicon' ->
+    `prefix`, 'glyphicon-x' -> 'fa-<mapped>'), so a self-hosted Font Awesome covers them too
+    (the glyphicons webfont is almost always missing). Unmapped names fall back to same-name."""
+    n = 0
+    for tag in glyph_tags:
+        new, changed = [], False
+        for t in _class_tokens(tag):
+            if t == "glyphicon":
+                new.append(prefix)
+                changed = True
+            elif t.startswith("glyphicon-"):
+                fa = GLYPHICON_TO_FA.get(t[10:], t[10:])
+                if fa:
+                    new.append("fa-" + fa)
+                changed = True
+            else:
+                new.append(t)
+        if changed:
+            tag["class"] = new
+            n += 1
+    report.glyphicons_rewritten += n
+    return n
+
+
+def _ensure_fa_cache(variant):
+    """Download the given Font Awesome variant once into a shared user cache (css rewritten to
+    woff2-only, plus exactly the woff2 files it references) and return the cache dir, or None
+    on failure. Shared across every site: on a batch of many domains only the FIRST cleanup
+    hits the network; every site after just copies from the cache instantly."""
+    cfg = FA_VARIANTS[variant]
+    cache = Path.home() / ".cache" / "cms-webarchive-fa" / f"{variant}-{cfg['version']}"
+    css_c = cache / cfg["css"]
+    if css_c.is_file():
+        return cache
+    try:
+        css_bytes = _fetch_url_bytes(f"{FA_CDN}/{cfg['version']}/{cfg['css']}", timeout=15)
+    except Exception:  # noqa: BLE001
+        return None
+    css_text = _fontface_woff2_only(css_bytes.decode("utf-8", "replace"))
+    css_c.parent.mkdir(parents=True, exist_ok=True)
+    css_c.write_text(css_text, encoding="utf-8")
+    refs = set(re.findall(r"url\(\s*['\"]?([^'\")?]+\.woff2)", css_text, re.I))
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _grab(ref):
+        try:
+            url = f"{FA_CDN}/{cfg['version']}/" + ref.replace("../", "")
+            dest = (css_c.parent / ref).resolve()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(_fetch_url_bytes(url, timeout=15))
+        except Exception:  # noqa: BLE001 - a missing font just means those glyphs won't show
+            pass
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(_grab, refs))
+    return cache if any((css_c.parent / r).exists() for r in refs) else None
+
+
+def self_host_font_awesome(html_path, soup, report, variant, dry_run=False):
+    """Self-host the matching Font Awesome `variant` (fa4/fa6) in the project and link it
+    locally, replacing any broken/CDN Font Awesome <link> - so icons render from a working
+    local font whose base classes (.fa vs .fas/.fab) match the markup. Copies from the shared
+    cache (downloaded once, see _ensure_fa_cache); skips if the project already has it."""
+    head = soup.find("head")
+    if not head:
+        return
+    cfg = FA_VARIANTS[variant]
+    assets_dir = html_path.with_name(html_path.stem + "_files")
+    fa_dir = assets_dir / "fontawesome"
+    css_path = fa_dir / cfg["css"]
+    rel_href = f"{assets_dir.name}/fontawesome/{cfg['css']}"
+
+    # Drop the export's pre-existing Font Awesome stylesheet link (a broken local copy, a CDN
+    # one, or the FA5/6 "all.min.css") - we add our own known-good local one. The orphaned old
+    # file is then swept into _unused_removed by the unused-asset pass at the end of cleanup.
+    patterns = r"font-?awesome|fontawesome" + (r"|all\.min\.css" if variant == "fa6" else "")
+    for link in list(head.find_all("link")):
+        href = link.get("href") or ""
+        if href != rel_href and re.search(patterns, href, re.I):
+            report.removed_links_css.append(href)
+            link.decompose()
+
+    if not dry_run and not css_path.is_file():
+        cache = _ensure_fa_cache(variant)
+        if cache is None:
+            print("[icons] could not obtain Font Awesome - icons left as-is")
+            return
+        shutil.copytree(cache, fa_dir, dirs_exist_ok=True)
+        print(f"[icons] self-hosted Font Awesome {cfg['version']} locally (from cache)")
+
+    if not head.find("link", href=rel_href):
+        head.append(soup.new_tag("link", rel="stylesheet", href=rel_href))
+    report.icon_font_selfhosted = True
+
+
+def ensure_icon_fonts(soup, html_path, report, dry_run=False):
+    """If the page uses icons (Font Awesome and/or Bootstrap glyphicons), make them actually
+    render: detect the Font Awesome MAJOR from the markup, remap glyphicons onto it, and
+    self-host that matching Font Awesome locally. No-op (no network) on pages with no icons."""
+    ver, glyph_tags = _detect_icon_font(soup)
+    if not ver and not glyph_tags:
+        return
+    if glyph_tags and not ver:
+        ver = "fa4"  # glyphicons are Bootstrap-3 era - pair them with FA4
+    if glyph_tags:
+        rewrite_glyphicons_to_fa(soup, glyph_tags, report, prefix=FA_VARIANTS[ver]["glyph_prefix"])
+    self_host_font_awesome(html_path, soup, report, ver, dry_run=dry_run)
+
+    # Shield icons from EVERY global "* { font-family: ... !important }" reset - ours is
+    # already scoped, but the site theme almost always ships its own unscoped one that would
+    # otherwise blank every icon. Patch it in the surviving inline <style> blocks and in every
+    # linked local stylesheet (e.g. the extracted -custom.css).
+    for st in soup.find_all("style"):
+        txt = st.string if st.string is not None else st.get_text()
+        if txt and "font-family" in txt:
+            new = _shield_icons_from_font_resets(txt)
+            if new != txt:
+                st.string = new
+    if not dry_run:
+        for css_path in _local_stylesheet_paths(soup, html_path):
+            try:
+                txt = read_text_safe(css_path)
+            except OSError:
+                continue
+            if "font-family" not in txt:
+                continue
+            new = _shield_icons_from_font_resets(txt)
+            if new != txt:
+                css_path.write_text(new, encoding="utf-8")
 
 
 def clean_data_and_event_attrs(soup):
@@ -1681,11 +2002,52 @@ WAYBACK_ASSET_URL_RE = re.compile(
 )
 
 
-RECOVERY_FETCH_RETRIES = 2  # web.archive.org routinely throttles / responds slowly when a
-# run recovers several assets back-to-back - a file that's genuinely present in the archive
-# (fetchable fine on its own) was being lost permanently to a single transient timeout, then
-# downgraded to a bare filename that loses the archive URL so it can't be re-recovered later.
-# Retry with a short backoff before giving up, so only genuinely-gone assets actually fail.
+RECOVERY_FETCH_RETRIES = 1  # one gentle retry covers the common transient web.archive.org
+# hiccup (a genuinely-present asset lost to a single slow response) without turning a page
+# full of genuinely-gone assets into minutes of backoff sleeps. Kept SHORT on purpose - the
+# earlier 2-retry / 1.5s+3s-backoff version made cleanup ~10x slower on any Bootstrap site
+# (many failing CDX lookups x big sleeps). Not recovering framework icon fonts at all (see
+# _recover_css_asset) removes most of those failing lookups in the first place.
+
+
+# web.archive.org rate-limits aggressively per-IP: two cleanups recovering assets at the same
+# time stampede it, every request then hangs to its 10s timeout instead of ~0.5s, and a page
+# that cleans in 30s alone sits for minutes in parallel. Serialize ONLY archive.org fetches
+# across every thread so we stay a single, polite stream and never trip the throttle. Other
+# hosts (Google Fonts on gstatic, Font Awesome on cdnjs) aren't throttle-sensitive and must NOT
+# share this lock, or parallel cleanups needlessly serialize their font/icon downloads too.
+_ARCHIVE_FETCH_LOCK = threading.Semaphore(1)
+
+
+class CleanupCancelled(BaseException):
+    """Raised when the running cleanup's cancel checkpoint fires, so it can be aborted from the
+    UI - at phase boundaries, inside the per-asset recovery loops, AND inside any network fetch.
+    Subclasses BaseException (not Exception) on purpose: the recovery loops wrap fetches in
+    `except Exception: continue`, which would otherwise swallow the cancellation and keep going."""
+
+
+# Per-thread cancel hook: clean_html_file installs its cancelled() callback here for the duration
+# of the run, so the shared low-level network fetch can become a cancellation point without every
+# intermediate function having to thread a `cancelled` argument through. Thread-local => each
+# parallel cleanup sees only its own.
+_CANCEL_TL = threading.local()
+
+
+def _set_cancel_check(fn):
+    _CANCEL_TL.check = fn
+
+
+def _cancel_active():
+    fn = getattr(_CANCEL_TL, "check", None)
+    return fn is not None and fn()
+
+
+def _raise_if_cancelled(cancelled=None):
+    """Raise CleanupCancelled if either the explicit callback OR the thread-local hook says so."""
+    if cancelled is not None and cancelled():
+        raise CleanupCancelled()
+    if _cancel_active():
+        raise CleanupCancelled()
 
 
 def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH_RETRIES):
@@ -1693,15 +2055,24 @@ def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH
     import urllib.request
 
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (image-recovery-bot)"})
+    use_lock = "archive.org" in url  # only the throttle-sensitive archive host is serialized
     last_err = None
     for attempt in range(retries + 1):
+        _raise_if_cancelled()  # every network attempt is a cancellation point
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
+            if use_lock:
+                with _ARCHIVE_FETCH_LOCK:
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        return resp.read()
+            else:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read()
+        except CleanupCancelled:
+            raise
         except Exception as e:  # noqa: BLE001 - retry any transient network/HTTP failure
             last_err = e
             if attempt < retries:
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(0.5)
     raise last_err
 
 
@@ -1829,6 +2200,27 @@ def _recover_css_asset(raw_url, css_path, report, site_domain):
         original_url, fragment = original_url.split("#", 1)
         fragment = "#" + fragment
     name = Path(urlsplit(original_url).path).name or "asset"
+    # Framework icon fonts (Bootstrap glyphicons, Font Awesome, ...) never actually lived at
+    # "<site domain>/<file>" - they shipped from the framework/CDN - so hitting the archive
+    # for them is pure wasted time: each is a slow CDX round-trip that always fails AND the
+    # burst of them triggers web.archive.org rate-limiting that then slows the assets that
+    # CAN be recovered. This was the bulk of the cleanup slowdown on any Bootstrap/FA site.
+    # Skip the network entirely and neutralize the reference the same way a failed recovery
+    # would; self-hosting the real icon font is a separate, deliberate step (not archive).
+    if any(hint in name.lower() for hint in ICON_FONT_HINTS) or _ICON_WEBFONT_RE.search(name):
+        return to_relative(raw_url, site_domain) if timestamp is None else name
+    # Asset served from a third-party font/framework CDN - never the site's own file; the cleaner
+    # re-injects fonts/icons fresh. Skip the network entirely (see _FONT_CDN_HOSTS).
+    host = domain_of(original_url)
+    if host and matches_suffix(host, _FONT_CDN_HOSTS):
+        return to_relative(raw_url, site_domain) if timestamp is None else name
+    # A saved Google-Fonts stylesheet (fonts.googleapis.com/css?... / /css2?... gets saved as a
+    # file named literally "css" or "css2") references only Google's own font files - often with
+    # their gstatic host already rewritten to the site's own domain, so the CDN check above misses
+    # them. The cleaner re-injects Google Fonts fresh and drops this stylesheet as unused anyway,
+    # so recovering its fonts from the archive is pure wasted time (dozens of failing lookups).
+    if css_path.name.lower() in ("css", "css2") and Path(name).suffix.lower() in CSS_FONT_EXTS:
+        return to_relative(raw_url, site_domain) if timestamp is None else name
     if Path(name).suffix.lower() not in CSS_RECOVERABLE_EXTS:
         if timestamp is None:
             # Bare same-domain absolute URL, not an asset type we know how to fetch -
@@ -1859,7 +2251,7 @@ def _recover_css_asset(raw_url, css_path, report, site_domain):
     return name
 
 
-def clean_local_linked_files(html_path, report=None, site_domain=None):
+def clean_local_linked_files(html_path, report=None, site_domain=None, cancelled=None):
     """Strip every remaining web.archive.org time-travel wrapper out of EVERY local
     text-based asset file next to the site - not just the HTML page and its <link
     rel=stylesheet> CSS (that used to be all clean_local_css_files touched). A wayback
@@ -1881,6 +2273,7 @@ def clean_local_linked_files(html_path, report=None, site_domain=None):
     site_root = html_path.parent
     changed = []
     for path in site_root.rglob("*"):
+        _raise_if_cancelled(cancelled)  # bail promptly if the user hit "Отменить"
         if not path.is_file():
             continue
         if any(part in QUARANTINE_DIR_NAMES for part in path.parts):
@@ -1902,6 +2295,7 @@ def clean_local_linked_files(html_path, report=None, site_domain=None):
         is_css = _looks_like_css(text, suffix)
         if is_css and report is not None:
             def _sub_css_url(m):
+                _raise_if_cancelled(cancelled)  # a big framework CSS = many url() fetches; stay abortable per-url
                 quote, raw_url = m.group(1), m.group(2)
                 new_ref = _recover_css_asset(raw_url, path, report, site_domain)
                 if new_ref is None:
@@ -1942,7 +2336,7 @@ def _looks_like_corrupted_wayback_asset(data):
     return any(marker in sample for marker in CORRUPTED_ASSET_MARKERS)
 
 
-def recover_corrupted_local_assets(html_path, report, site_domain=None):
+def recover_corrupted_local_assets(html_path, report, site_domain=None, cancelled=None):
     """Sweep every local raster-image file anywhere under the site folder for the
     wayback-html-masquerading-as-image problem (see _looks_like_corrupted_wayback_asset)
     and try to recover the REAL file. Unlike the CSS-url() wayback-wrapper case, a
@@ -1959,6 +2353,7 @@ def recover_corrupted_local_assets(html_path, report, site_domain=None):
     site_root = html_path.parent
     bare_domain = _bare_domain(site_domain)
     for path in sorted(site_root.rglob("*")):
+        _raise_if_cancelled(cancelled)  # each corrupted asset can cost a ~10s CDX fetch - stay abortable
         if not path.is_file() or path.suffix.lower() not in CSS_BG_RASTER_EXTS:
             continue
         if any(part in QUARANTINE_DIR_NAMES for part in path.relative_to(site_root).parts):
@@ -1992,6 +2387,84 @@ def recover_corrupted_local_assets(html_path, report, site_domain=None):
             f"{rel}: was a wayback error page saved as a local image, could not recover the real file - quarantined"
         )
         print(f"[corrupted-asset] FAILED, quarantined: {rel}")
+
+
+def localize_media_refs(soup, html_path, site_domain, report, dry_run=False, cancelled=None):
+    """No <img>/<source>/<video>/<audio> should point at an ABSOLUTE same-domain URL (e.g.
+    "https://mysite.com/clip.mp4") - those must be local. For every such ref: relink it to the
+    matching local file if it exists, else recover it from the archive and save it locally,
+    else - it's genuinely dead - drop the ref and remove any <img>/<video>/<audio> left with
+    no working source. Relative refs are left to the existing image-recovery / image-picker
+    flow; only same-domain-absolute ones are rewritten here."""
+    if not site_domain:
+        return
+    site_root = html_path.parent
+    bare = _bare_domain(site_domain)
+    recovered_dir = html_path.with_name(html_path.stem + "_files") / "_recovered"
+
+    local_by_name = {}
+    for p in site_root.rglob("*"):
+        if p.is_file() and not any(part in QUARANTINE_DIR_NAMES for part in p.relative_to(site_root).parts):
+            local_by_name.setdefault(p.name, p)
+
+    def _localize(url):
+        """(new_ref, dead) for a single ref - only touches same-domain absolute URLs."""
+        u = unwayback((url or "").strip())
+        if not u or not (is_external(u) and matches_suffix(domain_of(u), {bare})):
+            return url, False  # not a same-domain absolute ref - leave it
+        name = Path(urlsplit(u.split("?")[0].split("#")[0]).path).name or "asset"
+        found = local_by_name.get(name)
+        if found:
+            rel = os.path.relpath(found, site_root).replace(os.sep, "/")
+            report.localized_media.append(f"{u} -> {rel}")
+            return rel, False
+        if not dry_run:
+            try:
+                data, _ext = recover_asset_bytes(u.split("#")[0])
+            except Exception:  # noqa: BLE001
+                data = None
+            if data:
+                recovered_dir.mkdir(parents=True, exist_ok=True)
+                dest = recovered_dir / name
+                dest.write_bytes(data)
+                local_by_name.setdefault(name, dest)
+                rel = os.path.relpath(dest, site_root).replace(os.sep, "/")
+                report.recovered_images.append(f"{u} -> {rel} (media)")
+                report.localized_media.append(f"{u} -> {rel}")
+                return rel, False
+        return None, True  # same-domain absolute AND unrecoverable -> dead
+
+    for tag in soup.find_all(["img", "source", "video", "audio"]):
+        _raise_if_cancelled(cancelled)  # recovery per tag can hit the network - stay abortable
+        for attr in ("src", "poster"):
+            if tag.has_attr(attr):
+                ref, dead = _localize(tag[attr])
+                if dead:
+                    report.detached_media.append(f"<{tag.name} {attr}=\"{tag[attr]}\">")
+                    del tag[attr]
+                elif ref != tag[attr]:
+                    tag[attr] = ref
+        if tag.has_attr("srcset"):
+            kept = []
+            for part in tag["srcset"].split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                bits = part.split(" ", 1)
+                ref, dead = _localize(bits[0])
+                if not dead:
+                    kept.append(ref + ((" " + bits[1]) if len(bits) > 1 else ""))
+            if kept:
+                tag["srcset"] = ", ".join(kept)
+            else:
+                del tag["srcset"]
+        if tag.name in ("img", "source") and not tag.get("src") and not tag.get("srcset"):
+            tag.decompose()
+
+    for tag in soup.find_all(["video", "audio"]):
+        if not tag.get("src") and not tag.find("source"):
+            report.detached_media.append(f"<{tag.name}> (no working source)")
+            tag.decompose()
 
 
 def clean_iframes(soup, report):
@@ -2691,7 +3164,15 @@ def clean_html_file(
     favicon=None,
     recover_images=True,
     domain_override=None,
+    progress=None,
+    cancelled=None,
 ):
+    # Install this run's cancel hook for the whole thread, so even the low-level network fetches
+    # (font/icon downloads, archive recovery) abort promptly - not just the phase boundaries.
+    # Overwritten at the start of every call, so parallel cleanups (each its own thread) and
+    # repeated CLI calls never see a stale hook.
+    _set_cancel_check(cancelled)
+
     original_text = read_text_safe(html_path)
     # A stray element between <html> and <head> (e.g. wayback/YUI's
     # <div id="yui3-css-stamp">) makes some parsers misplace <head>'s
@@ -2700,6 +3181,15 @@ def clean_html_file(
     soup = BeautifulSoup(preclean_text, PARSER)
     normalize_charset_meta(soup)
     report = Report()
+
+    def _p(pct, msg):
+        # optional live-progress callback (site_studio streams this to the UI); no-op for CLI.
+        # Also a cancellation checkpoint: a cancelled job aborts at the next phase boundary.
+        _raise_if_cancelled(cancelled)
+        if progress:
+            progress(pct, msg)
+
+    _p(4, "Читаю и разбираю страницу")
 
     content_domain = get_site_domain(soup)
     site_domain = domain_override or _domain_from_folder_name(html_path) or content_domain
@@ -2710,18 +3200,21 @@ def clean_html_file(
         if bare_content.lower() != bare_site.lower():
             old_domain = content_domain
 
+    _p(9, "Восстанавливаю недостающие картинки из архива")
     if recover_images:
         recover_missing_local_images(soup, html_path, report, dry_run=dry_run)
 
     check_and_fix_redirect(soup, site_domain, report)
     check_and_fix_noindex(soup, report)
 
+    _p(28, "Снимаю обёртки веб-архива, тулбар и мусор")
     strip_wayback_comment_and_html_attrs(soup)
     strip_wayback_toolbar(soup)
     unwayback_all_attrs(soup)
     clean_scripts(soup, report)
     clean_stylesheet_links(soup, report)
     strip_cms_meta_links(soup, report)
+    _p(44, "Вырезаю скрипты, мету и следы владельца")
     strip_owner_traces(soup, update_year=True, report=report)
     clean_head_styles(soup, report, html_path)
     promote_src(soup)
@@ -2729,15 +3222,29 @@ def clean_html_file(
     clean_data_and_event_attrs(soup)
     # Empty fonts_param -> try to detect a font already used on this page (falls back
     # to a random preset if the page only declares generic/system-default fonts).
+    _p(56, "Подключаю шрифт (скачиваю локально)")
     inject_google_fonts(soup, resolve_font_input(fonts_param, soup=soup, html_path=html_path), html_path=html_path)
     inject_image_object_fit_style(soup)
+    _p(60, "Иконки: чиню и подключаю Font Awesome")
+    ensure_icon_fonts(soup, html_path, report, dry_run=dry_run)
     clean_links_a(soup, site_domain, report)
+    localize_media_refs(soup, html_path, site_domain, report, dry_run=dry_run, cancelled=cancelled)
     if not keep_contact_info:
         strip_contact_info(soup, report, old_domain=old_domain)
     clean_iframes(soup, report)
     scan_content_flags(soup, report)
     detect_and_report_logo(soup, report)
-    favicon_brand_hint = _bare_domain(site_domain).split(".")[0] if site_domain else None
+    # Domain override given -> rebrand from it: generate a text wordmark logo named after the
+    # domain (example.com -> "Example"), swap it in for the old image/text logo, and update
+    # <title>/og. Opt-in: only fires when the user explicitly set a target domain.
+    effective_brand = None
+    if domain_override and site_domain:
+        _p(64, "Ставлю логотип по домену")
+        derived = apply_auto_logo(soup, html_path, site_domain, report, dry_run=dry_run)
+        effective_brand = derived or _brand_name_from_domain(site_domain) or "Site"
+        apply_brand_text(soup, effective_brand, report)
+    _p(70, "Ссылки, контакты, favicon, SEO-файлы")
+    favicon_brand_hint = effective_brand or (_bare_domain(site_domain).split(".")[0] if site_domain else None)
     ensure_favicon(soup, html_path, favicon, report, dry_run=dry_run, brand_hint=favicon_brand_hint)
     ensure_local_seo_files(html_path, site_domain, report, dry_run=dry_run, overwrite=True)
     ensure_htaccess(html_path, report, dry_run=dry_run, overwrite=True)
@@ -2745,6 +3252,7 @@ def clean_html_file(
     check_internal_link_targets(soup, html_path, report)
     strip_empty_style_declarations(soup)
 
+    _p(82, "Записываю страницу")
     new_text = collapse_blank_lines(str(soup))
 
     print(f"\n### {html_path} (site domain detected: {site_domain or 'unknown'}) ###")
@@ -2752,14 +3260,15 @@ def clean_html_file(
 
     if dry_run:
         print("[dry-run] no files written")
-        return
+        return report.render()
 
     if backup:
         html_path.with_suffix(html_path.suffix + ".bak").write_text(original_text, encoding="utf-8")
     html_path.write_text(new_text, encoding="utf-8")
 
-    clean_local_linked_files(html_path, report=report, site_domain=site_domain)
-    recover_corrupted_local_assets(html_path, report, site_domain=site_domain)
+    _p(88, "Чищу CSS/JS и восстанавливаю ассеты из архива")
+    clean_local_linked_files(html_path, report=report, site_domain=site_domain, cancelled=cancelled)
+    recover_corrupted_local_assets(html_path, report, site_domain=site_domain, cancelled=cancelled)
     move_orphaned_wayback_assets(html_path, new_text, report)
     local_css_texts = []
     for link in soup.find_all("link", rel=lambda v: v and "stylesheet" in v):
@@ -2768,10 +3277,13 @@ def clean_html_file(
             css_path = (html_path.parent / href).resolve()
             if css_path.is_file() and css_path.suffix.lower() == ".css":
                 local_css_texts.append(read_text_safe(css_path))
+    _p(96, "Убираю неиспользуемые файлы")
     remove_unused_local_assets(html_path, new_text, report, dry_run=dry_run, extra_texts=local_css_texts)
 
     report_path = html_path.with_name(html_path.name + ".cleanup-report.txt")
-    report_path.write_text(report.render(), encoding="utf-8")
+    rendered = report.render()
+    report_path.write_text(rendered, encoding="utf-8")
+    return rendered  # caller reports 100% after any post-steps (e.g. menu auto-link)
 
 
 def check_url_live(url):
