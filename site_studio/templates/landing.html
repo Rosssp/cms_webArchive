@@ -75,6 +75,11 @@
     align-items:center; justify-content:center; gap:8px; font-size:12.5px; font-weight:600; letter-spacing:.5px;
     opacity:0; transition:opacity .16s}
   .thumb:hover .open-hint{opacity:1}
+  .thumb .open-hint svg{width:20px; height:20px; flex-shrink:0}
+  .thumb .skel{position:absolute; inset:0; z-index:3;
+    background:linear-gradient(90deg,#eeeae0 25%,#f6f2ea 37%,#eeeae0 63%); background-size:400% 100%;
+    animation:skelsh 1.3s ease-in-out infinite}
+  @keyframes skelsh{0%{background-position:100% 0}100%{background-position:-100% 0}}
   .thumb .badge{position:absolute; top:10px; left:10px; background:rgba(255,255,255,.94); color:var(--green);
     font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.8px; padding:4px 9px; border-radius:20px;
     box-shadow:0 3px 10px rgba(0,0,0,.12)}
@@ -96,6 +101,19 @@
   .prog .fill.pulse{background-size:200% 100%; animation:sh 1.4s linear infinite}
   @keyframes sh{0%{background-position:200% 0}100%{background-position:-200% 0}}
   .card-err{font-size:12px; color:var(--red); font-weight:600; line-height:1.4}
+
+  /* www / non-www canonical toggle */
+  .wwwtog{display:inline-flex; margin:2px 0 2px; border:1px solid var(--border-strong); border-radius:8px; overflow:hidden; align-self:flex-start}
+  .wtg{padding:4px 10px; font-size:11px; font-weight:700; color:var(--text-dim); background:var(--surface); cursor:pointer; letter-spacing:.02em}
+  .wtg + .wtg{border-left:1px solid var(--border)}
+  .wtg:hover{background:#efeadf}
+  .wtg.on{background:var(--green); color:#fff}
+  .wtg.on:hover{background:var(--green)}
+  .wwwtog.busy{display:inline-flex; align-items:center; gap:7px; padding:5px 11px; border:1px solid var(--border-strong);
+    border-radius:8px; font-size:11px; font-weight:700; color:var(--text-dim); align-self:flex-start}
+  .wwwtog.busy::before{content:''; width:11px; height:11px; border:2px solid var(--border); border-top-color:var(--green);
+    border-radius:50%; animation:wspin .7s linear infinite}
+  @keyframes wspin{to{transform:rotate(360deg)}}
 
   /* action buttons */
   .acts{display:flex; flex-wrap:wrap; gap:7px; margin-top:auto; padding-top:4px}
@@ -206,6 +224,8 @@ function cardHTML(e){
   const cleaned = e.clean_done;
   const dlErr = e.dl_error;
   const cleanErr = e.clean_error;
+  const isWww = (e.domain||'').toLowerCase().startsWith('www.');
+  const wwwBusy = _wwwBusy.has(e.id);
 
   // thumbnail
   let thumb;
@@ -224,7 +244,7 @@ function cardHTML(e){
   else if(e.clean_cancelled) badge = '<div class="badge amber">отменено</div>';
   else if(dlErr||cleanErr) badge = '<div class="badge red">ошибка</div>';
   else if(e.dl_done) badge = '<div class="badge">скачано</div>';
-  thumb += badge + '</div>';
+  thumb += badge + (wwwBusy ? '<div class="skel"></div>' : '') + '</div>';
 
   // progress / status area
   let mid = '';
@@ -251,9 +271,21 @@ function cardHTML(e){
     const canClean = e.dl_done && !dlErr;
     acts = '';
     if(canClean) acts += `<button class="b b-clean" data-clean="${e.id}">${SVG.broom}${cleanLabel}</button>`;
-    if(cleaned) acts += `<button class="b b-studio" data-open="${e.id}">${SVG.studio}В студию</button>`;
+    // studio opens for ANY downloaded site (adopted-from-disk included), not only cleaned ones
+    if(e.site_dir && !dlErr) acts += `<button class="b b-studio" data-open="${e.id}">${SVG.studio}В студию</button>`;
     if(e.site_dir) acts += `<button class="b b-ghost b-icon" data-folder="${e.id}" title="Открыть папку">${SVG.folder}</button>`;
     acts += `<button class="b b-ghost b-icon" data-remove="${e.id}" title="Удалить карточку">${SVG.trash}</button>`;
+  }
+
+  // www / non-www canonical toggle (only once the site is on disk and idle)
+  let wwwTog = '';
+  if(e.dl_done && e.site_dir && !cleaning && !dlErr){
+    wwwTog = wwwBusy
+      ? `<div class="wwwtog busy">меняю форму домена…</div>`
+      : `<div class="wwwtog" title="Каноническая форма домена — переименует папку и обновит canonical / robots / sitemap / .htaccess / ссылку логотипа по всему проекту">
+      <button class="wtg${isWww?'':' on'}" data-www="${e.id}" data-form="nonwww">non-www</button>
+      <button class="wtg${isWww?' on':''}" data-www="${e.id}" data-form="www">www</button>
+    </div>`;
   }
 
   return `<div class="card" data-id="${e.id}">
@@ -261,6 +293,7 @@ function cardHTML(e){
     <div class="body">
       <div class="dom">${esc(e.domain||'—')}</div>
       <div class="url">${esc(e.url)}</div>
+      ${wwwTog}
       ${mid}
       <div class="acts">${acts}</div>
     </div>
@@ -269,6 +302,7 @@ function cardHTML(e){
 
 // keep a small per-card cache-buster so the preview <img> reloads when clean finishes
 const _pv = {};
+const _wwwBusy = new Set();  // cards mid www<->non-www switch - render a skeleton on them
 function render(entries){
   const head = $('#gridHead'), grid = $('#grid');
   if(!entries.length){ head.style.display='none'; grid.innerHTML=''; return; }
@@ -293,10 +327,24 @@ function openStudio(id, e){
 
 let _entries = [];
 document.addEventListener('click', ev=>{
-  const t = ev.target.closest('[data-clean],[data-cancel],[data-remove],[data-folder],[data-open]');
+  const t = ev.target.closest('[data-clean],[data-cancel],[data-remove],[data-folder],[data-open],[data-www]');
   if(!t) return;
   const find = id => _entries.find(x=>x.id===id);
-  if(t.dataset.clean){ api('/api/entry/clean',{id:t.dataset.clean}).then(r=>{ if(!r.ok) alert(r.error||''); poll(); }); }
+  if(t.dataset.www){
+    // switch canonical form: server renames the folder + (if already cleaned) does a LIGHT
+    // re-canonicalize across the whole project (canonical / logo link / robots / sitemap /
+    // .htaccess). No full cleanup. Show a skeleton on the card until it's applied.
+    const id = t.dataset.www;
+    _wwwBusy.add(id);
+    render(_entries);
+    const t0 = Date.now();
+    api('/api/entry/set-www',{id, www: t.dataset.form==='www'}).then(r=>{
+      // keep the skeleton up for a visible minimum even if the swap was instant
+      const wait = Math.max(0, 500 - (Date.now() - t0));
+      setTimeout(()=>{ _wwwBusy.delete(id); if(!r.ok) alert(r.error||''); poll(); }, wait);
+    });
+  }
+  else if(t.dataset.clean){ api('/api/entry/clean',{id:t.dataset.clean}).then(r=>{ if(!r.ok) alert(r.error||''); poll(); }); }
   else if(t.dataset.cancel){ api('/api/entry/cancel',{id:t.dataset.cancel}).then(poll); }
   else if(t.dataset.remove){ api('/api/entry/remove',{id:t.dataset.remove}).then(poll); }
   else if(t.dataset.folder){ api('/api/entry/open-folder',{id:t.dataset.folder}).then(r=>{ if(!r.ok) alert(r.error||''); }); }

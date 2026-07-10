@@ -380,6 +380,60 @@ def api_entry_open_folder():
     return jsonify({"ok": True})
 
 
+@app.route("/api/entry/set-www", methods=["POST"])
+def api_entry_set_www():
+    """Switch a downloaded site between www and non-www by RENAMING its folder. Does NOT re-run
+    the full cleanup (that destroys already-clean sites). If the site was already cleaned, it
+    only re-canonicalizes to the new form: <canonical>, absolute in-page domain links (logo),
+    and robots.txt/sitemap.xml/.htaccess. A not-yet-cleaned site is just renamed - the form is
+    picked up whenever the user runs cleanup."""
+    body = request.json or {}
+    eid = body.get("id")
+    want_www = bool(body.get("www"))
+    with ENTRIES_LOCK:
+        e = ENTRIES.get(eid)
+        if not e:
+            return jsonify({"ok": False, "error": "карточки нет"}), 400
+        if not e.get("dl_done") or not e.get("site_dir"):
+            return jsonify({"ok": False, "error": "сайт ещё не скачан"}), 400
+        if e.get("clean_running"):
+            return jsonify({"ok": False, "error": "идёт очистка — подожди"}), 400
+        old_dir = Path(e["site_dir"])
+        domain = (e.get("domain") or old_dir.name).lower()
+        was_cleaned = bool(e.get("clean_done"))
+    bare = domain[4:] if domain.startswith("www.") else domain
+    new_domain = ("www." + bare) if want_www else bare
+    if new_domain == domain:
+        return jsonify({"ok": True, "changed": False, "domain": domain})
+    new_dir = old_dir.parent / new_domain
+    if new_dir.exists():
+        return jsonify({"ok": False, "error": f"папка «{new_domain}» уже существует"}), 400
+    try:
+        os.rename(old_dir, new_dir)
+    except Exception as ex:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"не удалось переименовать: {ex}"}), 400
+    with ENTRIES_LOCK:
+        e = ENTRIES.get(eid)
+        if e:
+            e["site_dir"] = str(new_dir)
+            e["domain"] = new_domain
+    if STATE.get("site_dir") and str(STATE["site_dir"]) == str(old_dir):
+        STATE["site_dir"] = new_dir
+        STATE["html_path"] = new_dir / "index.html"
+    # Adopted-from-disk sites carry no clean_done flag - detect a prior cleanup by its report file.
+    if not was_cleaned:
+        was_cleaned = any(new_dir.glob("*.cleanup-report.txt"))
+    # Already-clean site: light re-canonicalize to the new form (canonical + logo/domain links +
+    # robots/sitemap/.htaccess). A raw (not-yet-cleaned) site is just renamed.
+    if was_cleaned:
+        try:
+            clean_wayback_site.recanonicalize_domain(new_dir, new_domain)
+        except Exception as ex:  # noqa: BLE001
+            return jsonify({"ok": True, "changed": True, "domain": new_domain, "site_dir": str(new_dir),
+                            "warning": f"переименовано, но канониклы не обновились: {ex}"})
+    return jsonify({"ok": True, "changed": True, "domain": new_domain, "site_dir": str(new_dir)})
+
+
 @app.route("/api/entry/preview")
 def api_entry_preview():
     eid = request.args.get("id")
@@ -707,7 +761,7 @@ def api_cleanup():
                     (body.get("fonts") or "").strip() or None,
                     dry_run=bool(body.get("dry_run")),
                     backup=not body.get("no_backup"),
-                    keep_contact_info=bool(body.get("keep_contact_info")),
+                    keep_contact_info=bool(body.get("keep_contact_info", True)),
                     favicon=favicon,
                     recover_images=not body.get("no_image_recovery"),
                     domain_override=(body.get("domain") or "").strip() or None,
@@ -763,10 +817,12 @@ def api_ensure_seo():
     try:
         text = clean_wayback_site.read_text_safe(STATE["html_path"])
         soup = clean_wayback_site.BeautifulSoup(text, clean_wayback_site.PARSER)
-        site_domain = domain_override or clean_wayback_site.get_site_domain(soup)
+        site_domain = (domain_override
+                       or clean_wayback_site._domain_from_folder_name(STATE["html_path"])
+                       or clean_wayback_site.get_site_domain(soup))
         report = clean_wayback_site.Report()
         clean_wayback_site.ensure_local_seo_files(STATE["html_path"], site_domain, report, dry_run=False)
-        clean_wayback_site.ensure_htaccess(STATE["html_path"], report, dry_run=False)
+        clean_wayback_site.ensure_htaccess(STATE["html_path"], report, dry_run=False, site_domain=site_domain)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 

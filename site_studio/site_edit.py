@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from clean_wayback_site import BeautifulSoup, PARSER, _ensure_pillow, normalize_font_family, read_text_safe  # noqa: E402
+from clean_wayback_site import BeautifulSoup, PARSER, _ensure_pillow, normalize_font_family, read_text_safe, collapse_blank_lines  # noqa: E402
 
 _CSS_RULE_RE = re.compile(r"([^{}]+)\{([^{}]*)\}")
 _BG_URL_RE = re.compile(r"background(?:-image)?\s*:\s*[^;]*?url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", re.IGNORECASE)
@@ -1109,6 +1109,20 @@ def _nav_menu_links(container):
     return out
 
 
+def _find_logo_link(soup):
+    """The clickable logo/brand link (usually <a class="navbar-brand"> wrapping the logo <img>).
+    It's the site's real "home" link, so auto_link_menu rewrites its href to the absolute
+    canonical-domain URL. Prefer an explicit brand class; else the first text-less <a> that
+    wraps an <img> inside the header/nav region."""
+    a = soup.find("a", class_=re.compile(r"navbar-brand|(?:^|[\s_-])logo|brand", re.I))
+    if a is not None:
+        return a
+    for cand in soup.find_all("a"):
+        if cand.find("img") and not cand.get_text(strip=True) and cand.find_parent(["header", "nav"]):
+            return cand
+    return None
+
+
 def _find_header_nav(soup):
     """The site's primary top navigation: a <header>/<nav> if present, else the first
     nav-classed <div>/<ul> holding 2+ menu links (many exports drop the semantic tag and use
@@ -1144,6 +1158,23 @@ def _looks_like_footer_nav(footer):
     return len(links) >= 2
 
 
+def _fallback_section_blocks(soup, nav_desc):
+    """When a page has no <section> tags (common in older exports that lay content out as
+    <div class="content-section-a"> blocks straight under <body>), use the content root's
+    direct children that carry a heading as the sections instead. Skips nav/header/footer
+    (and their descendants) and non-element nodes; returns block elements in document order."""
+    root = soup.find("main") or soup.body or soup
+    out = []
+    for ch in root.find_all(recursive=False):
+        if not getattr(ch, "name", None) or ch.name in ("nav", "header", "footer", "script", "style"):
+            continue
+        if id(ch) in nav_desc:
+            continue
+        if ch.find(HEADING_TAGS):
+            out.append(ch)
+    return out
+
+
 def _content_sections(soup):
     """Real content sections a nav item can point to - <section> blocks NOT inside a
     header/nav/footer, each carrying a heading. Each entry knows its anchor element, heading
@@ -1156,7 +1187,9 @@ def _content_sections(soup):
             nav_desc.add(id(c))
             nav_desc.update(id(x) for x in c.find_all(True))
     out = []
-    for sec in soup.find_all("section"):
+    # Prefer real <section> tags; fall back to heading-bearing top-level blocks when the page
+    # has none (bad-semantics exports where sections are plain <div>s).
+    for sec in (soup.find_all("section") or _fallback_section_blocks(soup, nav_desc)):
         if id(sec) in nav_desc:
             continue
         if re.search(r"(?:^|[\s_-])(?:hero|banner|masthead|jumbotron)(?:[\s_-]|$)", _cls(sec), re.I):
@@ -1256,10 +1289,23 @@ def auto_link_menu(site_dir):
         soup = _read_soup(p)
         rel_self = p.relative_to(site_dir).as_posix()
         bare = cw._bare_domain(cw._domain_from_folder_name(p) or cw.get_site_domain(soup) or "")
+        # Full form (keeps www if the folder is named www.<domain>) - the header "Home" link
+        # points at this as an absolute canonical-domain URL.
+        site_domain_full = (cw._domain_from_folder_name(p) or cw.get_site_domain(soup) or "")
         sections = _content_sections(soup)
         used = set()
         dirty = False
         header_map = {}  # slug(original text) -> (href, label)
+
+        # The LOGO is the real "home" link -> absolute canonical-domain URL (www/non-www form
+        # from the folder name). The nav menu below stays in-page anchors only.
+        logo = _find_logo_link(soup)
+        if logo is not None and site_domain_full:
+            home_url = f"https://{site_domain_full}/"
+            if logo.get("href") != home_url:
+                logo["href"] = home_url
+                linked.append(f'{rel_self}: logo -> {home_url}')
+                dirty = True
 
         def _broken(a, _bare=bare):
             href = (a.get("href") or "").strip()
@@ -1284,10 +1330,18 @@ def auto_link_menu(site_dir):
             words = _slug_words(orig)
             if not words:
                 return None
-            pm = _page_match(words)
-            if pm:
-                a["href"] = os.path.relpath(site_dir / pm, p.parent).replace(os.sep, "/")
-                return a.get_text(" ", strip=True)
+            if short:
+                # Header nav is ALWAYS in-page section anchors - never a page/absolute link, and
+                # never special-cased by NAME: "Home" / "Startseite" / "الرئيسية" all map to a
+                # section the same way (by word-overlap, else next-in-order). The site language
+                # is unknowable, so we never key off an English word. The LOGO (handled above)
+                # carries the absolute home-domain link.
+                pass  # -> fall through to _best_section
+            else:
+                pm = _page_match(words)
+                if pm:
+                    a["href"] = os.path.relpath(site_dir / pm, p.parent).replace(os.sep, "/")
+                    return a.get_text(" ", strip=True)
             sec = _best_section(orig, sections, used)
             if not sec:
                 return None
@@ -1354,7 +1408,12 @@ def auto_link_menu(site_dir):
                     linked.append(f'{rel_self}: footer "{orig}" -> {a["href"]}')
                     dirty = True
                 else:
-                    unresolved.append(f'{rel_self}: footer "{orig}" - секции закончились, не привязано')
+                    # A broken footer link with no section to point at is a dead link to a page
+                    # that doesn't exist in this export (policy/PDF pages etc.) - drop it outright
+                    # rather than leaving an empty "#" anchor sitting in the footer.
+                    _remove_nav_item(a)
+                    removed.append(f'{rel_self}: footer "{orig}" (dead link to a missing page, removed)')
+                    dirty = True
 
         if dirty:
             _write_soup(p, soup)
@@ -1386,6 +1445,21 @@ def format_for_upload(html_path, clean_unused=True):
         result["flattened_recovered"] = flatten_recovered_assets(html_path)
     except Exception as e:  # noqa: BLE001 - formatting shouldn't die on a flatten hiccup
         result["flattened_recovered_error"] = str(e)
+
+    # Tidy accumulated blank-line runs in every HTML page (legacy whitespace, CRLF gaps from
+    # the raw download, etc.) - formatting for upload should leave clean files, not bloated ones.
+    result["tidied"] = []
+    for hp in list(site_dir.rglob("*.html")):
+        if any(part in ("_wayback_removed", "_unused_removed") for part in hp.relative_to(site_dir).parts):
+            continue
+        try:
+            txt = read_text_safe(hp)
+            tidy = collapse_blank_lines(txt)
+            if tidy != txt:
+                hp.write_text(tidy, encoding="utf-8")
+                result["tidied"].append(hp.relative_to(site_dir).as_posix())
+        except OSError:
+            pass
 
     for p in list(site_dir.rglob("*")):
         if p.is_file() and (p.suffix.lower() in _FORMAT_REMOVE_SUFFIXES or p.name.endswith(".cleanup-report.txt")):

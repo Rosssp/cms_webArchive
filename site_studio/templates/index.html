@@ -292,7 +292,7 @@
     <input id="cleanDomain" placeholder="необязательно; если указать — ещё и поставит текст-логотип из домена (example.com → Example)">
 
     <div class="check"><input type="checkbox" id="cleanDryRun"><label for="cleanDryRun">Dry-run (только отчёт, ничего не менять)</label></div>
-    <div class="check"><input type="checkbox" id="cleanKeepContact"><label for="cleanKeepContact">Оставить mailto/tel/email/телефоны</label></div>
+    <div class="check"><input type="checkbox" id="cleanKeepContact" checked><label for="cleanKeepContact">Оставить контакты (mailto/tel/email/телефоны/адрес) — по умолчанию да</label></div>
     <div class="check"><input type="checkbox" id="cleanNoBackup"><label for="cleanNoBackup">Не делать .bak бэкап</label></div>
     <div class="check"><input type="checkbox" id="cleanNoImageRecovery"><label for="cleanNoImageRecovery">Не восстанавливать картинки из web.archive.org</label></div>
 
@@ -585,10 +585,10 @@
 
 <div id="preview-wrap">
   <div id="preview-bar">
+    <button class="secondary" style="width:auto; margin-top:0;" onclick="location.href='/'">← На главную</button>
     <button class="secondary" style="width:auto; margin-top:0;" onclick="reloadPreview()">↻ Обновить превью</button>
     <div id="page-tabs"></div>
     <div id="pickerBanner" class="picker-banner"><span class="dot"></span>Кликни элемент на превью · Esc</div>
-    <span class="path-pill" id="previewPath"></span>
   </div>
   <iframe id="preview" src="/preview/"></iframe>
 </div>
@@ -696,7 +696,6 @@ async function refreshStatus() {
   const r = await fetch('/api/status');
   const data = await r.json();
   document.getElementById('siteDir').value = data.site_dir || '';
-  document.getElementById('previewPath').textContent = data.site_dir ? data.site_dir : 'сайт не выбран';
   activePage = data.active_page || 'index.html';
   renderPageTabs(data.pages || [], activePage);
 }

@@ -107,9 +107,11 @@ def _scroll_to_bottom(page):
     page.wait_for_timeout(400)
 
 
-def download_wayback_site(archive_url, dest_root, progress=None):
+def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
     """Download `archive_url` (a web.archive.org page URL) into <dest_root>/<domain>/. Calls
-    progress(percent, message) as it goes. Returns {'site_dir', 'domain'}."""
+    progress(percent, message) as it goes. Returns {'site_dir', 'domain'}. The folder name IS
+    the canonical-domain switch downstream (canonical/robots/sitemap/.htaccess all follow it):
+    use_www=True names it 'www.<domain>' so the whole restored site becomes www-canonical."""
     def _p(pct, msg):
         if progress:
             progress(int(pct), msg)
@@ -118,7 +120,9 @@ def download_wayback_site(archive_url, dest_root, progress=None):
     from playwright.sync_api import sync_playwright
 
     original = _original_url(archive_url)
-    domain = cw.domain_of(original) or "site"
+    domain = cw.domain_of(original) or "site"  # domain_of() always strips a leading www.
+    if use_www and domain != "site" and not domain.startswith("www."):
+        domain = "www." + domain
     site_dir = Path(dest_root) / domain
     files_dir = site_dir / "index_files"
     files_dir.mkdir(parents=True, exist_ok=True)

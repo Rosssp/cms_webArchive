@@ -28,9 +28,8 @@ Cleans a Wayback-Machine-saved (or similarly bloated CMS export) static site:
     standalone .css file and links it instead.
   - moves now-orphaned local wayback asset files (athena.js, wombat.js, ...) into a
     "_wayback_removed" sub-folder instead of deleting them outright.
-  - removes mailto:/tel: links entirely and redacts stray email addresses / phone
-    numbers left in visible text or attributes (title/alt/content/placeholder/
-    aria-label/value). Disable with --keep-contact-info.
+  - KEEPS all contact info by default (mailto:/tel: links, email/phone/address text) -
+    cleanup never touches it. Opt in to stripping/redacting it with --strip-contact-info.
   - removes <iframe> embeds pointing to external domains (maps, video, widgets).
   - flags (does NOT auto-delete - too risky to guess boundaries) possible physical
     addresses, adult/casino/gambling keywords, mojibake and leaked raw HTML-as-text.
@@ -83,7 +82,8 @@ Options
                                               favicon <link>.
     --dry-run                                Only print the report, write nothing.
     --no-backup                              Skip the automatic ".bak" backup files.
-    --keep-contact-info                      Do not strip mailto:/tel:/email/phone.
+    --strip-contact-info                     Opt in to removing mailto:/tel: and
+                                              redacting email/phone/address (kept by default).
     --check-url URL                          Standalone live-site check (no folder
                                               needed): HTTPS, redirect, status code,
                                               robots.txt/sitemap.xml reachability.
@@ -1008,7 +1008,8 @@ def clean_scripts(soup, report):
         # 'keep' -> leave tag in place
 
 
-def clean_stylesheet_links(soup, report):
+def clean_stylesheet_links(soup, report, site_domain=None):
+    bare = _bare_domain(site_domain) if site_domain else ""
     for tag in soup.find_all("link"):
         href = tag.get("href", "")
         rel = tag.get("rel") or []
@@ -1023,7 +1024,12 @@ def clean_stylesheet_links(soup, report):
             continue
         if is_external(clean_href):
             d = domain_of(clean_href)
-            if matches_suffix(d, FONT_SERVICE_DOMAINS) or d not in LIBRARY_DOMAINS:
+            # A same-domain absolute link (e.g. "http://site/css/landing-page.css") is the
+            # site's OWN theme CSS, not an external service - keep it (localize_media_refs
+            # rewrites it to the local copy later). Only genuinely external, non-library
+            # (or font-service) stylesheets get dropped here.
+            same_site = bool(bare) and matches_suffix(d, {bare})
+            if not same_site and (matches_suffix(d, FONT_SERVICE_DOMAINS) or d not in LIBRARY_DOMAINS):
                 report.removed_links_css.append(href)
                 tag.decompose()
                 continue
@@ -1194,8 +1200,27 @@ def detect_site_font(soup, html_path):
     head = soup.find("head")
     if head:
         for style_tag in head.find_all("style"):
+            # Skip OUR OWN injected font/image style from a previous run - otherwise a re-clean
+            # detects the preset we last dropped in (e.g. Montserrat) instead of the site's real
+            # font (Lato), and the wrong typeface sticks forever.
+            if style_tag.has_attr("data-site-studio-font") or style_tag.has_attr("data-site-studio-img"):
+                continue
             _collect_font_family_tokens(unwayback(style_tag.get_text()), tokens)
+    scanned = set()
     for css_path in _local_stylesheet_paths(soup, html_path):
+        _collect_font_family_tokens(read_text_safe(css_path), tokens)
+        scanned.add(css_path)
+    # Also scan every .css physically in the site folder. The theme's main CSS (where the real
+    # brand font lives, e.g. landing-page.css -> "Lato") is often still linked by an ABSOLUTE
+    # same-domain URL at this point (localize_media_refs rewrites those to local paths later),
+    # so _local_stylesheet_paths - which skips is_external hrefs - would miss it. The file is on
+    # disk regardless, so read it straight off disk.
+    site_root = html_path.parent
+    for css_path in sorted(site_root.rglob("*.css")):
+        if css_path in scanned or css_path.name.endswith("-fonts.css"):
+            continue  # -fonts.css is our OWN injected font CSS - never re-detect from it
+        if any(part in QUARANTINE_DIR_NAMES for part in css_path.relative_to(site_root).parts):
+            continue
         _collect_font_family_tokens(read_text_safe(css_path), tokens)
 
     for name in tokens:
@@ -1423,8 +1448,6 @@ def inject_google_fonts(soup, fonts_param, html_path=None):
         except Exception:
             local_css = None
 
-    style_tag = soup.new_tag("style")
-    style_tag["data-site-studio-font"] = "local"
     parts = []
     if local_css:
         parts.append(local_css.strip())
@@ -1437,13 +1460,25 @@ def inject_google_fonts(soup, fonts_param, html_path=None):
         head.append(font_link)
     # Loading the font isn't enough - the site's own CSS still references whatever
     # font-family the original theme used, so nothing would actually render in the
-    # new font without a global override.
+    # new font without a global override. Exclude icon-font elements (see _ICON_EXCLUDE_SEL)
+    # so this !important doesn't clobber their font-family and blank every icon.
     if primary:
-        # Exclude icon-font elements from the global override (see _ICON_EXCLUDE_SEL) so this
-        # !important doesn't clobber their font-family and blank every icon.
         parts.append(f"*{_ICON_EXCLUDE_SEL} {{ font-family: '{primary}', sans-serif !important; }}")
-    if parts:
-        style_tag.string = "\n".join(parts)
+    if not parts:
+        return
+    css_body = "\n".join(parts) + "\n"
+    if html_path is not None:
+        # Write the font CSS to a SEPARATE stylesheet and LINK it (not an inline <head><style>);
+        # _reorder_head_seo then places this <link> right after <link canonical>.
+        fonts_css_path = html_path.with_name(html_path.stem + "-fonts.css")
+        fonts_css_path.write_text(css_body, encoding="utf-8")
+        link = soup.new_tag("link", rel="stylesheet", href=fonts_css_path.name)
+        link["data-site-studio-font"] = "local"
+        head.append(link)
+    else:
+        style_tag = soup.new_tag("style")
+        style_tag["data-site-studio-font"] = "local"
+        style_tag.string = css_body
         head.append(style_tag)
 
 
@@ -1736,7 +1771,7 @@ def strip_empty_style_declarations(soup):
             del tag["style"]
 
 
-_EXCESS_BLANK_LINES_RE = re.compile(r"\n[ \t]*\n(?:[ \t]*\n)+")
+_EXCESS_BLANK_LINES_RE = re.compile(r"\r?\n[ \t]*\r?\n(?:[ \t]*\r?\n)+")
 
 
 def collapse_blank_lines(text):
@@ -1772,15 +1807,19 @@ def unwayback_all_attrs(soup):
                 tag.attrs[attr] = unwayback(val)
 
 
-def clean_links_a(soup, site_domain, report):
+def clean_links_a(soup, site_domain, report, keep_contact_info=True):
     """Unwrap the wayback wrapper off every <a href> and rewrite same-domain links as
     relative paths. External/social links are NOT deleted anymore - just unwaybacked
-    and left in place as-is (the site owner may want them kept); only mailto:/tel: are
-    still removed outright (that's contact-info stripping, a separate concern)."""
+    and left in place as-is (the site owner may want them kept). mailto:/tel: links are
+    also KEPT by default (they're the site's real contact info) - they're removed only
+    when keep_contact_info is False (the opt-in contact-stripping pass)."""
     for a in soup.find_all("a", href=True):
         raw_href = a["href"]
         href = unwayback(raw_href)
         if href.startswith(("mailto:", "tel:")):
+            if keep_contact_info:
+                a["href"] = href  # keep the contact link, just normalize the wrapper off
+                continue
             report.removed_contact_links.append(href)
             _remove_a_and_empty_parent(a)
             continue
@@ -2466,6 +2505,34 @@ def localize_media_refs(soup, html_path, site_domain, report, dry_run=False, can
             report.detached_media.append(f"<{tag.name}> (no working source)")
             tag.decompose()
 
+    # Stylesheets and scripts must be localized the same way. Many exports link the theme's
+    # own CSS/JS by an ABSOLUTE same-domain URL (e.g. "http://site/css/bootstrap.min.css")
+    # while the file itself was saved into <name>_files/. Left as-is that ref is dead AND the
+    # local copy looks unreferenced, so remove_unused_local_assets quarantines bootstrap /
+    # landing-page.css and the whole layout collapses. Relink to the local file (recover if
+    # missing), or drop the ref if it's genuinely dead.
+    for tag in soup.find_all("link"):
+        rel = tag.get("rel")
+        rel = " ".join(rel).lower() if isinstance(rel, list) else str(rel or "").lower()
+        if not tag.has_attr("href") or ("stylesheet" not in rel and "icon" not in rel):
+            continue
+        _raise_if_cancelled(cancelled)
+        ref, dead = _localize(tag["href"])
+        if dead:
+            report.removed_links_css.append(tag["href"])
+            tag.decompose()
+        elif ref != tag["href"]:
+            tag["href"] = ref
+    for tag in soup.find_all("script", src=True):
+        _raise_if_cancelled(cancelled)
+        ref, dead = _localize(tag["src"])
+        if dead:
+            del tag["src"]
+            if not (tag.string or "").strip():
+                tag.decompose()  # dead src, no inline body -> inert, drop it
+        elif ref != tag["src"]:
+            tag["src"] = ref
+
 
 def clean_iframes(soup, report):
     """PBN checklist item 24/25: no iframes/embeds to external resources, at all."""
@@ -3040,17 +3107,37 @@ def ensure_local_seo_files(html_path, site_domain, report, dry_run=False, overwr
         report.sitemap_created = True
 
 
-def ensure_htaccess(html_path, report, dry_run=False, overwrite=False):
+def _htaccess_with_canonical_redirect(site_domain):
+    """DEFAULT_HTACCESS ships with BOTH www<->non-www 301 blocks commented out. Uncomment the
+    one that enforces the site's chosen canonical form: a www-named folder wants everyone sent
+    to www (non-www -> www); a bare folder wants the opposite (www -> non-www). No domain known
+    -> leave both commented (don't guess a redirect that could loop)."""
+    text = DEFAULT_HTACCESS
+    if not site_domain:
+        return text
+    if site_domain.lower().startswith("www."):
+        return text.replace(
+            "# RewriteCond %{HTTP_HOST} !^www\\. [NC]\n# RewriteRule ^(.*)$ https://www.%{HTTP_HOST}/$1 [R=301,L]",
+            "RewriteCond %{HTTP_HOST} !^www\\. [NC]\nRewriteRule ^(.*)$ https://www.%{HTTP_HOST}/$1 [R=301,L]",
+        )
+    return text.replace(
+        "# RewriteCond %{HTTP_HOST} ^www\\.(.*)$ [NC]\n# RewriteRule ^(.*)$ https://%1/$1 [R=301,L]",
+        "RewriteCond %{HTTP_HOST} ^www\\.(.*)$ [NC]\nRewriteRule ^(.*)$ https://%1/$1 [R=301,L]",
+    )
+
+
+def ensure_htaccess(html_path, report, dry_run=False, overwrite=False, site_domain=None):
     """Every restored PBN site gets the same standard .htaccess (gzip compression,
-    .js.gz serving, font/webp mime types). Written unless one is already present, or
-    always (overwrite=True, the cleanup pass) - the block is a fixed standard, so
-    replacing a leftover export .htaccess with it is the intended behaviour."""
+    .js.gz serving, font/webp mime types) plus the canonical www/non-www 301 redirect for
+    site_domain's chosen form. Written unless one is already present, or always
+    (overwrite=True, the cleanup pass) - the block is a fixed standard, so replacing a
+    leftover export .htaccess with it is the intended behaviour."""
     site_root = html_path.parent
     htaccess_path = site_root / ".htaccess"
     report.htaccess_present = htaccess_path.is_file()
     if dry_run or (report.htaccess_present and not overwrite):
         return
-    htaccess_path.write_text(DEFAULT_HTACCESS, encoding="utf-8")
+    htaccess_path.write_text(_htaccess_with_canonical_redirect(site_domain), encoding="utf-8")
     report.htaccess_created = True
     report.htaccess_present = True
 
@@ -3088,6 +3175,82 @@ def ensure_canonical(soup, html_path, site_domain, report, dry_run=False):
         canonical["href"] = loc
     else:
         head.append(soup.new_tag("link", rel="canonical", href=loc))
+
+
+def _rewrite_domain_absolute_links(soup, site_domain):
+    """Point every absolute in-page link that targets THIS site's domain (mainly the logo/home
+    link) at site_domain's exact www/non-www form, preserving path/query/hash. Returns count."""
+    bare = _bare_domain(site_domain)
+    if not bare:
+        return 0
+    n = 0
+    for a in soup.find_all("a", href=True):
+        href = (a["href"] or "").strip()
+        if not is_external(href) or not matches_suffix(domain_of(href), {bare}):
+            continue
+        parts = urlsplit(href)
+        rest = parts.path or "/"
+        if parts.query:
+            rest += "?" + parts.query
+        if parts.fragment:
+            rest += "#" + parts.fragment
+        new = f"https://{site_domain}{rest}"
+        if a["href"] != new:
+            a["href"] = new
+            n += 1
+    return n
+
+
+def recanonicalize_domain(site_dir, site_domain):
+    """Switch an ALREADY-cleaned site between www and non-www WITHOUT re-running the destructive
+    full cleanup (that pass is for raw archive exports, not clean sites). Only touches what
+    actually depends on the domain form: <link canonical>, the absolute in-page domain links
+    (logo/home), and the domain-dependent config files (robots.txt/sitemap.xml/.htaccess)."""
+    site_dir = Path(site_dir)
+    report = Report()
+    pages = 0
+    for html_path in sorted(site_dir.rglob("*.html")):
+        if any(part in QUARANTINE_DIR_NAMES for part in html_path.relative_to(site_dir).parts):
+            continue
+        soup = BeautifulSoup(read_text_safe(html_path), PARSER)
+        ensure_canonical(soup, html_path, site_domain, report)
+        _rewrite_domain_absolute_links(soup, site_domain)
+        _reorder_head_seo(soup)  # keep description -> canonical -> fonts order after the swap
+        html_path.write_text(collapse_blank_lines(str(soup)), encoding="utf-8")
+        pages += 1
+    index_html = site_dir / "index.html"
+    if index_html.is_file():
+        ensure_local_seo_files(index_html, site_domain, report, overwrite=True)
+        ensure_htaccess(index_html, report, overwrite=True, site_domain=site_domain)
+    return {"pages": pages, "domain": site_domain}
+
+
+def _reorder_head_seo(soup):
+    """Enforce the head order the project wants: <title> -> <meta description> -> <link
+    canonical> -> the self-hosted fonts <link>, placed right after <meta charset>. Only reorders
+    the tags that actually exist. Runs late (after canonical + fonts are both in the head)."""
+    head = soup.find("head")
+    if not head:
+        return
+    title = head.find("title")
+    desc = head.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+    canonical = head.find("link", rel="canonical")
+    fontcss = head.find("link", attrs={"data-site-studio-font": True})
+    seq = [t for t in (title, desc, canonical, fontcss) if t is not None]
+    if not seq:
+        return
+    charset = head.find("meta", charset=True) or head.find(
+        "meta", attrs={"http-equiv": re.compile(r"^content-type$", re.I)}
+    )
+    for t in seq:
+        t.extract()
+    ref = charset
+    for t in seq:
+        if ref is None:
+            head.insert(0, t)
+        else:
+            ref.insert_after(t)
+        ref = t
 
 
 def check_and_fix_noindex(soup, report):
@@ -3160,7 +3323,7 @@ def clean_html_file(
     fonts_param,
     dry_run,
     backup,
-    keep_contact_info=False,
+    keep_contact_info=True,
     favicon=None,
     recover_images=True,
     domain_override=None,
@@ -3212,7 +3375,7 @@ def clean_html_file(
     strip_wayback_toolbar(soup)
     unwayback_all_attrs(soup)
     clean_scripts(soup, report)
-    clean_stylesheet_links(soup, report)
+    clean_stylesheet_links(soup, report, site_domain)
     strip_cms_meta_links(soup, report)
     _p(44, "Вырезаю скрипты, мету и следы владельца")
     strip_owner_traces(soup, update_year=True, report=report)
@@ -3227,7 +3390,7 @@ def clean_html_file(
     inject_image_object_fit_style(soup)
     _p(60, "Иконки: чиню и подключаю Font Awesome")
     ensure_icon_fonts(soup, html_path, report, dry_run=dry_run)
-    clean_links_a(soup, site_domain, report)
+    clean_links_a(soup, site_domain, report, keep_contact_info=keep_contact_info)
     localize_media_refs(soup, html_path, site_domain, report, dry_run=dry_run, cancelled=cancelled)
     if not keep_contact_info:
         strip_contact_info(soup, report, old_domain=old_domain)
@@ -3247,8 +3410,9 @@ def clean_html_file(
     favicon_brand_hint = effective_brand or (_bare_domain(site_domain).split(".")[0] if site_domain else None)
     ensure_favicon(soup, html_path, favicon, report, dry_run=dry_run, brand_hint=favicon_brand_hint)
     ensure_local_seo_files(html_path, site_domain, report, dry_run=dry_run, overwrite=True)
-    ensure_htaccess(html_path, report, dry_run=dry_run, overwrite=True)
+    ensure_htaccess(html_path, report, dry_run=dry_run, overwrite=True, site_domain=site_domain)
     ensure_canonical(soup, html_path, site_domain, report, dry_run=dry_run)
+    _reorder_head_seo(soup)  # head order: <meta description> -> <link canonical> -> fonts <link>
     check_internal_link_targets(soup, html_path, report)
     strip_empty_style_declarations(soup)
 
@@ -3349,9 +3513,10 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-backup", action="store_true")
     parser.add_argument(
-        "--keep-contact-info",
+        "--strip-contact-info",
         action="store_true",
-        help="Do not strip mailto:/tel: links or redact email/phone text (removed by default)",
+        help="Opt in to removing mailto:/tel: links and redacting email/phone/address text "
+             "(KEPT by default - cleanup never touches contact info unless you ask)",
     )
     parser.add_argument(
         "--check-url",
@@ -3391,7 +3556,7 @@ def main():
             args.fonts,
             args.dry_run,
             backup=not args.no_backup,
-            keep_contact_info=args.keep_contact_info,
+            keep_contact_info=not args.strip_contact_info,
             favicon=args.favicon,
             recover_images=not args.no_image_recovery,
             domain_override=args.domain,
