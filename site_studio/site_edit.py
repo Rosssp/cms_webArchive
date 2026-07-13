@@ -1192,8 +1192,10 @@ def _content_sections(soup):
     for sec in (soup.find_all("section") or _fallback_section_blocks(soup, nav_desc)):
         if id(sec) in nav_desc:
             continue
-        if re.search(r"(?:^|[\s_-])(?:hero|banner|masthead|jumbotron)(?:[\s_-]|$)", _cls(sec), re.I):
-            continue  # the top hero/banner band isn't a content section to link a menu item to
+        # NOTE: the hero/banner band is NOT skipped - it's a real, linkable section. The header
+        # must carry a link to it (the "Home"/top link) and the footer lists every section, hero
+        # included. It's just flagged is_hero so the header can guarantee that first link.
+        is_hero = bool(re.search(r"(?:^|[\s_-])(?:hero|banner|intro|masthead|jumbotron|welcome|cover)(?:[\s_-]|$)", _cls(sec), re.I))
         # Title source, in order of how good a menu label it makes: the eyebrow/.section-tag
         # (usually the cleanest short descriptor, e.g. "Our Services"), else the first heading
         # (an h2, or - when the section has no heading of its own, just a card grid - the first
@@ -1207,8 +1209,38 @@ def _content_sections(soup):
         title = tag_text or h_text or " ".join(w.capitalize() for w in cls_words[:3])
         keys = (set(_slug_words(h_text)) | set(_slug_words(tag_text))
                 | set(cls_words) | set(_slug_words(sec.get("id") or "")))
-        out.append({"el": sec, "text": title, "keys": keys})
+        # A short body sample (first paragraph-ish text after the heading) so the optional AI
+        # classifier can tell "Our Work" (portfolio) from "How It Works" (process) by content.
+        p = sec.find("p")
+        sample = re.sub(r"\s+", " ", p.get_text(" ", strip=True)).strip()[:200] if p else ""
+        out.append({"el": sec, "text": title, "keys": keys, "sample": sample,
+                    "kind": None, "ai_label": None, "is_hero": is_hero})
+    # The first section in document order is the hero/top block even if it carries no hero-ish
+    # class - the header's guaranteed "top" link points here.
+    if out:
+        out[0]["is_hero"] = True
     return out
+
+
+def _classify_sections_ai(sections):
+    """Best-effort: ask Haiku for a canonical kind + clean menu label per section and stash them
+    on each section dict ('kind', 'ai_label'). No-op without the semantics module/key."""
+    if not sections:
+        return
+    try:
+        import semantics
+    except ImportError:
+        return
+    if not semantics.available():
+        return
+    labels = semantics.classify_sections(
+        [{"text": s["text"], "sample": s.get("sample", "")} for s in sections]
+    )
+    if not labels:
+        return
+    for sec, lab in zip(sections, labels):
+        sec["kind"] = lab.get("kind")
+        sec["ai_label"] = lab.get("label") or None
 
 
 def _ensure_section_anchor(sec):
@@ -1216,6 +1248,12 @@ def _ensure_section_anchor(sec):
     3 words, from the heading or the section class) added to the section element."""
     if sec["el"].get("id"):
         return sec["el"]["id"]
+    # Prefer the AI-derived canonical kind as the anchor slug (clean, meaningful: #services,
+    # #about) when we have a confident one - falls back to the heading/class slug otherwise.
+    kind = sec.get("kind")
+    if kind and kind not in ("other", "hero"):
+        sec["el"]["id"] = kind
+        return kind
     words = _slug_words(sec["text"])
     while words and words[-1] in _LABEL_STOPWORDS:  # trim trailing filler for a clean anchor
         words.pop()
@@ -1250,19 +1288,120 @@ def _short_label(text):
     return " ".join(sig[:2]) if sig else (text or "").strip()
 
 
+_GENERIC_LABEL_RE = re.compile(
+    r"^(?:home|links?|click(?:\s*here)?|read\s*more|learn\s*more|more|page|untitled|menu|item|nav|go|here|#)$",
+    re.I,
+)
+
+
+def _is_generic_label(text):
+    """True when a link's own text is a meaningless placeholder ('Home', 'Click here', 'Read
+    more', '#'...) worth replacing with the destination section's name. A real label like
+    'Privacy Policy' is NOT generic - it stays as-is, we only give it a working anchor."""
+    t = re.sub(r"\s+", " ", (text or "")).strip()
+    return not t or bool(_GENERIC_LABEL_RE.match(t))
+
+
+_DIVIDER_CLASS_RE = re.compile(r"divider|separator|\bsep\b|dot", re.I)
+
+
+def _section_label(sec):
+    """The menu label for a section: prefer the AI label, else a short form of its heading."""
+    return sec.get("ai_label") or _short_label(sec["text"]) or (sec["text"] or "").strip()
+
+
+def _assign_footer_slot(slot, sec, changes):
+    """Point one footer link 'slot' (its <li> wrapper, or the bare <a>) at a section anchor,
+    relabel it to the section name, and drop target=_blank (in-page anchors open in place)."""
+    a = slot if getattr(slot, "name", None) == "a" else slot.find("a")
+    if a is None:
+        return
+    anchor = _ensure_section_anchor(sec)
+    a["href"] = "#" + anchor
+    if a.has_attr("target"):
+        del a["target"]
+    _set_link_text(a, _section_label(sec) or anchor)
+    changes.append(f'{a.get_text(" ", strip=True)} -> #{anchor}')
+
+
+def _rebuild_footer_sitemap(footer, sections):
+    """Rewrite the footer's nav-link block into the site's FULL sitemap: one in-page anchor per
+    section, ALL of them (unlike the capped header). Reuses the footer's own link markup - the
+    <li> items and their dividers - so styling/separators survive: reassigns existing slots,
+    clones the template for extra sections, removes surplus. Returns a list of change strings."""
+    links = _nav_menu_links(footer)
+    if not links or not sections:
+        return []
+
+    def _slot(a):
+        li = a.find_parent("li")
+        return li if li is not None else a
+
+    slots, seen = [], set()
+    for a in links:
+        s = _slot(a)
+        if id(s) not in seen:
+            seen.add(id(s))
+            slots.append(s)
+    if not slots:
+        return []
+    n_sec, n_slot = len(sections), len(slots)
+
+    # a divider element sitting between the links (e.g. <li class="footer-menu-divider">·</li>)
+    divider_tpl = None
+    sib = slots[0].next_sibling
+    while sib is not None and getattr(sib, "name", None) is None:
+        sib = sib.next_sibling
+    if sib is not None and getattr(sib, "name", None) and _DIVIDER_CLASS_RE.search(_cls(sib)):
+        divider_tpl = sib
+
+    import copy as _copy
+    changes = []
+    # 1) reassign the slots we already have
+    for i in range(min(n_sec, n_slot)):
+        _assign_footer_slot(slots[i], sections[i], changes)
+    # 2) extra sections -> clone the last slot (with a divider in front) and append
+    if n_sec > n_slot:
+        tail = slots[-1]
+        for j in range(n_slot, n_sec):
+            if divider_tpl is not None:
+                d = _copy.copy(divider_tpl)
+                tail.insert_after(d)
+                tail = d
+            s = _copy.copy(slots[0])
+            tail.insert_after(s)
+            tail = s
+            _assign_footer_slot(s, sections[j], changes)
+    # 3) surplus slots -> remove them and an adjacent divider
+    if n_slot > n_sec:
+        for k in range(n_sec, n_slot):
+            sl = slots[k]
+            prev = sl.previous_sibling
+            while prev is not None and getattr(prev, "name", None) is None:
+                prev = prev.previous_sibling
+            if prev is not None and getattr(prev, "name", None) and _DIVIDER_CLASS_RE.search(_cls(prev)):
+                prev.extract()
+            sl.extract()
+    return changes
+
+
 def auto_link_menu(site_dir):
-    """Deterministically wire up header/footer/mobile nav across every page (no AI):
-      - HEADER: keep at most 4 menu links (remove the rest); point each broken one (#, /,
-        javascript:void, empty) at the best-matching page section - matched by word overlap
-        between the link text and the section's heading/class/id/.section-tag, else the next
-        unused section; ensure that section has an anchor id (reuse an existing id, else add a
-        contextual <=3-word slug); give the link a SHORT label (About, How...).
-      - MOBILE nav (duplicate menu): mirror the header's href+label onto links with the same
-        original text, so the mobile menu matches.
-      - FOOTER: only if it actually holds a nav-style link block - attach its broken links to
-        sections the same way, but keep the FULLER label (footers aren't cramped).
-    Every href is relative/anchor - never an absolute URL. Only touches broken links; backs up
-    each edited page (.studio-bak). Returns a summary."""
+    """Wire up header/footer/mobile nav across every page. See NAV_LINKING.md for the full spec;
+    the short version, and the two rules that MUST hold (a past bug got them wrong):
+
+      - HEADER: a CURATED menu, capped at 4 in-page anchors. Points each broken link (#, /,
+        javascript:void, empty) at the best-matching section (word overlap vs heading/class/id/
+        .section-tag, else next unused), short label (About, How...). *** The header MUST always
+        carry a link to the HERO (the first/top block) *** - guaranteed even if nothing was broken.
+      - FOOTER: the FULL sitemap - REBUILT to hold one in-page anchor per section, ALL of them
+        (unlike the capped header), labeled by section name, reusing the footer's own list markup
+        and dividers. Whatever the original footer links were (dead policy/PDF links etc.) they
+        become the section list. Never leaves an empty '#'.
+      - MOBILE nav (duplicate menu): mirror the header's href+label onto matching links.
+
+    The LOGO gets the absolute canonical-domain home URL; every other nav href is a relative
+    in-page anchor. Sections come from _content_sections (hero INCLUDED, flagged is_hero). Backs
+    up each edited page (.studio-bak). Returns a summary."""
     html_paths = sorted(site_dir.rglob("*.html"))
     if not html_paths:
         return {"linked": [], "relabeled": [], "removed": [], "unresolved": []}
@@ -1293,6 +1432,7 @@ def auto_link_menu(site_dir):
         # points at this as an absolute canonical-domain URL.
         site_domain_full = (cw._domain_from_folder_name(p) or cw.get_site_domain(soup) or "")
         sections = _content_sections(soup)
+        _classify_sections_ai(sections)  # best-effort: better kinds/labels when a key is present
         used = set()
         dirty = False
         header_map = {}  # slug(original text) -> (href, label)
@@ -1351,8 +1491,11 @@ def auto_link_menu(site_dir):
             # the section title describes the destination better than a lost link's own text.
             # Header gets the short form, footer the fuller one; fall back to the link's own
             # text only if the section has no title at all.
-            title = sec["text"] or orig
-            label = _short_label(title) if short else title
+            # Prefer the AI menu label (already short + in the page's language); else derive one
+            # from the section title (short form for the header, fuller for the footer).
+            ai = sec.get("ai_label")
+            title = ai or sec["text"] or orig
+            label = ai or (_short_label(title) if short else title)
             _set_link_text(a, label)
             return label
 
@@ -1383,6 +1526,25 @@ def auto_link_menu(site_dir):
                     removed.append(f'{rel_self}: header "{orig}" (no section to point at)')
                     dirty = True
 
+        # The header MUST carry a link to the HERO (the first/top block). Resolving broken links
+        # already sends the first one there (hero is the first unused section), but if the header
+        # had nothing broken to resolve, force its first menu item onto the hero so "top" is always
+        # reachable from the menu.
+        if header_nav is not None and sections:
+            hero = next((s for s in sections if s.get("is_hero")), sections[0])
+            hero_href = "#" + _ensure_section_anchor(hero)
+            hlinks = _nav_menu_links(header_nav)
+            if hlinks and not any((a.get("href") or "") == hero_href for a in hlinks):
+                a0 = hlinks[0]
+                orig0 = a0.get_text(" ", strip=True)
+                a0["href"] = hero_href
+                if _is_generic_label(orig0):
+                    _set_link_text(a0, _section_label(hero) or orig0)
+                used.add(id(hero["el"]))
+                header_map[" ".join(_slug_words(orig0))] = (hero_href, a0.get_text(" ", strip=True))
+                linked.append(f'{rel_self}: header "{orig0}" -> {hero_href} (hero link guaranteed)')
+                dirty = True
+
         # --- mobile navs: mirror header decisions onto matching links ---
         exclude = {id(header_nav)} if header_nav is not None else set()
         footer = soup.find("footer")
@@ -1397,23 +1559,17 @@ def auto_link_menu(site_dir):
                     relabeled.append(f'{rel_self}: mobile "{key}" -> {header_map[key][0]}')
                     dirty = True
 
-        # --- footer: only if it has a real nav block; fuller labels ---
-        if footer is not None and _looks_like_footer_nav(footer):
-            for a in _nav_menu_links(footer):
-                if not _broken(a):
-                    continue
-                orig = a.get_text(" ", strip=True)
-                label = _resolve(a, short=False)
-                if label is not None:
-                    linked.append(f'{rel_self}: footer "{orig}" -> {a["href"]}')
-                    dirty = True
-                else:
-                    # A broken footer link with no section to point at is a dead link to a page
-                    # that doesn't exist in this export (policy/PDF pages etc.) - drop it outright
-                    # rather than leaving an empty "#" anchor sitting in the footer.
-                    _remove_nav_item(a)
-                    removed.append(f'{rel_self}: footer "{orig}" (dead link to a missing page, removed)')
-                    dirty = True
+        # --- footer = the site's FULL sitemap: one in-page anchor per section, ALL of them (the
+        #     header is capped/curated; the footer lists everything). We rebuild the footer's nav
+        #     block from the section list rather than patching each stale policy link, so the
+        #     result is always exactly "every section, anchored + labeled" no matter what the
+        #     original footer links were (Privacy/Payment/Refund PDFs etc.). ---
+        if footer is not None and _looks_like_footer_nav(footer) and sections:
+            fchanges = _rebuild_footer_sitemap(footer, sections)
+            if fchanges:
+                for c in fchanges:
+                    linked.append(f'{rel_self}: footer {c}')
+                dirty = True
 
         if dirty:
             _write_soup(p, soup)

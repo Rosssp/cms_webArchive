@@ -622,6 +622,10 @@ class Report:
         self.external_redirect_found = None
         self.broken_internal_targets = []
         self.lazy_loading_added = 0
+        # AI (Haiku) semantic pass - only populated when semantics.available()
+        self.semantic_title = None
+        self.semantic_description = None
+        self.semantic_tags_applied = []  # e.g. "div.top-bar -> header"
 
     def render(self):
         lines = ["=== cleanup report ===", ""]
@@ -786,6 +790,16 @@ class Report:
                 f"({len(self.broken_internal_targets)}):"
             )
             for s in sorted(set(self.broken_internal_targets)):
+                lines.append(f"  - {s}")
+        if self.semantic_title or self.semantic_description:
+            lines.append("AI-семантика (Haiku):")
+            if self.semantic_title:
+                lines.append(f"  title:       {self.semantic_title}")
+            if self.semantic_description:
+                lines.append(f"  description: {self.semantic_description}")
+        if self.semantic_tags_applied:
+            lines.append(f"AI-семантика тегов ({len(self.semantic_tags_applied)}):")
+            for s in self.semantic_tags_applied:
                 lines.append(f"  - {s}")
         lines.append("")
         lines.append(self.verdict())
@@ -3318,6 +3332,213 @@ def check_internal_link_targets(soup, html_path, report, fix=True):
 # --------------------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------------------
+# AI semantic pass (optional, Haiku) - see site_studio/semantics.py. All best-effort: the
+# deterministic cleanup runs identically with or without an ANTHROPIC_API_KEY.
+# --------------------------------------------------------------------------------------
+
+def _semantics():
+    """Lazily import the optional semantics module. It lives in site_studio/, which isn't on
+    sys.path when this file runs as a root CLI - add it on demand. Returns the module or None."""
+    try:
+        import semantics  # already importable when the process started from site_studio (server)
+        return semantics
+    except ImportError:
+        pass
+    try:
+        sub = Path(__file__).resolve().parent / "site_studio"
+        if str(sub) not in sys.path:
+            sys.path.insert(0, str(sub))
+        import semantics
+        return semantics
+    except Exception:  # noqa: BLE001 - the whole feature is optional
+        return None
+
+
+_SEM_HEADINGS = ("h1", "h2", "h3")
+_SEM_RENAMEABLE = {"div", "section"}  # only rewrite generic containers, never real landmarks
+# A hero/intro/banner band is CONTENT, never the page header or footer - it becomes a <section>.
+# The page header is the top NAV bar. These two patterns drive the deterministic header/hero rules
+# below so a hero (with, say, a couple of CTA buttons) is never mistaken for the menu bar.
+_SEM_HERO_RE = re.compile(
+    r"(?:^|[\s_-])(?:hero|intro|banner|masthead|jumbotron|slider|carousel|cover|splash|welcome)(?:[\s_-]|$)",
+    re.I,
+)
+_SEM_NAVBAR_RE = re.compile(
+    r"(?:^|[\s_-])(?:navbar|nav-bar|topnav|top-nav|main-nav|primary-nav|site-?header|masthead-nav|header-nav|menu-bar)(?:[\s_-]|$)",
+    re.I,
+)
+
+
+def _sem_cls(el):
+    return " ".join(el.get("class", [])) if hasattr(el, "get") else ""
+
+
+def _promote_header(soup, root):
+    """Deterministically make the site's primary top navigation the page <header> - a hero/intro
+    band is NEVER the header. Scans the first few top-level blocks for a genuine nav signal (a
+    <nav> tag, a navbar-classed container, or a block that CONTAINS a <nav>); turns that into, or
+    wraps it in, <header>. No '2+ links' guessing, so a hero with CTA buttons isn't grabbed as the
+    menu. Returns the old tag name (for the report) or None if there's no top nav to promote."""
+    # Self-heal: a hero/intro/banner band that an earlier run mis-tagged as <header>/<footer> is
+    # demoted back to <section>, so re-running the cleanup fixes a prior bad guess instead of
+    # freezing it in (the check below would otherwise see the stray <header> and bail).
+    for ch in root.find_all(recursive=False):
+        if getattr(ch, "name", None) in ("header", "footer") and _SEM_HERO_RE.search(_sem_cls(ch)):
+            ch.name = "section"
+    if root.find("header") is not None:
+        return None
+    children = [c for c in root.find_all(recursive=False) if getattr(c, "name", None)]
+    for ch in children[:4]:
+        cls = _sem_cls(ch)
+        if _SEM_HERO_RE.search(cls):
+            continue  # a hero/intro/banner is content - skip past it, keep looking for the nav
+        is_nav = ch.name == "nav" or bool(_SEM_NAVBAR_RE.search(cls)) or ch.find("nav") is not None
+        if not is_nav:
+            # hit real content (a heading-bearing block) before any nav -> this page has no top
+            # nav bar to promote; stop rather than reaching deep down the page.
+            if ch.name in _SEM_RENAMEABLE and ch.find(_SEM_HEADINGS):
+                break
+            continue
+        if ch.name == "nav":
+            # a bare top <nav> -> wrap it (plus an immediately-preceding logo-only sibling) in
+            # a fresh <header>, so the menu bar sits inside the page header where it belongs.
+            header = soup.new_tag("header")
+            prev = ch.find_previous_sibling(lambda t: getattr(t, "name", None) is not None)
+            ch.insert_before(header)
+            if (prev is not None and prev.name in ("a", "div")
+                    and prev.find("img") and not prev.get_text(strip=True)):
+                header.append(prev.extract())
+            header.append(ch.extract())
+            return "nav"
+        # a navbar-classed container (or any block wrapping a <nav>) -> rename it to <header>,
+        # and make sure its inner link list is a <nav>.
+        old = ch.name
+        ch.name = "header"
+        if ch.find("nav") is None:
+            for sub in ch.find_all("div", recursive=True):
+                if len([a for a in sub.find_all("a") if a.get_text(strip=True)]) >= 2:
+                    sub.name = "nav"
+                    break
+        return old
+    return None
+
+
+def _visible_text_for_meta(soup):
+    """A concise visible-text sample of the page's main content for meta generation: headings and
+    paragraphs from <body>, minus nav/footer/script/style noise, capped so the prompt stays cheap."""
+    body = soup.find("body") or soup
+    parts, total = [], 0
+    for el in body.find_all(["h1", "h2", "h3", "p", "li"]):
+        if el.find_parent(["nav", "footer", "script", "style"]):
+            continue
+        t = el.get_text(" ", strip=True)
+        if not t:
+            continue
+        parts.append(t)
+        total += len(t)
+        if total > 5000:
+            break
+    return "\n".join(parts)
+
+
+def apply_semantic_meta(soup, site_domain, report):
+    """Fill/refresh <title> and <meta name="description"> from the page content via Haiku. Runs
+    BEFORE _reorder_head_seo so the new tags get placed in the canonical head order. Best-effort:
+    a no-op without the semantics module/key, or when the LLM call fails."""
+    sem = _semantics()
+    if sem is None or not sem.available():
+        return
+    head = soup.find("head")
+    if head is None:
+        return
+    existing_title = soup.title.get_text(strip=True) if soup.title else None
+    meta = sem.generate_meta(
+        _visible_text_for_meta(soup),
+        existing_title=existing_title,
+        domain=_bare_domain(site_domain) or site_domain,
+    )
+    if not meta:
+        return
+    title_el = soup.find("title")
+    if title_el is None:
+        title_el = soup.new_tag("title")
+        head.append(title_el)
+    title_el.string = meta["title"]
+    report.semantic_title = meta["title"]
+    desc_el = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+    if desc_el is None:
+        desc_el = soup.new_tag("meta")
+        desc_el["name"] = "description"
+        head.append(desc_el)
+    desc_el["content"] = meta["description"]
+    report.semantic_description = meta["description"]
+
+
+def apply_semantic_tags(soup, report):
+    """Recover HTML5 semantics on a bad-markup export. Two passes, neither restructures content:
+      1) DETERMINISTIC header - the top nav bar becomes (or is wrapped in) <header>; a hero band
+         is never the header (see _promote_header). Done first so it's fixed before the AI runs.
+      2) Haiku suggests a landmark for each remaining top-level <div>/<section>, GUARDED so it
+         never turns a hero/intro/banner band into a landmark and never duplicates an existing
+         <main>/<header>/<footer> (those fall back to <section>).
+    Runs early so the later deterministic menu/section logic sees real landmarks. Best-effort."""
+    sem = _semantics()
+    if sem is None or not sem.available():
+        return
+    body = soup.find("body")
+    if body is None:
+        return
+    root = body.find("main") or body
+
+    # 1) Deterministic page header from the real top nav (never a hero).
+    old_hdr = _promote_header(soup, root)
+    if old_hdr is not None:
+        report.semantic_tags_applied.append(f"{old_hdr} -> header (top nav)")
+
+    # 2) AI pass over the remaining generic top-level blocks.
+    children = [c for c in root.find_all(recursive=False)
+                if getattr(c, "name", None) and c.name in _SEM_RENAMEABLE]
+    if not children:
+        return
+    n = len(children)
+    sigs = []
+    for idx, ch in enumerate(children):
+        h = ch.find(_SEM_HEADINGS)
+        sigs.append({
+            "tag": ch.name,
+            "cls": _sem_cls(ch),
+            "id": ch.get("id", "") or "",
+            "heading": h.get_text(" ", strip=True) if h else "",
+            "links": len(ch.find_all("a")),
+            "pos": "first" if idx == 0 else ("last" if idx == n - 1 else "middle"),
+        })
+    tags = sem.semantic_tags(sigs)
+    if not tags:
+        return
+    # Landmarks already present that we must not duplicate (main is unique; a second header/footer
+    # is sloppy). header may have just been created in pass 1.
+    taken = {t for t in ("main", "header", "footer") if soup.find(t) is not None}
+    for ch, sig, newtag in zip(children, sigs, tags):
+        cls = sig["cls"]
+        # A hero/intro/banner band is content: force it to <section>, never a landmark - this is
+        # exactly the "hero got tagged <header>" case the deterministic pass avoids for the header.
+        if _SEM_HERO_RE.search(cls) and newtag in ("header", "footer", "nav", "main", "aside"):
+            newtag = "section"
+        if newtag == "keep" or newtag == ch.name:
+            continue
+        if newtag in taken:  # don't create a duplicate main/header/footer
+            newtag = "section"
+        if newtag == "section" and newtag == ch.name:
+            continue
+        if newtag in ("main", "header", "footer"):
+            taken.add(newtag)
+        old = ch.name
+        ch.name = newtag
+        first_cls = ("." + cls.split()[0]) if cls else ""
+        report.semantic_tags_applied.append(f"{old}{first_cls} -> {newtag}")
+
+
 def clean_html_file(
     html_path,
     fonts_param,
@@ -3383,6 +3604,11 @@ def clean_html_file(
     promote_src(soup)
     add_lazy_loading(soup, report)
     clean_data_and_event_attrs(soup)
+    # AI (Haiku) tag-semantics: promote top-level <div> soup into HTML5 landmarks, so the menu/
+    # section logic below (and the final markup) sees real header/nav/main/section/footer. Skipped
+    # in dry-run (no LLM spend on a preview) and whenever no ANTHROPIC_API_KEY is configured.
+    if not dry_run:
+        apply_semantic_tags(soup, report)
     # Empty fonts_param -> try to detect a font already used on this page (falls back
     # to a random preset if the page only declares generic/system-default fonts).
     _p(56, "Подключаю шрифт (скачиваю локально)")
@@ -3411,8 +3637,12 @@ def clean_html_file(
     ensure_favicon(soup, html_path, favicon, report, dry_run=dry_run, brand_hint=favicon_brand_hint)
     ensure_local_seo_files(html_path, site_domain, report, dry_run=dry_run, overwrite=True)
     ensure_htaccess(html_path, report, dry_run=dry_run, overwrite=True, site_domain=site_domain)
+    # AI (Haiku) meta: write a real <title> + <meta description> from the page content, just
+    # before the head is reordered. Skipped in dry-run and without an ANTHROPIC_API_KEY.
+    if not dry_run:
+        apply_semantic_meta(soup, site_domain, report)
     ensure_canonical(soup, html_path, site_domain, report, dry_run=dry_run)
-    _reorder_head_seo(soup)  # head order: <meta description> -> <link canonical> -> fonts <link>
+    _reorder_head_seo(soup)  # head order: <title> -> <meta description> -> <link canonical> -> fonts
     check_internal_link_targets(soup, html_path, report)
     strip_empty_style_declarations(soup)
 

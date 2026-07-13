@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 try:
@@ -33,6 +34,19 @@ except ImportError:
     print("[setup] installing missing dependency: flask ...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "flask"])
     importlib.invalidate_caches()
+
+# anthropic powers the optional AI semantic pass (title/description, section labels, tag
+# semantics). It's only USED when an ANTHROPIC_API_KEY is set, but install it up front so the
+# feature is ready the moment a key appears in .env - the pass degrades to a no-op without a key.
+try:
+    import anthropic  # noqa: F401
+except ImportError:
+    print("[setup] installing optional dependency: anthropic ...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "anthropic"])
+        importlib.invalidate_caches()
+    except Exception as _e:  # noqa: BLE001 - optional; studio still runs without it
+        print(f"[setup] anthropic install skipped ({_e}); AI semantics disabled")
 
 from flask import Flask, jsonify, request, send_from_directory, render_template
 
@@ -380,6 +394,22 @@ def api_entry_open_folder():
     return jsonify({"ok": True})
 
 
+def _rename_dir_with_retry(old_dir, new_dir, attempts=8, delay=0.25):
+    """Rename a site folder, retrying transient Windows locks. Renaming a DIRECTORY on Windows
+    fails with WinError 5 (access denied) when any file inside is momentarily open - the card's
+    in-flight _preview.png fetch, antivirus, or the Search indexer touching a freshly-downloaded
+    folder. Those locks release in well under a second, so a short backoff clears them; a truly
+    persistent lock (folder open in Explorer) raises after the last attempt for the caller to report."""
+    for i in range(attempts):
+        try:
+            os.rename(old_dir, new_dir)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 @app.route("/api/entry/set-www", methods=["POST"])
 def api_entry_set_www():
     """Switch a downloaded site between www and non-www by RENAMING its folder. Does NOT re-run
@@ -409,9 +439,15 @@ def api_entry_set_www():
     if new_dir.exists():
         return jsonify({"ok": False, "error": f"папка «{new_domain}» уже существует"}), 400
     try:
-        os.rename(old_dir, new_dir)
-    except Exception as ex:  # noqa: BLE001
-        return jsonify({"ok": False, "error": f"не удалось переименовать: {ex}"}), 400
+        _rename_dir_with_retry(old_dir, new_dir)
+    except OSError as ex:
+        # WinError 5/32: a file inside is held open (in-flight _preview.png request, antivirus,
+        # Windows Search, or the folder open in Explorer). Transient locks are retried above; if
+        # it still fails the lock is persistent - tell the user how to clear it.
+        hint = ""
+        if getattr(ex, "winerror", None) in (5, 32):
+            hint = " — закрой папку в проводнике/просмотрщике и попробуй снова (файл внутри занят)"
+        return jsonify({"ok": False, "error": f"не удалось переименовать: {ex}{hint}"}), 400
     with ENTRIES_LOCK:
         e = ENTRIES.get(eid)
         if e:
