@@ -73,10 +73,15 @@ _WB_STRIP_JS = r"""
     if (/__wm\.|wombat|wmipp|archive_analytics/i.test(n.textContent || '')) n.remove();
   });
 
-  // 5) Safety net: any stray anchor into archive.org's site chrome (details/web/upload/etc.).
+  // 5) Safety net: stray anchors into archive.org's OWN site chrome (details pages, its home).
+  //    CAREFUL: do NOT match the generic "archive.org/web/" - in the live archive DOM EVERY
+  //    internal site link is wrapped as web.archive.org/web/<ts>/http://thesite/... , so that
+  //    pattern would delete the site's whole menu + all its internal links (leaving empty <li>).
+  //    The toolbar (removed in steps 1-3) already took its date-nav links with it; the wrapped
+  //    site links are unwrapped to real relative links by the cleaner later, so keep them.
   document.querySelectorAll(
-    'a[href*="archive.org/details"], a[href*="archive.org/web/"],' +
-    ' a[href="https://archive.org/"], a[href="https://web.archive.org"]'
+    'a[href*="archive.org/details"], a[href*="archive.org/account/"],' +
+    ' a[href="https://archive.org/"], a[href="https://web.archive.org/"], a[href="https://web.archive.org"]'
   ).forEach(a => rm(a));
 }
 """
@@ -182,6 +187,16 @@ def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
     _p(90, "Переписываю ссылки на локальные")
     for url in sorted(url_to_local, key=len, reverse=True):
         html = html.replace(url, url_to_local[url])
+
+    # When the DOM used the wayback-WRAPPED form of an asset URL but only its inner (unwrapped)
+    # URL matched a saved asset, the replace above rewrites just that inner part and leaves the
+    # wayback prefix in front of the now-local path, e.g.
+    #   https://web.archive.org/web/20160216123517cs_/index_files/reset.css
+    # That's a broken absolute URL - the local CSS/img never loads, so the whole page renders
+    # unstyled. index_files/ is OUR local folder and never appears in the real archive, so any
+    # wayback prefix sitting in front of it is always junk: strip it. (Fixes old table/WP themes
+    # whose many stylesheets otherwise all fail -> blank page.)
+    html = re.sub(r"(?:https?:)?//web\.archive\.org/web/\d+[a-z_]*/(?=index_files/)", "", html)
 
     (site_dir / "index.html").write_text(html, encoding="utf-8")
     _p(100, "Готово")

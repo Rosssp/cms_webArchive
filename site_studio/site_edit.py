@@ -1138,6 +1138,36 @@ def _find_header_nav(soup):
     return None
 
 
+def _is_cms_menu(el):
+    """True if `el` is a genuine CMS-generated navigation menu (WordPress & co: 3+ <li> carrying a
+    'menu-item'/'nav-item' class). Such a menu is already curated and richly labelled - the header
+    cap/relabel and footer-sitemap rewrites must LEAVE IT ALONE (rewriting it destroys the real
+    multi-page menu, e.g. turning a 7-item Punjabi menu into a single 'Snakes town' section link).
+    A hand-rolled Bootstrap navbar (no menu-item classes) is NOT a CMS menu, so it still gets wired."""
+    if el is None:
+        return False
+    return len(el.find_all("li", class_=re.compile(r"(?:^|[\s_-])(?:menu-item|nav-item)", re.I))) >= 3
+
+
+def _has_site_menu(soup):
+    """True if the page ALREADY has a real top menu, even one _find_header_nav can't wire up (an
+    image-/CSS-based menu whose <a> items carry no text - common in old themes: <ul id="navigation"
+    class="dropdown menu"> of image links). Checks the id AND class for nav/menu hints and needs
+    2+ links (with or without text). Used to SUPPRESS generating a header on top of an existing one
+    - generating one there just duplicates the site's own menu."""
+    for el in soup.find_all(["nav", "ul", "div"]):
+        ident = _cls(el) + " " + (el.get("id") or "")
+        if not _NAV_CLASS_RE.search(ident) or _MOBILE_CLASS_RE.search(ident):
+            continue
+        if el.find_parent("footer") or el.find_parent(["nav", "ul"]) is not None:
+            continue  # skip sub-menus / nested lists - count only the outer menu container
+        links = [a for a in el.find_all("a") if a.get("href")]
+        menu_lis = el.find_all("li", class_=re.compile(r"menu-item|nav-item", re.I))
+        if len(links) >= 2 or len(menu_lis) >= 2:  # real <a> menu, or an image/CSS menu-item list
+            return True
+    return False
+
+
 def _find_mobile_navs(soup, exclude_ids):
     """Duplicate/mobile nav containers (class hints mobile/burger/offcanvas/drawer) to mirror
     the header's decisions into, so the mobile menu gets the same anchors and labels."""
@@ -1500,7 +1530,12 @@ def auto_link_menu(site_dir):
             return label
 
         # --- header: cap at 4, resolve the broken ones, drop the excess/unresolvable ---
+        # ...UNLESS it's a genuine CMS menu (WordPress &c): that's the site's real multi-page nav,
+        # already curated and richly labelled - capping/relabelling it would gut it. Leave it as-is
+        # (its dead sub-page links were already neutered to '#' by the cleaner, labels preserved).
         header_nav = _find_header_nav(soup)
+        if header_nav is not None and _is_cms_menu(header_nav):
+            header_nav = None  # hands off - don't wire, don't cap, don't relabel, don't generate
         if header_nav is not None:
             kept = 0
             for a in _nav_menu_links(header_nav):
@@ -1545,6 +1580,26 @@ def auto_link_menu(site_dir):
                 linked.append(f'{rel_self}: header "{orig0}" -> {hero_href} (hero link guaranteed)')
                 dirty = True
 
+        # No header AT ALL on this page -> GENERATE a simple one (logo + anchor nav + burger),
+        # tinted with the site's own colours, auto light/dark. See header_gen / NAV_LINKING.md.
+        # But NOT if the site already has a menu our text-based detector just couldn't wire (an
+        # image/CSS menu) - stacking a generated header on top of it duplicates the real nav.
+        if (header_nav is None and soup.find("header") is None and sections
+                and not _has_site_menu(soup)):
+            try:
+                import header_gen
+                info = header_gen.build_header(
+                    soup, p, sections, site_domain_full or bare,
+                    ensure_anchor=_ensure_section_anchor, section_label=_section_label,
+                )
+                if info:
+                    linked.append(f'{rel_self}: GENERATED header (variant {info["variant"]} '
+                                  f'"{info["variant_name"]}", accent {info["accent_light"]}, '
+                                  f'nav={info["nav"]})')
+                    dirty = True
+            except Exception as ex:  # noqa: BLE001 - header generation is best-effort
+                unresolved.append(f'{rel_self}: header generation failed: {ex}')
+
         # --- mobile navs: mirror header decisions onto matching links ---
         exclude = {id(header_nav)} if header_nav is not None else set()
         footer = soup.find("footer")
@@ -1564,11 +1619,36 @@ def auto_link_menu(site_dir):
         #     block from the section list rather than patching each stale policy link, so the
         #     result is always exactly "every section, anchored + labeled" no matter what the
         #     original footer links were (Privacy/Payment/Refund PDFs etc.). ---
-        if footer is not None and _looks_like_footer_nav(footer) and sections:
+        # (Not for a CMS footer menu - like the header, that's the site's real nav; leave it.)
+        if (footer is not None and _looks_like_footer_nav(footer) and sections
+                and not _is_cms_menu(footer)):
             fchanges = _rebuild_footer_sitemap(footer, sections)
             if fchanges:
                 for c in fchanges:
                     linked.append(f'{rel_self}: footer {c}')
+                dirty = True
+
+        # --- final sweep: any link STILL pointing nowhere (dead "#"/"/"/empty/js) that the
+        #     header/footer passes didn't touch - hero CTA buttons ("Get Started"), stray
+        #     placeholders, icon-only social links. A link WITH visible text gets a section anchor
+        #     (contextual word-match, else the first/any section); an icon-only link (social, no
+        #     text) just loses its dead href so it stops looking clickable. ---
+        for a in soup.find_all("a", href=True):
+            low = (a.get("href") or "").strip().lower()
+            if low not in _NAV_UNRESOLVED_HREFS and not low.startswith("javascript"):
+                continue
+            if _is_dropdown_toggle(a):
+                continue  # a real dropdown toggle legitimately uses "#" - leave it
+            txt = a.get_text(" ", strip=True)
+            if txt and sections:
+                sec = _best_section(txt, sections, set()) or sections[0]
+                a["href"] = "#" + _ensure_section_anchor(sec)
+                linked.append(f'{rel_self}: cta "{txt[:24]}" -> {a["href"]}')
+                dirty = True
+            elif not txt:
+                # icon-only dead link (social etc.) -> drop the dead href, keep the empty <a>
+                del a["href"]
+                relabeled.append(f'{rel_self}: dropped dead href on icon-only <a> ({_cls(a)[:24]})')
                 dirty = True
 
         if dirty:

@@ -451,6 +451,8 @@ def strip_wayback_appended_comments(text):
     return text
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+# Same, but with the local part and domain captured, for rewriting an e-mail's domain in place.
+_EMAIL_LOCAL_DOMAIN_RE = re.compile(r"([A-Za-z0-9._%+\-]+)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})")
 # Phone-ish text: a run of digits/spaces/dashes/parens/leading "+" (deliberately NOT
 # dots - dotted digit groups are almost always dates like 17.3.2019, especially on
 # European/Finnish sites). Verified further in _phone_sub (min digit count, needs
@@ -591,6 +593,7 @@ class Report:
         self.redacted_phones = []
         self.redacted_addresses = []
         self.redacted_domain_mentions = []
+        self.emails_domain_normalized = []
         self.removed_iframes = []
         self.flagged_adult = []
         self.flagged_garbage_text = []
@@ -662,6 +665,10 @@ class Report:
         if self.redacted_emails:
             lines.append(f"email addresses redacted from text/attrs: {len(self.redacted_emails)}")
             for s in sorted(set(self.redacted_emails)):
+                lines.append(f"  - {s}")
+        if self.emails_domain_normalized:
+            lines.append(f"email domains normalized to the site domain: {len(self.emails_domain_normalized)}")
+            for s in self.emails_domain_normalized:
                 lines.append(f"  - {s}")
         if self.redacted_phones:
             lines.append(f"phone-like numbers redacted from text/attrs: {len(self.redacted_phones)}")
@@ -1915,6 +1922,42 @@ def strip_contact_info(soup, report, old_domain=None):
             new_val = _redact(val)
             if new_val != val:
                 tag[attr] = new_val.strip()
+
+
+def normalize_email_domains(soup, site_domain, report):
+    """Make every e-mail address use THIS site's domain (the one the export folder is named after)
+    so a restored page doesn't keep the previous owner's address - info@gigaworks.com on a
+    gigaworks.in site becomes info@gigaworks.in. Local part is kept, only the domain is swapped to
+    the bare site domain. Runs when contacts are KEPT (when they're stripped this is moot)."""
+    bare = _bare_domain(site_domain)
+    if not bare:
+        return
+    seen = set()
+
+    def _swap(m):
+        local, dom = m.group(1), m.group(2)
+        if dom.lower() == bare.lower():
+            return m.group(0)
+        newv = f"{local}@{bare}"
+        key = (m.group(0), newv)
+        if key not in seen:
+            seen.add(key)
+            report.emails_domain_normalized.append(f"{m.group(0)} -> {newv}")
+        return newv
+
+    # mailto: hrefs (an attribute, not a text node)
+    for a in soup.find_all("a", href=True):
+        if a["href"].lower().startswith("mailto:"):
+            a["href"] = _EMAIL_LOCAL_DOMAIN_RE.sub(_swap, a["href"])
+    # visible text (covers <p>info@old.com</p> and the mailto anchor's own text)
+    for node in list(soup.find_all(string=_EMAIL_LOCAL_DOMAIN_RE)):
+        if isinstance(node, Comment):
+            continue
+        if node.parent and node.parent.name in ("script", "style"):
+            continue
+        newv = _EMAIL_LOCAL_DOMAIN_RE.sub(_swap, str(node))
+        if newv != str(node):
+            node.replace_with(newv)
 
 
 def _remove_a_and_empty_parent(a_tag):
@@ -3620,6 +3663,10 @@ def clean_html_file(
     localize_media_refs(soup, html_path, site_domain, report, dry_run=dry_run, cancelled=cancelled)
     if not keep_contact_info:
         strip_contact_info(soup, report, old_domain=old_domain)
+    else:
+        # Contacts are kept - but normalize their e-mail domains to THIS site's domain so a
+        # restored page never keeps the old owner's address (info@old.com -> info@site.in).
+        normalize_email_domains(soup, site_domain, report)
     clean_iframes(soup, report)
     scan_content_flags(soup, report)
     detect_and_report_logo(soup, report)
