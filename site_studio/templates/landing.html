@@ -239,7 +239,8 @@ function cardHTML(e){
   }
   // status badge
   let badge = '';
-  if(cleaned) badge = '<div class="badge">очищено</div>';
+  if(cleaned && e.qa_broken) badge = `<div class="badge amber" title="${esc(e.qa_reason||'')}">⚠ проверь рендер</div>`;
+  else if(cleaned) badge = '<div class="badge">очищено ✓</div>';
   else if(cleaning) badge = '<div class="badge amber">очистка…</div>';
   else if(e.clean_cancelled) badge = '<div class="badge amber">отменено</div>';
   else if(dlErr||cleanErr) badge = '<div class="badge red">ошибка</div>';

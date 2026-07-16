@@ -37,6 +37,8 @@ _CSS_FETCH_TIMEOUT = 8
 
 _WB_RE = re.compile(r"/web/(\d+)[a-z_]*/(https?://.+)$", re.I)
 _ASSET_TYPES = {"stylesheet", "image", "font", "script", "media"}
+_ASSET_EXT_RE = re.compile(
+    r"\.(?:css|js|png|jpe?g|gif|svg|woff2?|ttf|otf|eot|ico|webp|avif|mp4|webm|bmp)$", re.I)
 
 
 def _original_url(archive_url):
@@ -47,7 +49,18 @@ def _original_url(archive_url):
 def _sanitize_name(url):
     path = urlsplit(cw.unwayback(url)).path
     name = unquote(Path(path).name) or "asset"
-    name = re.sub(r"[^\w.\-]+", "_", name)[:120].strip("._") or "asset"
+    name = re.sub(r"[^\w.\-]+", "_", name).strip("._") or "asset"
+    # Cap the length. Blogspot/Google asset names are 100+ char hashes; combined with a deep
+    # download folder they blow past Windows' 260-char MAX_PATH and the write CRASHES the whole
+    # download (puratoni/mikatoronen). Keep a short readable stem + an md5 tag so distinct long
+    # names stay distinct, and preserve the extension.
+    if len(name) > 64:
+        import hashlib
+        stem, dot, ext = name.rpartition(".")
+        if not dot:
+            stem, ext = name, ""
+        tag = hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
+        name = f"{stem[:40]}_{tag}" + (f".{ext[:8]}" if ext else "")
     return name
 
 
@@ -103,12 +116,27 @@ def _strip_wayback_dom(page):
         pass  # best-effort; the cleaner strips the toolbar again later anyway
 
 
+def _has_real_content(html):
+    """True if `html` is a genuinely loaded page, not an empty/redirect interstitial. A blank
+    archive result is ~39 bytes (`<html><head></head><body></body></html>`); a real page carries
+    lots of markup. Guards the download from silently saving an empty 'site'."""
+    return bool(html) and len(html) > 1200 and html.count("<") > 15
+
+
 def _scroll_to_bottom(page):
     """Scroll the page to the very bottom in steps, waiting between each, until its height
-    stops growing - so infinite-scroll / lazy-loaded images/sections actually load."""
+    stops growing - so infinite-scroll / lazy-loaded images/sections actually load.
+
+    Every page.evaluate here is wrapped: an archived page often JS-redirects or the archive
+    itself navigates to the canonical snapshot mid-scroll, which destroys the JS execution
+    context ("Execution context was destroyed, most likely because of a navigation"). That must
+    NOT kill the whole download - we just stop scrolling and keep whatever loaded."""
     prev = -1
     for _ in range(40):
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            break  # navigated/reloaded mid-scroll - stop, keep what we have
         page.wait_for_timeout(500)
         try:
             h = page.evaluate("() => document.body.scrollHeight")
@@ -117,7 +145,10 @@ def _scroll_to_bottom(page):
         if h == prev:
             break
         prev = h
-    page.evaluate("window.scrollTo(0, 0)")
+    try:
+        page.evaluate("window.scrollTo(0, 0)")
+    except Exception:
+        pass
     page.wait_for_timeout(400)
 
 
@@ -230,20 +261,66 @@ def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
             page = browser.new_page(viewport={"width": 1440, "height": 900})
             page.on("response", lambda r: responses.append(r))
             _p(15, "Загружаю страницу архива")
-            try:
-                page.goto(archive_url, wait_until="networkidle", timeout=90000)
-            except Exception:
-                pass  # networkidle can time out on chatty archive pages - keep what loaded
-            _p(45, "Прокручиваю страницу до конца")
-            _scroll_to_bottom(page)
-            page.wait_for_timeout(1200)
+            # An archive snapshot often redirects (http->https, to the canonical timestamp, or the
+            # page JS-redirects) - the browser can end up on a BLANK/interstitial page and we grab a
+            # ~39-byte empty document. Retry the whole load until we actually have real content, so a
+            # flaky redirect doesn't silently produce an empty "site". `responses` accumulates across
+            # attempts, so assets captured on any try are kept.
+            html, _best = "", 0
+
+            def _consider(h):
+                # Keep the LARGEST real content seen. Grabbing both before AND after the scroll
+                # matters: on an image-heavy gallery (mikatoronen) the scroll can trigger a
+                # navigation that empties the DOM, so the pre-scroll grab is the one that survives.
+                nonlocal html, _best
+                if _has_real_content(h) and len(h) > _best:
+                    html, _best = h, len(h)
+
+            for attempt in range(5):
+                try:
+                    page.goto(archive_url, wait_until="domcontentloaded", timeout=90000)
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=25000)
+                except Exception:
+                    pass  # chatty archive pages never go idle - keep what loaded
+                try:
+                    _consider(page.content())  # BEFORE scroll - survives a scroll-triggered navigation
+                except Exception:
+                    pass
+                if attempt == 0:
+                    _p(45, "Прокручиваю страницу до конца")
+                try:
+                    _scroll_to_bottom(page)
+                except Exception:
+                    pass  # a mid-scroll navigation must never abort the whole download
+                page.wait_for_timeout(1000)
+                try:
+                    _consider(page.content())  # AFTER scroll - lazy content now loaded
+                except Exception:
+                    pass
+                if _best:
+                    break
+                # Empty result - usually archive.org throttling under load returning an interstitial.
+                # Back off progressively before re-loading (longer each attempt), so a busy archive
+                # gets time to answer instead of us hammering it into more empties.
+                page.wait_for_timeout(1500 + attempt * 1500)
+
             _strip_wayback_dom(page)  # remove the wayback toolbar/runtime before shot + save
             try:
                 page.screenshot(path=str(site_dir / "_preview.png"))  # thumbnail for the card
             except Exception:
                 pass
             _p(62, "Снимаю готовую страницу")
-            html = page.content()
+            try:
+                stripped = page.content()  # PREFER the toolbar-stripped page if it's still real
+                if _has_real_content(stripped):
+                    html = stripped
+            except Exception:
+                pass
+            if not _has_real_content(html):
+                raise RuntimeError("архив вернул пустую страницу (снапшот редиректит/не открывается)")
             _p(70, "Собираю ассеты")
             assets = {}
             for r in responses:
@@ -267,12 +344,25 @@ def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
             cand = (f"{stem}_{i}.{ext}" if dot else f"{name}_{i}")
             i += 1
         used.add(cand)
-        (files_dir / cand).write_bytes(data)
+        try:
+            (files_dir / cand).write_bytes(data)
+        except OSError:
+            continue  # a single un-writable asset (still-too-long path, bad name) never aborts the run
         rel = f"index_files/{cand}"
         url_to_local[url] = rel
         unwrapped = cw.unwayback(url)
         if unwrapped != url:
             url_to_local[unwrapped] = rel
+        # The DOM frequently references an asset by the ROOT-RELATIVE wayback form (host stripped):
+        #   <link href="/web/20180601184817cs_/https://site/css/x.css">
+        # The response URL we keyed on is the ABSOLUTE archive URL, so that href never matched and
+        # the stylesheet stayed pointing at a dead wayback path -> the file WAS saved but the page
+        # rendered unstyled (ariyalur & co). Register the root-/protocol-relative forms too so the
+        # rewrite below catches them.
+        for host in ("https://web.archive.org", "http://web.archive.org", "//web.archive.org"):
+            if url.startswith(host):
+                url_to_local[url[len(host):]] = rel  # -> "/web/<ts>cs_/https://site/..."
+                break
         if cand.lower().endswith(".css"):
             css_items.append((url, files_dir / cand))
 
@@ -280,6 +370,47 @@ def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
     # now, while we still know each stylesheet's original URL to resolve them against.
     _p(86, "Дотягиваю фоновые картинки из CSS")
     _fetch_css_assets(files_dir, css_items, url_to_local, used, log=lambda m: _p(86, m))
+
+    # Assets the DOM references but the browser NEVER handed us (an old snapshot serving CSS via a
+    # redirect/non-200, a lazily-requested file, ...) would otherwise stay pointing at a dead wayback
+    # URL -> page renders unstyled. sylhet's own new_style.css was simply absent from the browser's
+    # responses. Second pass: for every wayback-wrapped ASSET ref still in the HTML that we don't
+    # have locally, fetch it directly and save it. Generic - closes the "browser didn't give us the
+    # stylesheet/script" class for ANY archive.
+    _p(88, "Дотягиваю недостающие стили/скрипты")
+    _new_css = []
+    for m in re.finditer(
+        r'''(?:src|href)\s*=\s*["']((?:(?:https?:)?//web\.archive\.org)?/web/\d+[a-z_]*/[^"'<>]+)["']''', html):
+        ref = m.group(1)
+        if ref in url_to_local:
+            continue
+        base = ref.split("#")[0].split("?")[0].rsplit("/", 1)[-1]
+        if not _ASSET_EXT_RE.search(base):
+            continue  # a page link, not an asset - the cleaner unwraps it later
+        abs_url = (ref if ref.startswith("http")
+                   else "https:" + ref if ref.startswith("//") else "https://web.archive.org" + ref)
+        data = _fetch_one(abs_url)
+        if not data:
+            continue
+        name = _sanitize_name(abs_url)
+        stem, dot, ext = name.rpartition(".")
+        cand, i = name, 1
+        while cand in used:
+            cand = (f"{stem}_{i}.{ext}" if dot else f"{name}_{i}")
+            i += 1
+        used.add(cand)
+        try:
+            (files_dir / cand).write_bytes(data)
+        except OSError:
+            continue
+        rel = f"index_files/{cand}"
+        url_to_local[ref] = rel
+        url_to_local[abs_url] = rel
+        if cand.lower().endswith(".css"):
+            _new_css.append((abs_url, files_dir / cand))
+    # a directly-fetched stylesheet has its own url() backgrounds - pull those in too
+    if _new_css:
+        _fetch_css_assets(files_dir, _new_css, url_to_local, used, log=lambda m: _p(88, m))
 
     _p(90, "Переписываю ссылки на локальные")
     for url in sorted(url_to_local, key=len, reverse=True):
@@ -300,6 +431,25 @@ def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
     # All three are junk in front of our local folder, and the last one silently broke the
     # header banner (the file WAS downloaded, the ref just pointed nowhere).
     html = re.sub(r"(?:(?:https?:)?//web\.archive\.org)?/web/\d+[a-z_]*/(?=index_files/)", "", html)
+
+    # Robust fallback: ANY wayback-wrapped ref still left (root-relative like
+    # "/web/<ts>cs_/https://site/css/alucss.css", a redirect whose final URL didn't match the DOM
+    # href, etc.) is relinked to the local file BY BASENAME if we saved one. This is what actually
+    # rescues stylesheets on sites where the URL-keyed rewrite missed - the .css WAS downloaded, the
+    # <link> just still pointed at a dead wayback path, so the page rendered unstyled. Non-asset
+    # page links whose basename we didn't save are left untouched (the cleaner unwraps them later).
+    _saved_by_name = {}
+    for p in files_dir.iterdir():
+        if p.is_file():
+            _saved_by_name.setdefault(p.name.lower(), p.name)
+
+    def _relink(m):
+        ref = m.group(0)
+        base = ref.split("?")[0].split("#")[0].rstrip("/").rsplit("/", 1)[-1]
+        real = _saved_by_name.get(base.lower())
+        return f"index_files/{real}" if real else ref
+
+    html = re.sub(r"(?:(?:https?:)?//web\.archive\.org)?/web/\d+[a-z_]*/[^\s\"'()>]+", _relink, html)
 
     (site_dir / "index.html").write_text(html, encoding="utf-8")
     _p(100, "Готово")

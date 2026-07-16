@@ -99,6 +99,7 @@ def _new_entry(url):
         "clean_running": False, "clean_pct": 0, "clean_action": "",
         "clean_done": False, "clean_error": None, "clean_cancelled": False,
         "preview": False,
+        "qa_broken": False, "qa_reason": "",  # render-QA verdict (visual "looks broken?" check)
     }
     return eid
 
@@ -117,11 +118,31 @@ def _has_preview(site_dir):
         return False
 
 
+_RENDER_QA_JS = """() => {
+  const h = document.body ? document.body.scrollHeight : 0;
+  const els = document.querySelectorAll('body *');
+  let styled = 0;
+  const n = Math.min(els.length, 600);
+  for (let i = 0; i < n; i++) {
+    const cs = getComputedStyle(els[i]);
+    const bg = cs.backgroundColor, bi = cs.backgroundImage;
+    if ((bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'rgb(255, 255, 255)') || (bi && bi !== 'none')) styled++;
+  }
+  return {height: h, count: els.length, styled: styled};
+}"""
+
+
 def _screenshot_local(html_path, out_path):
-    """Render a cleaned local index.html in a headless browser and save a thumbnail, so the
-    card preview reflects the CLEAN result (not just the archived page grabbed at download)."""
+    """Render a cleaned local index.html in a headless browser, save a thumbnail, AND return a
+    render-QA verdict {'broken': bool, 'reason': str}. The verdict is the VISUAL safety net for the
+    exact failure the user fears: 'the archived page looked fine but the CLEANED page renders broken/
+    unstyled' - which the structural checks can't see. Heuristic: a page with plenty of elements but
+    almost no styling (no backgrounds/colors) or one that collapsed to near-nothing is flagged, so
+    the card can warn instead of silently shipping a broken site. Conservative thresholds -> a real
+    (even minimal) site always has some backgrounds, so false positives are rare."""
     image_providers._ensure_playwright()
     from playwright.sync_api import sync_playwright
+    verdict = {"broken": False, "reason": ""}
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         try:
@@ -129,8 +150,17 @@ def _screenshot_local(html_path, out_path):
             page.goto(Path(html_path).resolve().as_uri(), wait_until="networkidle", timeout=40000)
             page.wait_for_timeout(800)
             page.screenshot(path=str(out_path))
+            try:
+                m = page.evaluate(_RENDER_QA_JS)
+                if m["height"] < 400 and m["count"] > 15:
+                    verdict = {"broken": True, "reason": "страница схлопнулась — вероятно без стилей"}
+                elif m["count"] > 40 and m["styled"] < 2:
+                    verdict = {"broken": True, "reason": "нет фоновых стилей — вероятно голый HTML"}
+            except Exception:  # noqa: BLE001 - QA metric is best-effort
+                pass
         finally:
             browser.close()
+    return verdict
 
 
 def _humanize_progress_line(line):
@@ -327,12 +357,14 @@ def _clean_entry(eid):
         except Exception:  # noqa: BLE001 - never fail cleanup over the menu step
             pass
         _entry_set(eid, clean_action="Обновляю превью")
+        qa = {"broken": False, "reason": ""}
         try:
-            _screenshot_local(html_path, site_dir / "_preview.png")
-        except Exception:  # noqa: BLE001 - preview is best-effort
+            qa = _screenshot_local(html_path, site_dir / "_preview.png") or qa
+        except Exception:  # noqa: BLE001 - preview/QA is best-effort
             pass
         _entry_set(eid, clean_running=False, clean_pct=100, clean_action="Готово",
-                   clean_done=True, preview=_has_preview(site_dir))
+                   clean_done=True, preview=_has_preview(site_dir),
+                   qa_broken=bool(qa.get("broken")), qa_reason=qa.get("reason", ""))
     except clean_wayback_site.CleanupCancelled:
         _entry_set(eid, clean_running=False, clean_cancelled=True, clean_action="Отменено")
     except Exception as e:  # noqa: BLE001 - surface to the card

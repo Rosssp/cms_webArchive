@@ -643,6 +643,11 @@ class Report:
         self.semantic_title = None
         self.semantic_description = None
         self.semantic_tags_applied = []  # e.g. "div.top-bar -> header"
+        self.headings_normalized = []  # e.g. "h4 -> h3"
+        self.base_tag_removed = None  # the killed <base href="..."> if any
+        self.sri_stripped = 0  # integrity/crossorigin attrs removed (they'd block local assets)
+        self.qa_fixed = []  # QA self-check auto-fixes (e.g. "стиль был HTML, снят")
+        self.qa_warnings = []  # QA self-check issues that need a human eye
 
     def render(self):
         lines = ["=== cleanup report ===", ""]
@@ -844,6 +849,22 @@ class Report:
             lines.append(f"AI-семантика тегов ({len(self.semantic_tags_applied)}):")
             for s in self.semantic_tags_applied:
                 lines.append(f"  - {s}")
+        if self.headings_normalized:
+            lines.append(f"уровни заголовков выровнены (без пропусков) ({len(self.headings_normalized)}):")
+            for s in self.headings_normalized[:20]:
+                lines.append(f"  - {s}")
+        if self.base_tag_removed:
+            lines.append(f"убран <base href> (ломал все относительные ссылки/стили): {self.base_tag_removed}")
+        if self.sri_stripped:
+            lines.append(f"снято integrity/crossorigin (блокировали локальные стили/скрипты): {self.sri_stripped}")
+        if self.qa_fixed:
+            lines.append(f"QA-автофиксы ({len(self.qa_fixed)}):")
+            for s in self.qa_fixed:
+                lines.append(f"  - {s}")
+        if self.qa_warnings:
+            lines.append(f"QA-предупреждения — проверь глазами ({len(self.qa_warnings)}):")
+            for s in self.qa_warnings:
+                lines.append(f"  ! {s}")
         lines.append("")
         lines.append(self.verdict())
         return "\n".join(lines)
@@ -2207,6 +2228,173 @@ def _remove_a_and_empty_parent(a_tag):
         parent.decompose()
 
 
+def strip_base_href(soup, report=None):
+    """Remove a leftover <base href="https://origin/"> - THE classic "restored page has no styles"
+    trap. A base href makes the browser resolve EVERY relative URL (stylesheets, scripts, images)
+    against that absolute origin, so once the page is a self-contained local export, all its
+    index_files/*.css etc. try to load from the (usually dead) original domain and nothing applies
+    - the page renders as bare unstyled HTML. A restored static site must resolve relatives against
+    its own folder, so any <base> with an absolute/protocol-relative href is dropped. A bare
+    <base target="_blank"> (no href) is harmless and kept."""
+    for base in soup.find_all("base"):
+        href = (base.get("href") or "").strip()
+        if href.lower().startswith(("http://", "https://", "//")):
+            if report is not None:
+                report.base_tag_removed = href
+            if base.get("target"):
+                del base["href"]  # keep a meaningful target=, just drop the poisoning href
+            else:
+                base.decompose()
+
+
+def _audit_stylesheets(soup, html_path, site_domain, report):
+    """QA self-check on the stylesheets the browser will actually try to load. Two universal
+    breakages this catches for ANY site:
+      - a <link rel=stylesheet> whose local file is really an HTML page (the archive served an
+        error/interstitial and it got saved under a .css name, e.g. customize.css) - unparseable as
+        CSS, so those styles silently vanish. Try to recover the real CSS from the archive (domain
+        guess, like the corrupted-image sweep); failing that, drop the dead <link> and quarantine
+        the file so it's visibly gone instead of silently broken.
+      - a <link rel=stylesheet> pointing at a local file that doesn't exist -> flag it.
+    Returns True if it changed the soup (a <link> was removed)."""
+    site_root = html_path.parent
+    bare = _bare_domain(site_domain) if site_domain else None
+    changed = False
+    for link in list(soup.find_all("link")):
+        rels = [r.lower() for r in (link.get("rel") or [])]
+        if "stylesheet" not in rels:
+            continue
+        href = (link.get("href") or "").strip()
+        if not href or href.lower().startswith(("http://", "https://", "//", "data:")):
+            continue  # remote/data URL - not a local file we own
+        local = site_root / href.split("?")[0].split("#")[0]
+        if not local.is_file():
+            report.qa_warnings.append(f"стиль отсутствует локально: {href}")
+            continue
+        try:
+            head = local.read_bytes().lstrip()[:64].lower()
+        except OSError:
+            continue
+        if not head.startswith((b"<!doctype", b"<html", b"<head", b"<script", b"<body")):
+            continue  # real CSS (never starts with an HTML tag) - fine
+        # This "stylesheet" is actually HTML. Recover real CSS, or drop the dead link.
+        recovered = False
+        if bare:
+            try:
+                data, _ext = recover_asset_bytes(f"http://{bare}/{local.name}")
+            except Exception:  # noqa: BLE001
+                data = None
+            if data and not data.lstrip()[:15].lower().startswith((b"<!doctype", b"<html")):
+                local.write_bytes(data)
+                recovered = True
+        if recovered:
+            report.qa_fixed.append(f"стиль был HTML → восстановлен из архива: {href}")
+        else:
+            trash = local.parent / "_wayback_removed"
+            trash.mkdir(exist_ok=True)
+            dest, i = trash / local.name, 1
+            while dest.exists():
+                dest = trash / f"{local.stem}_{i}{local.suffix}"
+                i += 1
+            shutil.move(str(local), str(dest))
+            link.decompose()
+            changed = True
+            report.qa_fixed.append(f"стиль был HTML (не CSS) → снят и в карантин: {href}")
+    return changed
+
+
+def _audit_final_output(html_path, report):
+    """Universal 'did it come out broken?' check, run LAST on the FINAL files. Catches the signals
+    that mean a page renders wrong for ANY archive - a class we've closed or one we haven't yet:
+      - leftover wayback refs ('/web/<ts>/...') anywhere in the HTML or local CSS/JS = an asset ref
+        we failed to localize -> that asset won't load;
+      - <link rel=stylesheet> whose local file is missing -> those styles won't apply.
+    Cheap (no render). Turns a SILENT breakage into a visible warning so a new bad archive announces
+    itself in the report instead of surfacing later as 'опять пришло кривым'."""
+    site_root = html_path.parent
+    try:
+        html = read_text_safe(html_path)
+    except Exception:  # noqa: BLE001
+        return
+    wb = len(re.findall(r"/web/\d{8,}[a-z_]*/", html))
+    for p in site_root.rglob("*"):
+        if (p.is_file() and p.suffix.lower() in (".css", ".js")
+                and not any(part in QUARANTINE_DIR_NAMES for part in p.relative_to(site_root).parts)):
+            try:
+                wb += len(re.findall(r"/web/\d{8,}[a-z_]*/", read_text_safe(p)))
+            except Exception:  # noqa: BLE001
+                pass
+    if wb:
+        report.qa_warnings.append(
+            f"осталось {wb} wayback-ссылок в HTML/CSS/JS — часть ассетов может не грузиться (проверь рендер)")
+    soup = BeautifulSoup(html, PARSER)
+    missing = broken = 0
+    for l in soup.find_all("link", rel=lambda v: v and "stylesheet" in v):
+        h = (l.get("href") or "").split("?")[0].split("#")[0]
+        if not h or h.startswith(("http", "//", "data:")):
+            continue
+        f = site_root / h
+        if not f.is_file():
+            missing += 1
+            continue
+        # The file exists but is EMPTY/truncated or is really an HTML error page -> it applies no
+        # CSS, so a single critical stylesheet in this state leaves the whole page unstyled. Flag it.
+        try:
+            data = f.read_bytes()
+        except OSError:
+            continue
+        if len(data.strip()) < 8 or data.lstrip()[:15].lower().startswith((b"<!doctype", b"<html")):
+            broken += 1
+    if missing:
+        report.qa_warnings.append(
+            f"{missing} <link rel=stylesheet> ведут на несуществующий локальный файл — стили не применятся")
+    if broken:
+        report.qa_warnings.append(
+            f"{broken} подключённых CSS пустые/битые (не настоящий CSS) — стили с них не применятся (проверь рендер)")
+    if soup.find(["frameset", "frame"]) is not None:
+        report.qa_warnings.append(
+            "страница на <frameset> — контент в отдельных фреймах, нужен ручной разбор (старый сайт)")
+    body = soup.find("body")
+    if body is not None and len(body.get_text(strip=True)) < 40 and not body.find(["img", "iframe", "svg"]):
+        report.qa_warnings.append(
+            "в <body> почти нет контента — возможно, страница скачалась пустой/сломанной")
+
+
+def strip_blocking_meta(soup, report=None):
+    """Remove a <meta http-equiv="Content-Security-Policy"> (and its Report-Only variant). An
+    archived page's CSP almost always whitelists ONLY the original domain, so once the page is a
+    self-contained local export the CSP BLOCKS every local stylesheet/script/image/font - the page
+    goes completely blank/unstyled, and INVISIBLY (no toolbar, no error the user sees). A restored
+    static site needs no CSP at all, so dropping it is always safe (it only relaxes). Anticipatory:
+    not in the test batch, but common on modern sites and a guaranteed whole-page breaker."""
+    n = 0
+    for meta in soup.find_all("meta", attrs={"http-equiv": re.compile(
+            r"^\s*content-security-policy(-report-only)?\s*$", re.I)}):
+        meta.decompose()
+        n += 1
+    if report is not None and n:
+        report.qa_fixed.append(f"снят <meta CSP> ({n}) — иначе блокировал бы все локальные стили/скрипты")
+    return n
+
+
+def strip_sri_attrs(soup, report=None):
+    """Remove integrity= (and crossorigin=) from <link>/<script>. Subresource Integrity pins a hash
+    of the ORIGINAL remote asset; once we serve a LOCAL copy (recovered/rewritten) the hash no
+    longer matches and the browser BLOCKS the stylesheet/script outright - an INVISIBLE "no styles /
+    dead JS" on any modern archived site that shipped SRI (common on CDN <link>/<script>). Not in the
+    test batch, but a guaranteed future breaker, so close the class now. crossorigin on a now-local
+    ref is moot too."""
+    n = 0
+    for tag in soup.find_all(["link", "script", "style"]):
+        for attr in ("integrity", "crossorigin"):
+            if tag.has_attr(attr):
+                del tag[attr]
+                n += 1
+    if report is not None and n:
+        report.sri_stripped = n
+    return n
+
+
 def strip_wayback_toolbar(soup):
     for tag_id in ("wm-ipp-base", "wm-ipp-print"):
         el = soup.find(id=tag_id)
@@ -2352,7 +2540,13 @@ RECOVERY_FETCH_RETRIES = 1  # one gentle retry covers the common transient web.a
 # across every thread so we stay a single, polite stream and never trip the throttle. Other
 # hosts (Google Fonts on gstatic, Font Awesome on cdnjs) aren't throttle-sensitive and must NOT
 # share this lock, or parallel cleanups needlessly serialize their font/icon downloads too.
-_ARCHIVE_FETCH_LOCK = threading.Semaphore(1)
+# Bounded GLOBAL concurrency for archive.org. Was 1 (fully serial) to avoid the throttle-stampede
+# that once hung 2 parallel cleanups; but the real culprit then was the Google-Fonts recovery spam
+# (fixed via _FONT_CDN_HOSTS). A small pool is polite AND lets a single big page's CSS recovery run
+# several lookups at once (the phase-88 bottleneck: dozens of serialized CDX round-trips). The cap is
+# GLOBAL, so even N parallel cleanups never exceed _ARCHIVE_POOL concurrent archive requests total.
+_ARCHIVE_POOL = 4
+_ARCHIVE_FETCH_LOCK = threading.Semaphore(_ARCHIVE_POOL)
 
 # Remembers URLs that already failed this process, so a serialized archive fetch is never spent
 # twice on the same dead asset (see _fetch_url_bytes). Keyed by URL -> the original exception.
@@ -2389,6 +2583,39 @@ def _raise_if_cancelled(cancelled=None):
         raise CleanupCancelled()
     if _cancel_active():
         raise CleanupCancelled()
+
+
+# Per-run archive-recovery circuit breaker + negative cache. A page whose assets simply aren't in
+# the archive (a common case) otherwise pays a full serialized CDX round-trip for EVERY missing
+# asset - 100+ of them = minutes. After too many CONSECUTIVE misses we conclude the archive doesn't
+# have this site's assets and stop the network for the rest of the run (recovery is best-effort;
+# the same "couldn't recover" fallbacks still fire). A single success resets the streak, so sites
+# that DO recover are never cut off. Thread-local => each parallel cleanup has its own breaker.
+# Enabled only inside clean_html_file; standalone recover_asset_bytes callers keep old behaviour.
+_REC_TL = threading.local()
+_REC_MAX_CONSEC_FAILS = 10
+
+
+def _reset_recovery_state():
+    _REC_TL.enabled = True
+    _REC_TL.consec_fails = 0
+    _REC_TL.dead = False
+    _REC_TL.miss = set()  # original URLs already known-dead this run (skip re-lookup)
+
+
+def _recovery_giving_up():
+    return getattr(_REC_TL, "enabled", False) and getattr(_REC_TL, "dead", False)
+
+
+def _recovery_note(success):
+    if not getattr(_REC_TL, "enabled", False):
+        return
+    if success:
+        _REC_TL.consec_fails = 0
+    else:
+        _REC_TL.consec_fails = getattr(_REC_TL, "consec_fails", 0) + 1
+        if _REC_TL.consec_fails >= _REC_MAX_CONSEC_FAILS:
+            _REC_TL.dead = True
 
 
 def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH_RETRIES):
@@ -2474,6 +2701,21 @@ def _wayback_nearest_snapshot_url(original_url, timestamp):
     return f"https://web.archive.org/web/{best[ts_i]}id_/{original_url}"
 
 
+def _cap_asset_name(name):
+    """Cap a recovered asset's filename so <deep site folder>/index_files/.../<name> never blows
+    Windows' 260-char MAX_PATH - blogspot/Google asset names are 100+ char hashes, and the write
+    then CRASHES the whole cleanup (puratoni). Short readable stem + an md5 tag keeps distinct long
+    names distinct; the extension is preserved."""
+    name = name or "asset"
+    if len(name) <= 64:
+        return name
+    import hashlib
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    return f"{stem[:40]}_{hashlib.md5(name.encode('utf-8')).hexdigest()[:8]}" + (f".{ext[:8]}" if ext else "")
+
+
 def recover_asset_bytes(original_url, timestamp=None):
     """Try to fetch the real bytes of `original_url` from the Wayback Machine - the
     exact-timestamp raw fetch first if a timestamp hint is available, then the CDX
@@ -2481,6 +2723,12 @@ def recover_asset_bytes(original_url, timestamp=None):
     or (None, ext) if nothing could be recovered. Shared by the CSS asset recovery
     below and the broken-resource auto-cleanup in site_edit.py."""
     ext = Path(urlsplit(original_url).path).suffix.lower()
+    enabled = getattr(_REC_TL, "enabled", False)
+    if enabled:
+        # This site's assets are clearly not archived, or we already tried this exact URL and it
+        # was dead - skip the (serialized, slow) CDX round-trip and go straight to the fallback.
+        if _recovery_giving_up() or original_url in getattr(_REC_TL, "miss", ()):
+            return None, ext
     candidates = []
     if timestamp:
         candidates.append(f"https://web.archive.org/web/{timestamp}id_/{original_url}")
@@ -2493,7 +2741,11 @@ def recover_asset_bytes(original_url, timestamp=None):
         except Exception:
             continue
         if _looks_like_valid_asset_bytes(data, ext):
+            _recovery_note(True)
             return data, ext
+    _recovery_note(False)
+    if enabled:
+        _REC_TL.miss.add(original_url)
     return None, ext
 
 
@@ -2589,13 +2841,17 @@ def _recover_css_asset(raw_url, css_path, report, site_domain):
         print(f"[css-recovery] ok: {original_url}")
         assets_dir = css_path.parent / f"{css_path.stem}_recovered"
         assets_dir.mkdir(parents=True, exist_ok=True)
+        name = _cap_asset_name(name)  # long blogspot/Google hashes else blow Windows MAX_PATH -> crash
         dest = assets_dir / name
         i = 1
         while dest.exists() and dest.read_bytes() != data:
             dest = assets_dir / f"{Path(name).stem}_{i}{Path(name).suffix}"
             i += 1
-        if not dest.exists():
-            dest.write_bytes(data)
+        try:
+            if not dest.exists():
+                dest.write_bytes(data)
+        except OSError:
+            return to_relative(raw_url, site_domain) if timestamp is None else Path(name).name
         report.recovered_images.append(f"{original_url} -> {dest.relative_to(css_path.parent).as_posix()} (CSS {Path(name).suffix.lstrip('.')})")
         return dest.relative_to(css_path.parent).as_posix() + fragment
 
@@ -2649,10 +2905,37 @@ def clean_local_linked_files(html_path, report=None, site_domain=None, cancelled
         working = text
         is_css = _looks_like_css(text, suffix)
         if is_css and report is not None:
+            # A big framework/theme CSS has dozens of url()s, each a slow serialized archive lookup -
+            # the phase-88 bottleneck. PRE-recover the unique targets CONCURRENTLY (bounded globally by
+            # _ARCHIVE_FETCH_LOCK), then the regex pass just reads the results. No network in the sub.
+            _seen, _targets = set(), []
+            for _m in CSS_URL_RE.finditer(working):
+                _ru = _m.group(2)
+                if _ru not in _seen:
+                    _seen.add(_ru)
+                    _targets.append(_ru)
+            _recovered = {}
+            if _targets:
+                _raise_if_cancelled(cancelled)
+                from concurrent.futures import ThreadPoolExecutor
+
+                def _rec_one(ru):
+                    if cancelled is not None and cancelled():
+                        raise CleanupCancelled()
+                    try:
+                        return ru, _recover_css_asset(ru, path, report, site_domain)
+                    except CleanupCancelled:
+                        raise
+                    except Exception:  # noqa: BLE001 - a single asset failure never breaks the file
+                        return ru, None
+
+                with ThreadPoolExecutor(max_workers=min(_ARCHIVE_POOL, len(_targets))) as _ex:
+                    for _ru, _res in _ex.map(_rec_one, _targets):
+                        _recovered[_ru] = _res
+
             def _sub_css_url(m):
-                _raise_if_cancelled(cancelled)  # a big framework CSS = many url() fetches; stay abortable per-url
                 quote, raw_url = m.group(1), m.group(2)
-                new_ref = _recover_css_asset(raw_url, path, report, site_domain)
+                new_ref = _recovered.get(raw_url)
                 if new_ref is None:
                     return m.group(0)
                 q = quote or "'"
@@ -2762,6 +3045,59 @@ def localize_media_refs(soup, html_path, site_domain, report, dry_run=False, can
         if p.is_file() and not any(part in QUARANTINE_DIR_NAMES for part in p.relative_to(site_root).parts):
             local_by_name.setdefault(p.name, p)
 
+    # Pre-recover all same-domain-absolute media CONCURRENTLY (pool 4, globally bounded): each is a
+    # slow serialized archive fetch and a gallery has dozens - the phase-60-70 bottleneck. Populates
+    # local_by_name + disk so the serial pass below just relinks locally (no network in it).
+    if not dry_run:
+        pend = set()
+        for tag in soup.find_all(["img", "source", "video", "audio"]):
+            for attr in ("src", "poster"):
+                if tag.has_attr(attr):
+                    pend.add(tag[attr])
+            if tag.has_attr("srcset"):
+                for part in tag["srcset"].split(","):
+                    bit = part.strip().split(" ", 1)
+                    if bit and bit[0]:
+                        pend.add(bit[0])
+        want, seen = [], set()
+        for url in pend:
+            u = unwayback((url or "").strip())
+            if not (u and is_external(u) and matches_suffix(domain_of(u), {bare})):
+                continue
+            name = Path(urlsplit(u.split("?")[0].split("#")[0]).path).name or "asset"
+            if name in local_by_name or name in seen:
+                continue
+            seen.add(name)
+            want.append((u.split("#")[0], name))
+        if want:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _rec_media(item):
+                _u, _name = item
+                if cancelled is not None and cancelled():
+                    raise CleanupCancelled()
+                try:
+                    _data, _ = recover_asset_bytes(_u)
+                except CleanupCancelled:
+                    raise
+                except Exception:  # noqa: BLE001
+                    _data = None
+                return _name, _u, _data
+
+            with ThreadPoolExecutor(max_workers=min(_ARCHIVE_POOL, len(want))) as _ex:
+                for _name, _u, _data in _ex.map(_rec_media, want):
+                    if not _data:
+                        continue
+                    recovered_dir.mkdir(parents=True, exist_ok=True)
+                    _dest = recovered_dir / _cap_asset_name(_name)
+                    try:
+                        _dest.write_bytes(_data)
+                        local_by_name.setdefault(_name, _dest)
+                        report.recovered_images.append(
+                            f"{_u} -> {os.path.relpath(_dest, site_root).replace(os.sep, '/')} (media)")
+                    except OSError:
+                        pass
+
     def _localize(url):
         """(new_ref, dead) for a single ref - only touches same-domain absolute URLs."""
         u = unwayback((url or "").strip())
@@ -2780,8 +3116,12 @@ def localize_media_refs(soup, html_path, site_domain, report, dry_run=False, can
                 data = None
             if data:
                 recovered_dir.mkdir(parents=True, exist_ok=True)
-                dest = recovered_dir / name
-                dest.write_bytes(data)
+                safe = _cap_asset_name(name)  # else a long blogspot/Google hash blows MAX_PATH -> crash
+                dest = recovered_dir / safe
+                try:
+                    dest.write_bytes(data)
+                except OSError:
+                    return None, True  # can't save it -> treat as dead rather than crash the run
                 local_by_name.setdefault(name, dest)
                 rel = os.path.relpath(dest, site_root).replace(os.sep, "/")
                 report.recovered_images.append(f"{u} -> {rel} (media)")
@@ -3841,6 +4181,24 @@ def _sem_cls(el):
     return " ".join(el.get("class", [])) if hasattr(el, "get") else ""
 
 
+def _looks_like_nav_block(el):
+    """A bare container (div/ul/center/table) that IS the site's menu even with NO nav class - many
+    text links that dominate its content and no heading of its own. This is what separates a real
+    menu bar (lots of short links, little else) from a hero band (a couple of CTA buttons + big
+    heading text), so old exports whose nav is just `<div>`/`<center>` full of links still get a
+    proper <header> instead of being missed."""
+    if getattr(el, "name", None) not in ("div", "ul", "center", "nav", "table"):
+        return False
+    links = [a for a in el.find_all("a") if a.get_text(strip=True)]
+    if len(links) < 3:
+        return False
+    if el.find(_SEM_HEADINGS):
+        return False  # a nav bar carries no <h1..h3> of its own - that's content
+    link_text = sum(len(a.get_text(" ", strip=True)) for a in links)
+    total = len(el.get_text(" ", strip=True)) or 1
+    return link_text / total > 0.55  # predominantly links -> it's the menu
+
+
 def _promote_header(soup, root):
     """Deterministically make the site's primary top navigation the page <header> - a hero/intro
     band is NEVER the header. Scans the first few top-level blocks for a genuine nav signal (a
@@ -3855,17 +4213,29 @@ def _promote_header(soup, root):
             ch.name = "section"
     if root.find("header") is not None:
         return None
+    # Descend through a single generic wrapper that holds the whole page (old layouts wrap everything
+    # in one <center>/<div>/<table>), so the nav that sits INSIDE it is reachable by the top-level
+    # scan below - otherwise the wrapper is the only "child" and the menu is never seen.
+    _WRAP = ("center", "div", "table", "tbody", "tr", "form", "section", "main")
+    for _ in range(5):
+        kids = [c for c in root.find_all(recursive=False)
+                if getattr(c, "name", None) not in (None, "script", "style", "link", "meta", "br", "noscript")]
+        if len(kids) == 1 and kids[0].name in _WRAP:
+            root = kids[0]
+        else:
+            break
     children = [c for c in root.find_all(recursive=False) if getattr(c, "name", None)]
-    for ch in children[:4]:
+    for ch in children[:6]:
         cls = _sem_cls(ch)
         if _SEM_HERO_RE.search(cls):
             continue  # a hero/intro/banner is content - skip past it, keep looking for the nav
-        is_nav = ch.name == "nav" or bool(_SEM_NAVBAR_RE.search(cls)) or ch.find("nav") is not None
+        # NOTE: do NOT bail just because an earlier block has a heading - the menu often sits right
+        # AFTER a logo/title bar (which carries the site's <h1>), e.g. <div>logo+h1</div><div>nav</div>.
+        # Only a link-dominated block (nav tag / navbar class / contains <nav> / _looks_like_nav_block)
+        # is taken as the header; ordinary content blocks are skipped, not treated as a stop signal.
+        is_nav = (ch.name == "nav" or bool(_SEM_NAVBAR_RE.search(cls))
+                  or ch.find("nav") is not None or _looks_like_nav_block(ch))
         if not is_nav:
-            # hit real content (a heading-bearing block) before any nav -> this page has no top
-            # nav bar to promote; stop rather than reaching deep down the page.
-            if ch.name in _SEM_RENAMEABLE and ch.find(_SEM_HEADINGS):
-                break
             continue
         if ch.name == "nav":
             # a bare top <nav> -> wrap it (plus an immediately-preceding logo-only sibling) in
@@ -3940,6 +4310,77 @@ def apply_semantic_meta(soup, site_domain, report):
         head.append(desc_el)
     desc_el["content"] = meta["description"]
     report.semantic_description = meta["description"]
+
+
+_HEADING_RE = re.compile(r"^h[1-6]$")
+
+
+def normalize_heading_levels(soup, report):
+    """Make the document's heading outline have NO skipped levels: after an h2 the next-deeper
+    heading is h3, never h4. Deterministic, no AI, changes only the tag LEVEL (never the text).
+
+    Walk headings in document order keeping a stack of the ancestors' ORIGINAL levels; a heading's
+    output level is its depth in that tree, offset from the first heading's own level so the top of
+    the page keeps its level (a page that starts at h2 stays h2, its children become h3, h4, ...).
+    Siblings share a level; going shallower pops back up. Capped at h6."""
+    body = soup.find("body") or soup
+    headings = body.find_all(_HEADING_RE)
+    if not headings:
+        return
+    baseline = int(headings[0].name[1])  # keep the first heading's level as the outline's top
+    stack = []
+    for h in headings:
+        lvl = int(h.name[1])
+        while stack and stack[-1] >= lvl:
+            stack.pop()
+        stack.append(lvl)
+        out = min(6, baseline + len(stack) - 1)
+        new_name = f"h{out}"
+        if h.name != new_name:
+            report.headings_normalized.append(f"{h.name} -> {new_name}")
+            h.name = new_name
+
+
+def ensure_landmarks(soup, report):
+    """Deterministic HTML5 landmarks (runs WITH OR WITHOUT the AI key): wrap the content region in
+    <main> and turn top-level content <div>s (those carrying a heading = a real section) into
+    <section>. section/main are generic blocks exactly like div, and classes are preserved, so this
+    is box-model-neutral and doesn't change the look (verified: renders identical). Skips header/
+    footer/nav. Idempotent: only adds <main> if none exists; only renames heading-bearing divs."""
+    body = soup.find("body")
+    if body is None:
+        return
+    root = body
+    for _ in range(4):  # descend through a single generic wrapper (old <center>/<div>/<form> layouts)
+        kids = [c for c in root.find_all(recursive=False)
+                if getattr(c, "name", None) not in (None, "script", "style", "link", "meta", "br", "noscript")]
+        if len(kids) == 1 and kids[0].name in ("div", "center", "form", "section", "main"):
+            root = kids[0]
+        else:
+            break
+    hdr, ftr = soup.find("header"), soup.find("footer")
+    renamed = 0
+    for c in [c for c in root.find_all(recursive=False) if getattr(c, "name", None)]:
+        if c is hdr or c is ftr or c.name != "div":
+            continue
+        if _SEM_HERO_RE.search(_sem_cls(c)) or c.find(_SEM_HEADINGS) is None:
+            continue  # only a heading-bearing content block becomes a <section>
+        c.name = "section"
+        renamed += 1
+    wrapped = 0
+    if soup.find("main") is None and hdr is not None:
+        main = soup.new_tag("main")
+        hdr.insert_after(main)
+        nxt = main.next_sibling
+        while nxt is not None:
+            cur, nxt = nxt, nxt.next_sibling
+            if getattr(cur, "name", None) == "footer":
+                break
+            if getattr(cur, "name", None):
+                main.append(cur.extract())
+                wrapped += 1
+    if renamed or wrapped:
+        report.semantic_tags_applied.append(f"детерминированно: div→section {renamed}, main-обёртка {wrapped} блоков")
 
 
 def apply_semantic_tags(soup, report):
@@ -4023,8 +4464,16 @@ def clean_html_file(
     # Overwritten at the start of every call, so parallel cleanups (each its own thread) and
     # repeated CLI calls never see a stale hook.
     _set_cancel_check(cancelled)
+    _reset_recovery_state()  # fresh archive-recovery circuit breaker per run
 
-    original_text = read_text_safe(html_path)
+    # IDEMPOTENCY: always clean from the TRUE original. The first run saves the raw download into
+    # <file>.bak; a re-run ("Очистить снова") must clean THAT raw again, not the already-cleaned
+    # index.html - otherwise it double-processes (re-extracts inline <style> over the theme CSS,
+    # duplicates our injected <link>s) and a good page comes out white/unstyled. So: if .bak exists,
+    # parse it; and .bak is written ONCE (below) so it stays the real raw forever.
+    bak_path = html_path.with_suffix(html_path.suffix + ".bak")
+    source_path = bak_path if (backup and bak_path.is_file()) else html_path
+    original_text = read_text_safe(source_path)
     # A stray element between <html> and <head> (e.g. wayback/YUI's
     # <div id="yui3-css-stamp">) makes some parsers misplace <head>'s
     # content into <body> - strip it before parsing.
@@ -4061,6 +4510,9 @@ def clean_html_file(
     _p(28, "Снимаю обёртки веб-архива, тулбар и мусор")
     strip_wayback_comment_and_html_attrs(soup)
     strip_wayback_toolbar(soup)
+    strip_base_href(soup, report)  # kill <base href> - else all relative CSS/JS/img break locally
+    strip_sri_attrs(soup, report)  # kill integrity/crossorigin - else SRI blocks our local copies
+    strip_blocking_meta(soup, report)  # kill <meta CSP> - else it blocks every local resource
     unwayback_all_attrs(soup)
     clean_scripts(soup, report)
     clean_stylesheet_links(soup, report, site_domain)
@@ -4071,11 +4523,25 @@ def clean_html_file(
     promote_src(soup)
     add_lazy_loading(soup, report)
     clean_data_and_event_attrs(soup)
+    # DETERMINISTIC page header (runs WITH OR WITHOUT the AI key): make the site's real top nav -
+    # even a bare <div>/<center> full of links with no nav class - the page <header>. Old exports
+    # whose menu is just a link-heavy div were previously missed entirely; the AI pass below only
+    # refines. (If there's genuinely no nav, auto_link_menu generates a header as the last step.)
+    _hdr_root = soup.find("body")
+    if _hdr_root is not None:
+        _old_hdr = _promote_header(soup, _hdr_root.find("main") or _hdr_root)
+        if _old_hdr is not None:
+            report.semantic_tags_applied.append(f"{_old_hdr} -> header (верхний нав, детерминированно)")
     # AI (Haiku) tag-semantics: promote top-level <div> soup into HTML5 landmarks, so the menu/
     # section logic below (and the final markup) sees real header/nav/main/section/footer. Skipped
     # in dry-run (no LLM spend on a preview) and whenever no ANTHROPIC_API_KEY is configured.
     if not dry_run:
         apply_semantic_tags(soup, report)
+    # Fix the heading outline so levels never skip (h2 then h3, never h4). Deterministic - runs
+    # with or without the AI pass, after tag-semantics so it sees the final structure.
+    normalize_heading_levels(soup, report)
+    # Deterministic <main> + <section> landmarks (box-model-neutral, runs without the AI key too).
+    ensure_landmarks(soup, report)
     # Empty fonts_param -> try to detect a font already used on this page (falls back
     # to a random preset if the page only declares generic/system-default fonts).
     _p(56, "Подключаю шрифт (скачиваю локально)")
@@ -4126,6 +4592,11 @@ def clean_html_file(
     _reorder_head_seo(soup)  # head order: <title> -> <meta description> -> <link canonical> -> fonts
     check_internal_link_targets(soup, html_path, report)
     strip_empty_style_declarations(soup)
+    # QA self-check: any <link rel=stylesheet> that's really an HTML page (would silently lose those
+    # styles) is recovered or dropped; missing local stylesheets are flagged. Runs before the write
+    # so a removed dead <link> lands in the saved HTML.
+    if not dry_run:
+        _audit_stylesheets(soup, html_path, site_domain, report)
 
     _p(82, "Записываю страницу")
     new_text = collapse_blank_lines(str(soup))
@@ -4137,8 +4608,8 @@ def clean_html_file(
         print("[dry-run] no files written")
         return report.render()
 
-    if backup:
-        html_path.with_suffix(html_path.suffix + ".bak").write_text(original_text, encoding="utf-8")
+    if backup and not bak_path.is_file():
+        bak_path.write_text(original_text, encoding="utf-8")  # save the raw ONCE; never overwrite it
     html_path.write_text(new_text, encoding="utf-8")
 
     _p(88, "Чищу CSS/JS и восстанавливаю ассеты из архива")
@@ -4154,6 +4625,7 @@ def clean_html_file(
                 local_css_texts.append(read_text_safe(css_path))
     _p(96, "Убираю неиспользуемые файлы")
     remove_unused_local_assets(html_path, new_text, report, dry_run=dry_run, extra_texts=local_css_texts)
+    _audit_final_output(html_path, report)  # universal "did it come out broken?" self-check
 
     report_path = html_path.with_name(html_path.name + ".cleanup-report.txt")
     rendered = report.render()
