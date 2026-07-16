@@ -128,6 +128,49 @@ def _first_color_in(value, props):
     return named
 
 
+_BODY_BG_RE = re.compile(r"(?:^|[},])\s*(?:html|body)[^{}]*\{([^}]*)\}", re.I)
+_ANY_HEX_RE = re.compile(r"#[0-9a-fA-F]{6}\b|#[0-9a-fA-F]{3}\b")
+
+
+def _site_background(css, props, soup=None):
+    """The page's REAL background colour: the html/body rule's background. This is what the header
+    must sit on - picking anything else is how the header ended up black on a #f8f8f8 site.
+    Old table-layout sites state it as <body bgcolor="#F6DAAC"> with no CSS at all, so check the
+    attribute too."""
+    for m in _BODY_BG_RE.finditer(css):
+        bm = _SEL_BG_RE.search(m.group(1))
+        if bm:
+            c = _first_color_in(bm.group(1), props)
+            if c:
+                return c
+    if soup is not None:
+        body = soup.find("body")
+        if body is not None:
+            for attr in ("bgcolor", "background-color"):
+                c = cw.parse_color(body.get(attr) or "")
+                if c:
+                    return c
+    return None
+
+
+def _dominant_accent(css):
+    """The site's own accent: the most-used SATURATED colour across its stylesheets (Bootstrap
+    themes state it as #337ab7 on borders/buttons rather than in a --var). Greys, near-white and
+    near-black are skipped - they're chrome, not brand."""
+    counts = {}
+    for m in _ANY_HEX_RE.finditer(css):
+        rgb = cw.parse_color(m.group(0))
+        if not rgb:
+            continue
+        h, l, s = _rgb_to_hls(rgb)
+        if s < 0.25 or l < 0.12 or l > 0.88:
+            continue  # grey / almost black / almost white -> not an accent
+        counts[rgb] = counts.get(rgb, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
 def _hero_background(soup, sections, css, props):
     """Best-effort background colour of the hero (first) section: its inline style, else a CSS
     rule whose selector names the hero's class/id, else the body/root background."""
@@ -184,34 +227,46 @@ def extract_palette(soup, html_path, sections, brand):
     css = _gather_css(soup, html_path)
     props = _css_custom_props(css)
 
-    accent = _pick_var(props, _ACCENT_VAR_HINTS)
-    site_bg = _pick_var(props, _BG_VAR_HINTS) or _hero_background(soup, sections, css, props)
-    if accent is None:
-        accent = _hero_background(soup, sections, css, props)
-    if accent is None:
-        accent = cw._letter_to_bg_color((brand or "S")[0])  # grayscale site -> per-brand hue
+    # ACCENT, best source first: an explicit --accent/--brand var, else the colour the site
+    # actually USES most (borders/buttons - a Bootstrap theme states #337ab7 there, never in a
+    # --var), else the hero background, else a per-brand hue for a greyscale site.
+    accent = (_pick_var(props, _ACCENT_VAR_HINTS)
+              or _dominant_accent(css)
+              or _hero_background(soup, sections, css, props)
+              or cw._letter_to_bg_color((brand or "S")[0]))
+    # BACKGROUND: the html/body background is what the header actually sits on, so it - and not
+    # the visitor's OS - decides light vs dark. (A #f8f8f8 site was getting a black bar purely
+    # because the viewer's OS was in dark mode.)
+    site_bg = (_site_background(css, props, soup)
+               or _pick_var(props, _BG_VAR_HINTS)
+               or _hero_background(soup, sections, css, props))
 
-    h, _l, s = _rgb_to_hls(accent)
+    h, acc_l, s = _rgb_to_hls(accent)
     if s < 0.12:  # the "accent" we found is basically grey -> borrow a hue so there's a tint
         h, s = _rgb_to_hls(cw._letter_to_bg_color((brand or "S")[0]))[0], 0.6
+        acc_l = 0.42
 
     site_is_dark = bool(site_bg) and _luminance(site_bg) < 0.4
+    # Sit ON the site's own background instead of a generic white/black bar.
+    site_bg_hex = _rgb_to_hex(site_bg) if site_bg else None
 
-    # Accent lightness/sat per theme - a darker accent reads on a white bar, a brighter one on a
-    # dark bar. The SAME values feed both the CSS and the baked logo PNGs so text and logo match.
-    l_acc = (h, 0.42, max(0.55, s))
-    d_acc = (h, 0.66, max(0.6, s))
+    # Accent lightness per theme - a darker accent reads on a light bar, a brighter one on a dark
+    # bar. But KEEP the site's real colour when it's already in a readable range: forcing every
+    # accent to L=0.42 turned this site's navy #000080 into a garish #0000d6, which is the exact
+    # opposite of "take the colours from the site". Only pull it in when it genuinely wouldn't read.
+    l_acc = (h, acc_l if 0.22 <= acc_l <= 0.58 else 0.42, max(0.55, s))
+    d_acc = (h, acc_l if 0.5 <= acc_l <= 0.8 else 0.66, max(0.6, s))
     return {
         "hue": h, "sat": max(0.5, min(0.9, s)),
         "site_is_dark": site_is_dark,
-        # LIGHT theme
-        "l_bg": "#ffffff",
+        # LIGHT theme - on the site's own background when it has one (#f8f8f8, not a generic white)
+        "l_bg": (site_bg_hex if (site_bg_hex and not site_is_dark) else "#ffffff"),
         "l_text": "#161616",
         "l_muted": "#5b5b5b",
         "l_accent": _hls_hex(*l_acc), "l_accent_rgb": _hls_rgb(*l_acc),
         "l_border": "rgba(0,0,0,.10)",
-        # DARK theme (bg tinted with the site hue so it feels part of the site)
-        "d_bg": _hls_hex(h, 0.08, min(0.35, s)),
+        # DARK theme - likewise the site's own dark background, else one tinted with its hue
+        "d_bg": (site_bg_hex if (site_bg_hex and site_is_dark) else _hls_hex(h, 0.08, min(0.35, s))),
         "d_text": "#f3f3f5",
         "d_muted": "#a6a6ad",
         "d_accent": _hls_hex(*d_acc), "d_accent_rgb": _hls_rgb(*d_acc),
@@ -225,15 +280,50 @@ def extract_palette(soup, html_path, sections, brand):
 # --------------------------------------------------------------------------- #
 
 def _base_css(pal):
+    # The header is anchored to the SITE's theme, not the visitor's OS. A light site keeps a light
+    # bar even in dark mode - flipping it produced a black bar on a #f8f8f8 page, which is exactly
+    # what "pick the header colours from the site" must not do. The prefers-color-scheme override
+    # is therefore only emitted for a site that IS dark (there it genuinely helps); [data-theme]
+    # stays available either way for a site with its own switcher.
+    dark = pal["site_is_dark"]
+    pal = dict(pal)
+    pal["base_bg"] = pal["d_bg"] if dark else pal["l_bg"]
+    pal["base_text"] = pal["d_text"] if dark else pal["l_text"]
+    pal["base_muted"] = pal["d_muted"] if dark else pal["l_muted"]
+    pal["base_accent"] = pal["d_accent"] if dark else pal["l_accent"]
+    pal["base_border"] = pal["d_border"] if dark else pal["l_border"]
+    pal["dark_media"] = (
+        "@media (prefers-color-scheme:dark){.wbh{--bg:%(d_bg)s;--tx:%(d_text)s;--mut:%(d_muted)s;"
+        "--ac:%(d_accent)s;--bd:%(d_border)s}}\n" % pal
+    ) if dark else ""
+    # v6 stacks the logo above the nav, so it's taller than the single 64px bar the others use.
+    pal["header_h"] = pal.get("header_h", "64px")
+    # the baked logo follows the same anchor: hide the variant the site's own theme doesn't use
+    pal["logo_off"] = "l-light" if dark else "l-dark"
+    pal["logo_dark_media"] = (
+        "@media (prefers-color-scheme:dark){.wbh__logo .l-light{display:none}"
+        ".wbh__logo .l-dark{display:block}}\n"
+    ) if dark else ""
     return """
 /* === auto-generated site header (header_gen.py) === */
-.wbh{--bg:%(l_bg)s;--tx:%(l_text)s;--mut:%(l_muted)s;--ac:%(l_accent)s;--bd:%(l_border)s;--acx:%(accent_contrast)s;--lg:var(--ac);
-  position:sticky;top:0;z-index:1000;width:100%%;font-family:inherit;
-  -webkit-font-smoothing:antialiased;box-sizing:border-box}
-@media (prefers-color-scheme:dark){.wbh{--bg:%(d_bg)s;--tx:%(d_text)s;--mut:%(d_muted)s;--ac:%(d_accent)s;--bd:%(d_border)s}}
-:root[data-theme="dark"] .wbh{--bg:%(d_bg)s;--tx:%(d_text)s;--mut:%(d_muted)s;--ac:%(d_accent)s;--bd:%(d_border)s}
+.wbh{--bg:%(base_bg)s;--tx:%(base_text)s;--mut:%(base_muted)s;--ac:%(base_accent)s;--bd:%(base_border)s;--acx:%(accent_contrast)s;--lg:var(--ac);
+  /* Span the VIEWPORT, not whatever box the theme drops us in. Old layouts shrink-to-fit an
+     injected child - neerajgangwar.in uses body{display:table}, so the bar landed in an anonymous
+     table cell and width:100%% meant "440px of content". !important can't fix that (it's the
+     formatting context, not specificity), and forcing 100vw instead just made the table itself
+     1473px wide -> horizontal scroll. position:fixed takes us OUT of the parent's flow entirely:
+     left/right:0 resolve against the viewport (excluding the scrollbar, so no overflow) and the
+     page's own layout is left completely untouched. The spacer below reserves the space. */
+  display:block!important;position:fixed!important;top:0!important;left:0!important;right:0!important;
+  z-index:1000!important;width:auto!important;max-width:none!important;min-width:0!important;
+  margin:0!important;padding:0!important;float:none!important;transform:none!important;
+  font-family:inherit;-webkit-font-smoothing:antialiased;box-sizing:border-box}
+%(dark_media)s:root[data-theme="dark"] .wbh{--bg:%(d_bg)s;--tx:%(d_text)s;--mut:%(d_muted)s;--ac:%(d_accent)s;--bd:%(d_border)s}
 :root[data-theme="light"] .wbh{--bg:%(l_bg)s;--tx:%(l_text)s;--mut:%(l_muted)s;--ac:%(l_accent)s;--bd:%(l_border)s}
 .wbh *{box-sizing:border-box}
+/* The bar is position:fixed (see above), so it no longer occupies space - this reserves exactly
+   its height so the page's first block isn't hidden underneath. Height is baked per variant. */
+.wbh-spacer{display:block!important;width:100%%;height:%(header_h)s;flex:none}
 .wbh__inner{max-width:1180px;margin:0 auto;padding:0 clamp(16px,4vw,32px);height:64px;
   display:flex;align-items:center;justify-content:space-between;gap:20px}
 .wbh__logo{display:inline-flex;align-items:center;text-decoration:none;flex:0 0 auto}
@@ -243,10 +333,11 @@ def _base_css(pal):
 .wbh img{opacity:1!important;visibility:visible!important;animation:none!important;
   transform:none!important;filter:none!important;max-width:none!important;max-height:none!important}
 .wbh__logo img{display:block;height:28px;width:auto}
-/* baked-logo theme swap: show the light-accent PNG by default, the dark-accent PNG in dark mode */
-.wbh__logo .l-dark{display:none}
-@media (prefers-color-scheme:dark){.wbh__logo .l-light{display:none}.wbh__logo .l-dark{display:block}}
-:root[data-theme="dark"] .wbh__logo .l-light{display:none}
+/* baked-logo theme swap - anchored to the SITE's theme like the bar itself: a light site always
+   shows the light-accent PNG (its bar stays light even in dark mode), a dark site the dark one.
+   Only a genuinely dark site follows prefers-color-scheme. */
+.wbh__logo .%(logo_off)s{display:none}
+%(logo_dark_media)s:root[data-theme="dark"] .wbh__logo .l-light{display:none}
 :root[data-theme="dark"] .wbh__logo .l-dark{display:block}
 :root[data-theme="light"] .wbh__logo .l-light{display:block}
 :root[data-theme="light"] .wbh__logo .l-dark{display:none}
@@ -256,13 +347,16 @@ def _base_css(pal):
 .wbh__nav a{position:relative;text-decoration:none;color:var(--tx);font-size:15px;font-weight:500;
   letter-spacing:.01em;white-space:nowrap;transition:color .18s ease;padding:6px 0}
 .wbh__nav a:hover{color:var(--ac)}
-.wbh__toggle{display:none}
-.wbh__burger{display:none;flex-direction:column;justify-content:center;gap:5px;width:42px;height:42px;
+/* !important: the restored theme's own CSS bleeds onto our markup (blanket input/label rules are
+   common) and was un-hiding the burger checkbox + label on desktop - they showed up as a stray
+   checkbox and a black bar inside the bar. Ours must win in both directions (see also .wbh img). */
+.wbh__toggle{display:none!important}
+.wbh__burger{display:none!important;flex-direction:column;justify-content:center;gap:5px;width:42px;height:42px;
   padding:9px;cursor:pointer;border-radius:9px;flex:0 0 auto}
 .wbh__burger span{display:block;height:2px;width:100%%;background:var(--tx);border-radius:2px;
   transition:transform .25s ease,opacity .2s ease}
 @media (max-width:820px){
-  .wbh__burger{display:flex}
+  .wbh__burger{display:flex!important}  /* must also be !important - the desktop rule above is */
   .wbh__nav{position:absolute;left:0;right:0;top:64px;flex-direction:column;align-items:stretch;
     gap:0;background:var(--bg);border-bottom:1px solid var(--bd);
     max-height:0;overflow:hidden;transition:max-height .3s ease}
@@ -315,7 +409,14 @@ _VARIANT_CSS = {
 }
 
 
+# v6 stacks the logo above the nav; the rest are a single 64px bar. The fixed bar reserves its
+# space with .wbh-spacer, so this height must match the variant's real height.
+VARIANT_HEIGHT = {6: "92px"}
+
+
 def variant_css(variant, pal):
+    pal = dict(pal)
+    pal["header_h"] = VARIANT_HEIGHT.get(variant, "64px")
     return _base_css(pal) + "\n" + _VARIANT_CSS.get(variant, _VARIANT_CSS[1])
 
 
@@ -346,11 +447,16 @@ def variant_for_domain(domain):
 
 def build_header(soup, html_path, sections, site_domain, variant=None,
                  ensure_anchor=None, section_label=None):
-    """Generate + inject a header into a page that has none. Returns an info dict (or None if
-    there's nothing to build - no sections). Idempotent: replaces any header we injected before."""
-    if not sections:
-        return None
+    """Generate + inject a header into a page that has none. Idempotent: replaces any header we
+    injected before.
+
+    Works with NO sections too. Old table-layout sites (2000s markup: one <table>, <p>s, and not a
+    single h1-h6) give _content_sections nothing to anchor to - but they still need a header. There
+    we ship the logo bar alone: no anchor nav, no burger, because there is genuinely nothing to
+    link to. A header is always better than no header."""
     from bs4 import BeautifulSoup  # (cw re-exports it, but keep this module import-light)
+
+    sections = sections or []
 
     brand = cw._brand_name_from_domain(site_domain) or "Site"
     variant = variant or variant_for_domain(site_domain)
@@ -400,24 +506,29 @@ def build_header(soup, html_path, sections, site_domain, variant=None,
         logo.append(span)
     inner.append(logo)
 
-    toggle = soup.new_tag("input", attrs={"class": "wbh__toggle", "type": "checkbox",
-                                          "id": "wbh-burger", "aria-label": "Toggle menu"})
-    inner.append(toggle)
-    burger = soup.new_tag("label", attrs={"class": "wbh__burger", "for": "wbh-burger",
-                                          "aria-hidden": "true"})
-    for _ in range(3):
-        burger.append(soup.new_tag("span"))
-    inner.append(burger)
+    # Nav + burger only exist if there's somewhere to navigate to. On a heading-less table site
+    # the bar is just the logo - an empty menu and a burger opening nothing would be worse.
+    if nav:
+        toggle = soup.new_tag("input", attrs={"class": "wbh__toggle", "type": "checkbox",
+                                              "id": "wbh-burger", "aria-label": "Toggle menu"})
+        inner.append(toggle)
+        burger = soup.new_tag("label", attrs={"class": "wbh__burger", "for": "wbh-burger",
+                                              "aria-hidden": "true"})
+        for _ in range(3):
+            burger.append(soup.new_tag("span"))
+        inner.append(burger)
 
-    navtag = soup.new_tag("nav", attrs={"class": "wbh__nav"})
-    for label, href in nav:
-        a = soup.new_tag("a", href=href)
-        a.string = label
-        navtag.append(a)
-    inner.append(navtag)
+        navtag = soup.new_tag("nav", attrs={"class": "wbh__nav"})
+        for label, href in nav:
+            a = soup.new_tag("a", href=href)
+            a.string = label
+            navtag.append(a)
+        inner.append(navtag)
 
-    # --- inject: remove any previous auto-header + its style, then add fresh ---
+    # --- inject: remove any previous auto-header (+ its spacer/style), then add fresh ---
     for old in soup.find_all(attrs={"data-wb-header": True}):
+        old.decompose()
+    for old in soup.find_all(attrs={"data-wb-header-spacer": True}):
         old.decompose()
     for old in soup.find_all("style", attrs={"data-wb-header-css": True}):
         old.decompose()
@@ -426,6 +537,10 @@ def build_header(soup, html_path, sections, site_domain, variant=None,
     if body is None:
         return None
     body.insert(0, header)
+    # the fixed bar takes no space of its own - reserve it so the page doesn't start underneath
+    spacer = soup.new_tag("div", attrs={"class": "wbh-spacer"})
+    spacer["data-wb-header-spacer"] = "1"
+    header.insert_after(spacer)
 
     style = soup.new_tag("style")
     style["data-wb-header-css"] = "1"

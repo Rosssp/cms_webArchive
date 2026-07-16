@@ -1487,7 +1487,11 @@ def auto_link_menu(site_dir):
             if netloc.startswith("www."):
                 netloc = netloc[4:]
             if netloc and _bare and netloc != _bare:
-                return False  # a real external (other-domain) link - not ours to touch
+                # A third-party link in the HEADER/FOOTER: a restored page shouldn't send anyone
+                # off-site from its own menu, so treat it as broken - it gets re-pointed at an
+                # in-page section and relabelled like any other lost menu item. (Off-menu external
+                # links are handled by the cleaner, which just strips their href.)
+                return True
             # points at the site root / itself with no real target (/, /#, https://site/,
             # https://site/#) - a placeholder nav item, treat as broken. A real "#anchor"
             # (non-empty fragment) or a "/page" path is left alone.
@@ -1584,7 +1588,10 @@ def auto_link_menu(site_dir):
         # tinted with the site's own colours, auto light/dark. See header_gen / NAV_LINKING.md.
         # But NOT if the site already has a menu our text-based detector just couldn't wire (an
         # image/CSS menu) - stacking a generated header on top of it duplicates the real nav.
-        if (header_nav is None and soup.find("header") is None and sections
+        # NOTE: deliberately NOT gated on `sections`. Old table-layout sites have no <section> and
+        # no headings at all, so there's nothing to anchor to - but they still need a header, and
+        # build_header ships the logo bar alone in that case.
+        if (header_nav is None and soup.find("header") is None
                 and not _has_site_menu(soup)):
             try:
                 import header_gen

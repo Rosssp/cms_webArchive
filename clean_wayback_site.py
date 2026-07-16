@@ -153,6 +153,13 @@ SYSTEM_FONT_NAMES = {
     "times new roman", "times", "georgia", "courier new", "courier",
     "trebuchet ms", "lucida sans unicode", "lucida grande", "impact",
     "comic sans ms", "ms sans serif", "consolas", "monaco",
+    # More OS stacks old themes declare. These are NOT on Google Fonts, so treating one as
+    # "the site's font" makes the download 404/403 and the page render in a fallback anyway.
+    "lucida sans", "lucida console", "lucida", "book antiqua", "palatino",
+    "palatino linotype", "garamond", "bookman old style", "century gothic",
+    "franklin gothic medium", "arial black", "arial narrow", "gill sans",
+    "candara", "calibri", "cambria", "constantia", "corbel", "optima",
+    "geneva", "sans-serif", "serif",
 }
 # Icon fonts (Bootstrap glyphicons, Font Awesome, Material Icons, ...) turn up in a
 # font-family: declaration same as a real webfont would, but aren't a body-text
@@ -605,8 +612,15 @@ class Report:
         self.owner_trace_year_updates = 0
         self.icon_font_selfhosted = False
         self.glyphicons_rewritten = 0
+        self.custom_icons_rewritten = 0  # theme's own icon font (icon-twitter...) -> Font Awesome
         self.localized_media = []
         self.detached_media = []
+        self.external_media_localized = []   # third-party image downloaded into the project
+        self.external_media_removed = []     # third-party image unreachable/tracker -> element gone
+        self.external_embeds_removed = []    # <object>/<embed> to youtube/flash/etc (ads+trackers)
+        self.external_hrefs_stripped = []    # external <a> on the page -> href dropped
+        self.inline_scripts_externalized = None  # inline JS moved to a deferred .js file
+        self.jquery_selfhosted = None            # page used jQuery with none loaded -> added
         self.favicon_present = False
         self.favicon_set = False
         self.favicon_auto_generated = False
@@ -665,6 +679,26 @@ class Report:
         if self.redacted_emails:
             lines.append(f"email addresses redacted from text/attrs: {len(self.redacted_emails)}")
             for s in sorted(set(self.redacted_emails)):
+                lines.append(f"  - {s}")
+        if self.inline_scripts_externalized:
+            lines.append(f"inline JS externalized: {self.inline_scripts_externalized}")
+        if self.jquery_selfhosted:
+            lines.append(f"jQuery self-hosted locally: {self.jquery_selfhosted}")
+        if self.external_media_localized:
+            lines.append(f"third-party images pulled local: {len(self.external_media_localized)}")
+            for s in self.external_media_localized:
+                lines.append(f"  - {s}")
+        if self.external_media_removed:
+            lines.append(f"third-party images removed (tracker/unreachable): {len(self.external_media_removed)}")
+            for s in self.external_media_removed:
+                lines.append(f"  - {s}")
+        if self.external_embeds_removed:
+            lines.append(f"external <object>/<embed> removed (flash/youtube -> ads): {len(self.external_embeds_removed)}")
+            for s in self.external_embeds_removed:
+                lines.append(f"  - {s}")
+        if self.external_hrefs_stripped:
+            lines.append(f"external link hrefs stripped: {len(self.external_hrefs_stripped)}")
+            for s in sorted(set(self.external_hrefs_stripped))[:30]:
                 lines.append(f"  - {s}")
         if self.emails_domain_normalized:
             lines.append(f"email domains normalized to the site domain: {len(self.emails_domain_normalized)}")
@@ -737,6 +771,8 @@ class Report:
             lines.append("icons: self-hosted a working Font Awesome locally (broken icon webfont replaced)")
         if self.glyphicons_rewritten:
             lines.append(f"icons: Bootstrap glyphicons remapped to Font Awesome: {self.glyphicons_rewritten}")
+        if self.custom_icons_rewritten:
+            lines.append(f"icons: theme icon-font classes remapped to Font Awesome: {self.custom_icons_rewritten}")
         if self.localized_media:
             lines.append(f"media: same-domain absolute refs made local: {len(self.localized_media)}")
             for s in self.localized_media:
@@ -891,10 +927,12 @@ def get_site_domain(soup):
     return ""
 
 
-RECOVERY_FETCH_TIMEOUT = 10  # seconds - was 30; a page with many broken images turned
-# "try every candidate" into multi-minute hangs (N images x up to 2 attempts x 30s
-# worst case). Fails fast instead so a handful of genuinely-gone assets don't stall
-# the whole cleanup - a real download rarely needs anywhere near 10s anyway.
+RECOVERY_FETCH_TIMEOUT = 8  # seconds - was 30, then 10. Measured: a healthy web.archive.org
+# asset answers in ~1.5s, but a THROTTLED one still legitimately takes 5-8s, so anything under
+# 8 starts throwing away assets that would have arrived. 8 trims the dead-request wait without
+# losing real recoveries. The actual speed-ups are elsewhere and cost nothing: _FETCH_FAILED
+# (never re-ask for a known-dead URL) and fetching CSS-referenced images at DOWNLOAD time, which
+# is what took an asset-heavy page from 30+ minutes to ~3.
 
 
 def recover_missing_local_images(soup, html_path, report, dry_run=False):
@@ -1114,6 +1152,20 @@ def strip_url_meta_tags(soup, report):
             meta.decompose()
 
 
+_FONT_FACE_RULE_RE = re.compile(r"@font-face\s*\{[^{}]*\}", re.I)
+_TYPEKIT_RULE_RE = re.compile(r"@import[^;]*typekit[^;]*;", re.I)
+
+
+def _strip_font_loading_rules(css):
+    """Remove the site's OWN webfont loading (@font-face rules + typekit @imports) from a CSS blob,
+    KEEPING everything else. A CMS/Blogger skin block mixes dozens of @font-face rules straight into
+    ~90KB of layout CSS, so dropping the whole <style> (the old behaviour) nuked the theme and left
+    the page unstyled. We inject our own font, so only the font rules need to go."""
+    css = _FONT_FACE_RULE_RE.sub("", css)
+    css = _TYPEKIT_RULE_RE.sub("", css)
+    return css
+
+
 def clean_head_styles(soup, report, html_path):
     """Extract the site's OWN surviving inline <head><style> blocks into a standalone
     -custom.css. Must skip any <style> this tool injected itself (data-site-studio-
@@ -1133,9 +1185,10 @@ def clean_head_styles(soup, report, html_path):
         css_text = FONT_IMPORT_RE.sub("", unwayback(style_tag.get_text()))
         for m in FONT_FAMILY_RE.finditer(css_text):
             report.font_families_found.add(m.group(1).strip().strip('"\''))
+        # Strip only the font-loading rules, keep the layout. (Was: drop the whole block on any
+        # @font-face - which destroyed CMS skins where fonts and 90KB of theme CSS share one block.)
         if "@font-face" in css_text or "use.typekit.net" in css_text:
-            style_tag.decompose()
-            continue
+            css_text = _strip_font_loading_rules(css_text)
         if re.search(r"green-outline|red-outline", css_text):
             style_tag.decompose()
             continue
@@ -1461,24 +1514,36 @@ def inject_google_fonts(soup, fonts_param, html_path=None):
     # no html_path was given to know where to save files - some connection is better
     # than the page silently rendering in a fallback font with no explanation.
     primary = _primary_font_family(fonts_param)
-    local_css = None
-    if html_path is not None:
+
+    def _try_selfhost(param):
+        if html_path is None:
+            return None
         try:
             dest_dir = html_path.with_name(html_path.stem + "_files") / "fonts"
-            local_css = download_google_font_locally(fonts_param, dest_dir, html_path.parent)
-        except Exception:
-            local_css = None
+            return download_google_font_locally(param, dest_dir, html_path.parent)
+        except Exception:  # noqa: BLE001 - offline/blocked/not-a-Google-font
+            return None
+
+    local_css = _try_selfhost(fonts_param)
+    if not local_css:
+        # The requested family isn't downloadable (not on Google Fonts, or the fetch failed).
+        # NEVER fall back to a live <link> to fonts.googleapis.com: that leaks an external
+        # request on every page load and, for a non-Google family, just 403s and renders
+        # nothing. Retry with a known-good preset instead, so the page still gets a real,
+        # self-hosted webfont.
+        for preset in PRESET_FONTS:
+            cand = normalize_font_family(f"{preset}:wght@{FONT_WEIGHTS}")
+            local_css = _try_selfhost(cand)
+            if local_css:
+                fonts_param = cand
+                primary = _primary_font_family(cand)
+                break
 
     parts = []
     if local_css:
         parts.append(local_css.strip())
-    else:
-        families = "&".join(f"family={fam.strip()}" for fam in fonts_param.split(",") if fam.strip())
-        font_link = soup.new_tag(
-            "link", rel="stylesheet", href=f"https://fonts.googleapis.com/css2?{families}&display=swap"
-        )
-        font_link["data-site-studio-font"] = "link"
-        head.append(font_link)
+    # else: no external link at all - the font-family rule below still applies with its
+    # generic sans-serif fallback, and the page stays free of third-party requests.
     # Loading the font isn't enough - the site's own CSS still references whatever
     # font-family the original theme used, so nothing would actually render in the
     # new font without a global override. Exclude icon-font elements (see _ICON_EXCLUDE_SEL)
@@ -1626,6 +1691,82 @@ def _detect_icon_font(soup):
     return ver, glyph_tags
 
 
+# Custom icon-font classes (end2end-icons, themify, ionicons, a theme's own set...): <i class=
+# "icon icon-twitter">. The webfont behind them is virtually never archived, so they render as
+# empty squares. The NAME, though, is right there - remap it onto the Font Awesome we self-host.
+_CUSTOM_ICON_RE = re.compile(r"^(?:icon|ico|icn|fi|if|e2e|social)-([a-z0-9][a-z0-9-]*)$", re.I)
+_CUSTOM_ICON_BASE_RE = re.compile(r"^(?:icon|ico|icn|fi|if|e2e|social|icons?)$", re.I)
+# names FA puts in the BRANDS font (fab); everything else is solid (fas)
+_FA_BRAND_NAMES = {
+    "twitter", "x-twitter", "facebook", "facebook-f", "instagram", "linkedin", "linkedin-in",
+    "github", "gitlab", "youtube", "vimeo", "pinterest", "reddit", "tumblr", "whatsapp",
+    "telegram", "skype", "snapchat", "tiktok", "discord", "slack", "dribbble", "behance",
+    "flickr", "soundcloud", "spotify", "medium", "wordpress", "google", "google-plus",
+    "google-plus-g", "apple", "android", "windows", "amazon", "paypal", "stack-overflow",
+    "quora", "vk", "weibo", "wechat", "line", "viber", "rss",
+}
+# custom-set name -> FA name, where they differ
+_CUSTOM_ICON_TO_FA = {
+    "mail": "envelope", "email": "envelope", "letter": "envelope",
+    "tel": "phone", "telephone": "phone", "call": "phone", "mobile": "mobile-screen",
+    "pin": "location-dot", "map": "location-dot", "marker": "location-dot",
+    "location": "location-dot", "place": "location-dot", "address": "location-dot",
+    "time": "clock", "date": "calendar", "cart": "cart-shopping", "basket": "cart-shopping",
+    "magnifier": "magnifying-glass", "zoom": "magnifying-glass", "search": "magnifying-glass",
+    "user": "user", "profile": "user", "people": "users", "team": "users",
+    "gplus": "google-plus-g", "googleplus": "google-plus-g", "fb": "facebook-f",
+    "tw": "twitter", "in": "linkedin-in", "yt": "youtube", "ig": "instagram",
+    "feed": "rss", "arrow-right": "arrow-right", "arrow-left": "arrow-left",
+    "close": "xmark", "cross": "xmark", "menu": "bars", "burger": "bars",
+    "heart": "heart", "star": "star", "check": "check", "download": "download",
+    "link": "link", "share": "share-nodes", "comment": "comment", "quote": "quote-left",
+    "home": "house", "info": "circle-info", "help": "circle-question",
+}
+
+
+def _detect_custom_icons(soup):
+    """Elements using a NON-Font-Awesome icon-font class (icon-twitter, e2e-mail, ...). Skips
+    anything already on Font Awesome or glyphicons - those have their own paths."""
+    out = []
+    for tag in soup.find_all(["i", "span", "a", "em"]):
+        toks = _class_tokens(tag)
+        if not toks or "glyphicon" in toks:
+            continue
+        if any(_FA_ICON_TOKEN_RE.match(t) or _FA5_PREFIX_RE.match(t) or _FA4_BASE_RE.match(t)
+               for t in toks):
+            continue  # already Font Awesome
+        if any(_CUSTOM_ICON_RE.match(t) for t in toks):
+            out.append(tag)
+    return out
+
+
+def rewrite_custom_icons_to_fa(soup, tags, report, prefix="fas"):
+    """Rewrite a custom icon set onto Font Awesome in place: <i class="icon icon-twitter"> ->
+    <i class="fab fa-twitter">. The base token (icon/ico/e2e...) becomes the FA style prefix -
+    `fab` when the name is one of FA's brands, else `prefix` (fas) - and icon-<name> becomes
+    fa-<mapped name>. The site keeps its own markup and layout; only the classes change, so the
+    icons stop being empty squares once our self-hosted Font Awesome is linked."""
+    n = 0
+    for tag in tags:
+        name = None
+        for t in _class_tokens(tag):
+            m = _CUSTOM_ICON_RE.match(t)
+            if m:
+                name = m.group(1).lower()
+                break
+        if not name:
+            continue
+        fa_name = _CUSTOM_ICON_TO_FA.get(name, name)
+        style = "fab" if fa_name in _FA_BRAND_NAMES else prefix
+        new = [t for t in _class_tokens(tag)
+               if not _CUSTOM_ICON_RE.match(t) and not _CUSTOM_ICON_BASE_RE.match(t)]
+        new += [style, "fa-" + fa_name]
+        tag["class"] = new
+        n += 1
+    report.custom_icons_rewritten += n
+    return n
+
+
 def rewrite_glyphicons_to_fa(soup, glyph_tags, report, prefix="fa"):
     """Rewrite Bootstrap glyphicon classes to Font Awesome in place (base 'glyphicon' ->
     `prefix`, 'glyphicon-x' -> 'fa-<mapped>'), so a self-hosted Font Awesome covers them too
@@ -1727,12 +1868,23 @@ def ensure_icon_fonts(soup, html_path, report, dry_run=False):
     render: detect the Font Awesome MAJOR from the markup, remap glyphicons onto it, and
     self-host that matching Font Awesome locally. No-op (no network) on pages with no icons."""
     ver, glyph_tags = _detect_icon_font(soup)
-    if not ver and not glyph_tags:
+    # A theme's OWN icon font (icon-twitter, e2e-*, ...) is never archived, so those icons render
+    # as empty squares. The names are usable though - remap them onto the Font Awesome we
+    # self-host anyway. Needs FA5/6 (brand icons like fab fa-twitter don't exist in FA4).
+    custom_tags = _detect_custom_icons(soup)
+    if not ver and not glyph_tags and not custom_tags:
         return
+    if custom_tags and not ver:
+        ver = "fa6"
     if glyph_tags and not ver:
         ver = "fa4"  # glyphicons are Bootstrap-3 era - pair them with FA4
     if glyph_tags:
         rewrite_glyphicons_to_fa(soup, glyph_tags, report, prefix=FA_VARIANTS[ver]["glyph_prefix"])
+    if custom_tags:
+        if ver == "fa4":
+            ver = "fa6"  # brands need FA5+; upgrade rather than ship dead classes
+        rewrite_custom_icons_to_fa(soup, custom_tags, report,
+                                   prefix=FA_VARIANTS[ver]["glyph_prefix"])
     self_host_font_awesome(html_path, soup, report, ver, dry_run=dry_run)
 
     # Shield icons from EVERY global "* { font-family: ... !important }" reset - ours is
@@ -1756,6 +1908,88 @@ def ensure_icon_fonts(soup, html_path, report, dry_run=False):
             new = _shield_icons_from_font_resets(txt)
             if new != txt:
                 css_path.write_text(new, encoding="utf-8")
+
+
+# A restored theme's scripts almost always assume jQuery, but the library itself is frequently
+# NOT in the export (CDN-loaded originally, or dropped as an unclassified/minified bundle). The
+# page then throws "jQuery is not defined" and every one of its behaviours is dead. Self-host it.
+JQUERY_VERSION = "3.7.1"
+JQUERY_CDN = f"https://code.jquery.com/jquery-{JQUERY_VERSION}.min.js"
+# calls that prove a script NEEDS jQuery
+_JQ_USE_RE = re.compile(r"jQuery\s*\(|\$\s*\(\s*(?:document|function|window|['\"])|\$\.\w+\s*\(")
+# a file that IS jQuery (or bundles it) - then nothing needs adding
+_JQ_DEFINES_RE = re.compile(r"window\.jQuery\s*=|jQuery\s*=\s*function|\.fn\.jquery\s*=|"
+                            r"jQuery\.fn\.jquery\s*=", re.I)
+_JQ_FILENAME_RE = re.compile(r"jquery[.-][\w.]*\.js$|^jquery\.js$", re.I)
+
+
+def _ensure_jquery_cache():
+    """Download jQuery once into a shared user cache and return the file, or None. Shared across
+    every site, like the Font Awesome cache: only the first cleanup hits the network."""
+    cache = Path.home() / ".cache" / "cms-webarchive-jq" / JQUERY_VERSION
+    dest = cache / "jquery.min.js"
+    if dest.is_file() and dest.stat().st_size > 20000:
+        return dest
+    try:
+        data = _fetch_url_bytes(JQUERY_CDN, timeout=15)
+    except Exception:  # noqa: BLE001 - offline/blocked: leave the page as-is
+        return None
+    if not data or len(data) < 20000 or b"jQuery" not in data[:4000]:
+        return None
+    cache.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    return dest
+
+
+def ensure_jquery(soup, html_path, report, dry_run=False):
+    """If anything still on the page uses jQuery but no jQuery is loaded, self-host it locally and
+    link it FIRST. Runs after the script passes, so it judges the scripts that actually survived."""
+    scripts = list(soup.find_all("script"))
+    if not scripts:
+        return
+    site_root = html_path.parent
+    uses = loaded = False
+    for tag in scripts:
+        src = (tag.get("src") or "").split("?")[0]
+        if src:
+            if _JQ_FILENAME_RE.search(src.rsplit("/", 1)[-1]):
+                loaded = True
+                continue
+            if src.startswith(("http://", "https://", "//")):
+                continue  # external ref (kept library) - can't inspect, assume it isn't jQuery
+            p = (site_root / src)
+            if not p.is_file():
+                continue
+            text = read_text_safe(p)[:400000]
+        else:
+            text = tag.string or tag.get_text() or ""
+        if _JQ_DEFINES_RE.search(text):
+            loaded = True
+        elif _JQ_USE_RE.search(text):
+            uses = True
+    if not uses or loaded:
+        return
+
+    cached = _ensure_jquery_cache()
+    if cached is None:
+        return
+    assets_dir = html_path.with_name(html_path.stem + "_files")
+    dest = assets_dir / "jquery.min.js"
+    rel = f"{assets_dir.name}/{dest.name}"
+    if not dry_run:
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        if not dest.is_file():
+            shutil.copyfile(cached, dest)
+    tag = soup.new_tag("script", src=rel)
+    # Must run BEFORE the scripts that use it. The inline bundle we emit is deferred, and defer
+    # keeps document order, so putting jQuery ahead of every other script is enough - it is
+    # already executed by the time anything else runs.
+    first = soup.find("script")
+    if first is not None:
+        first.insert_before(tag)
+    else:
+        (soup.find("head") or soup.find("body")).append(tag)
+    report.jquery_selfhosted = f"{JQUERY_VERSION} -> {rel} (page used jQuery with none loaded)"
 
 
 def clean_data_and_event_attrs(soup):
@@ -1853,12 +2087,18 @@ def clean_links_a(soup, site_domain, report, keep_contact_info=True):
             a["href"] = to_relative(href, site_domain)
             report.kept_a_internal += 1
             continue
-        if matches_suffix(d, SOCIAL_DOMAINS):
+        # A restored page must not send anyone to third-party resources. Strip the href and keep
+        # the text: the element stays (layout intact), it just stops being a live outbound link.
+        # EXCEPTION: links inside the header/nav/footer keep their href for now - auto_link_menu
+        # runs next and turns those into in-page section anchors (with a proper label) instead;
+        # it can only find them while they still have an href.
+        if a.find_parent(["header", "nav", "footer"]) is not None:
             a["href"] = href
-            report.kept_a_social.append(href)
+            (report.kept_a_social if matches_suffix(d, SOCIAL_DOMAINS)
+             else report.kept_a_external).append(href)
             continue
-        a["href"] = href
-        report.kept_a_external.append(href)
+        del a["href"]
+        report.external_hrefs_stripped.append(href)
 
 
 def _old_domain_mention_re(old_domain):
@@ -2114,6 +2354,11 @@ RECOVERY_FETCH_RETRIES = 1  # one gentle retry covers the common transient web.a
 # share this lock, or parallel cleanups needlessly serialize their font/icon downloads too.
 _ARCHIVE_FETCH_LOCK = threading.Semaphore(1)
 
+# Remembers URLs that already failed this process, so a serialized archive fetch is never spent
+# twice on the same dead asset (see _fetch_url_bytes). Keyed by URL -> the original exception.
+_FETCH_FAILED = {}
+_FETCH_FAIL_LOCK = threading.Lock()
+
 
 class CleanupCancelled(BaseException):
     """Raised when the running cleanup's cancel checkpoint fires, so it can be aborted from the
@@ -2150,6 +2395,16 @@ def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH
     import time
     import urllib.request
 
+    # Archive fetches are SERIALIZED (see _ARCHIVE_FETCH_LOCK), so every wasted request costs the
+    # whole run ~1.5s on a good day and the full timeout when throttled. The same dead URL gets
+    # asked for again and again (the same missing sprite referenced from several stylesheets, the
+    # same font from every page), so remember what already failed and fail those instantly. This
+    # is the single biggest cleanup speed-up on asset-heavy sites - no behaviour is lost, we just
+    # stop re-asking for things we already know aren't there.
+    with _FETCH_FAIL_LOCK:
+        if url in _FETCH_FAILED:
+            raise _FETCH_FAILED[url]
+
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (image-recovery-bot)"})
     use_lock = "archive.org" in url  # only the throttle-sensitive archive host is serialized
     last_err = None
@@ -2169,6 +2424,8 @@ def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH
             last_err = e
             if attempt < retries:
                 time.sleep(0.5)
+    with _FETCH_FAIL_LOCK:
+        _FETCH_FAILED[url] = last_err
     raise last_err
 
 
@@ -2310,12 +2567,14 @@ def _recover_css_asset(raw_url, css_path, report, site_domain):
     host = domain_of(original_url)
     if host and matches_suffix(host, _FONT_CDN_HOSTS):
         return to_relative(raw_url, site_domain) if timestamp is None else name
-    # A saved Google-Fonts stylesheet (fonts.googleapis.com/css?... / /css2?... gets saved as a
-    # file named literally "css" or "css2") references only Google's own font files - often with
-    # their gstatic host already rewritten to the site's own domain, so the CDN check above misses
-    # them. The cleaner re-injects Google Fonts fresh and drops this stylesheet as unused anyway,
-    # so recovering its fonts from the archive is pure wasted time (dozens of failing lookups).
-    if css_path.name.lower() in ("css", "css2") and Path(name).suffix.lower() in CSS_FONT_EXTS:
+    # WEBFONTS are never worth an archive round-trip. Whatever font the page's CSS references
+    # (a Google-Fonts mirror whose gstatic host got rewritten to the site's own domain, so the
+    # CDN check above misses it - this was 58 of 62 fetches and ~750s on a Blogger site; or the
+    # theme's own self-hosted face), the cleaner re-injects its own Google Font with a global
+    # !important override, so the original never renders anyway. Any .woff2/.woff/.ttf/.otf/.eot
+    # that isn't already sitting on disk locally is pure wasted time (a slow CDX lookup that then
+    # usually 404s AND whose burst triggers the rate-limiting that slows the assets that DO matter).
+    if Path(name).suffix.lower() in CSS_FONT_EXTS:
         return to_relative(raw_url, site_domain) if timestamp is None else name
     if Path(name).suffix.lower() not in CSS_RECOVERABLE_EXTS:
         if timestamp is None:
@@ -2591,6 +2850,161 @@ def localize_media_refs(soup, html_path, site_domain, report, dry_run=False, can
             tag["src"] = ref
 
 
+# jQuery methods that always exist - a call to one of these proves nothing about plugins.
+# (lower-cased at build time: every lookup below compares name.lower())
+_JQ_CORE = {_n.lower() for _n in {
+    "ready", "on", "off", "one", "trigger", "bind", "unbind", "delegate", "live", "click",
+    "hover", "focus", "blur", "change", "submit", "keyup", "keydown", "keypress", "mouseover",
+    "mouseout", "mouseenter", "mouseleave", "mousedown", "mouseup", "scroll", "resize", "load",
+    "each", "map", "filter", "not", "is", "find", "closest", "parent", "parents", "parentsUntil",
+    "children", "siblings", "next", "nextAll", "prev", "prevAll", "first", "last", "eq", "slice",
+    "add", "end", "addClass", "removeClass", "toggleClass", "hasClass", "attr", "removeAttr",
+    "prop", "removeProp", "val", "text", "html", "append", "appendTo", "prepend", "prependTo",
+    "after", "before", "insertAfter", "insertBefore", "wrap", "wrapAll", "wrapInner", "unwrap",
+    "remove", "detach", "empty", "clone", "replaceWith", "css", "width", "height", "innerWidth",
+    "innerHeight", "outerWidth", "outerHeight", "offset", "position", "scrollTop", "scrollLeft",
+    "show", "hide", "toggle", "fadeIn", "fadeOut", "fadeTo", "fadeToggle", "slideUp", "slideDown",
+    "slideToggle", "animate", "stop", "delay", "queue", "dequeue", "data", "removeData", "index",
+    "get", "size", "toArray", "serialize", "serializeArray", "ajaxComplete", "promise", "done",
+    "fail", "always", "then", "push", "call", "apply", "test", "match", "replace", "split",
+    "indexOf", "length", "extend", "trim", "inArray", "isArray", "isFunction", "parseJSON",
+}}
+_JQ_PLUGIN_DEF_RE = re.compile(r"(?:\$|jQuery)\s*\.\s*fn\s*\.\s*(\w+)\s*=|\.fn\.extend\(\s*\{\s*(\w+)", re.I)
+# a plugin CALL on a jQuery result: ").pluginName(" / "$(sel).pluginName(" / "$this.pluginName("
+_JQ_PLUGIN_CALL_RE = re.compile(r"(?:\)|\$\w*|\w+\$)\s*\.\s*([a-zA-Z_]\w{2,})\s*\(")
+
+
+def drop_scripts_with_missing_plugins(soup, html_path, report):
+    """Drop a kept LOCAL script that calls a jQuery plugin nothing else defines. The archive often
+    saves a theme's plugin CALLER (jquery.dropdown.js) but not the plugin itself (hoverIntent), so
+    the page throws "$(...).hoverIntent is not a function" on every load and the script does
+    nothing anyway. Only same-page scripts are considered, and only names that aren't jQuery core."""
+    site_root = html_path.parent
+    scripts = []  # (tag, label, text) for every script that could run on this page
+    for tag in soup.find_all("script"):
+        src = (tag.get("src") or "").split("?")[0]
+        if src:
+            if is_external(src):
+                continue
+            p = (site_root / src).resolve()
+            if p.is_file():
+                scripts.append((tag, p.name, read_text_safe(p)))
+        else:
+            body = tag.string or tag.get_text() or ""
+            if body.strip():
+                scripts.append((tag, "(inline script)", body))
+    if not scripts:
+        return
+    defined = set()
+    for _t, _n, text in scripts:
+        for m in _JQ_PLUGIN_DEF_RE.finditer(text):
+            defined.add((m.group(1) or m.group(2) or "").lower())
+    for tag, name, text in scripts:
+        if _JQ_PLUGIN_DEF_RE.search(text):
+            continue  # this file IS a plugin/library - keep it
+        missing = {
+            m.group(1) for m in _JQ_PLUGIN_CALL_RE.finditer(text)
+            if m.group(1).lower() not in _JQ_CORE and m.group(1).lower() not in defined
+        }
+        if missing:
+            report.removed_scripts.append(f"{name} (calls missing jQuery plugin: {', '.join(sorted(missing))})")
+            tag.decompose()
+
+
+def externalize_inline_scripts(soup, html_path, report, dry_run=False):
+    """Move every surviving inline <script> out of the markup into ONE real .js file, loaded with
+    `defer` at the end of <body>. Inline JS sitting in <head> is render-blocking and unfiles the
+    page's behaviour; a deferred external file parses in parallel and runs after the DOM is up
+    (which is what these jQuery(document).ready blocks wanted anyway). Trackers/analytics are
+    already gone by this point (clean_scripts), and scripts that could only throw were dropped by
+    drop_scripts_with_missing_plugins - so whatever is left here is real, wanted behaviour."""
+    body = soup.find("body")
+    if body is None:
+        return
+    inline = [t for t in soup.find_all("script")
+              if not t.get("src") and (t.string or t.get_text() or "").strip()
+              and "json" not in (t.get("type") or "").lower()]
+    if not inline:
+        return
+    chunks = []
+    for t in inline:
+        code = (t.string or t.get_text() or "").strip()
+        chunks.append(code if code.endswith((";", "}")) else code + ";")
+        t.decompose()
+    js_path = html_path.with_name(html_path.stem + "-inline.js")
+    if not dry_run:
+        js_path.write_text("\n\n".join(chunks) + "\n", encoding="utf-8")
+    tag = soup.new_tag("script", src=js_path.name)
+    tag["defer"] = ""
+    body.append(tag)
+    report.inline_scripts_externalized = f"{len(inline)} inline script(s) -> {js_path.name} (defer, end of body)"
+
+
+# A 1x1 (or name-obvious) image is a tracking beacon, not content - never worth localizing.
+_TRACKING_PIXEL_NAME_RE = re.compile(r"(?:^|/)(?:pixel|1x1|spacer|blank|clear|beacon|track(?:ing)?|px)\.(?:gif|png|jpg)",
+                                     re.I)
+
+
+def _is_tracking_pixel(tag, url):
+    if _TRACKING_PIXEL_NAME_RE.search(url or ""):
+        return True
+
+    def _one(v):
+        return str(v).strip().lower() in ("1", "1px", "0")
+
+    return _one(tag.get("width") or "") and _one(tag.get("height") or "")
+
+
+def localize_external_media(soup, html_path, site_domain, report, dry_run=False, cancelled=None):
+    """Third-party images (paypal donate button, google thumbnails, ...) must not stay as live
+    external requests: download each into <stem>_files/ and point at the local copy. If it can't
+    be fetched, REMOVE the element outright rather than ship a broken/hot-linked image. Tracking
+    beacons (1x1 / pixel.gif) are dropped without even trying. Covers <img>, <source> and
+    PayPal-style <input type="image">. Same-domain refs are handled by localize_media_refs."""
+    site_root = html_path.parent
+    assets_dir = html_path.with_name(html_path.stem + "_files")
+    bare = _bare_domain(site_domain or "")
+    own = {bare} if bare else set()
+    tags = [t for t in soup.find_all(["img", "source"])]
+    tags += [t for t in soup.find_all("input") if (t.get("type") or "").lower() == "image"]
+    for tag in tags:
+        _raise_if_cancelled(cancelled)
+        url = unwayback((tag.get("src") or "").strip())
+        if not url or not is_external(url):
+            continue  # relative/local ref - nothing to fetch
+        if own and matches_suffix(domain_of(url), own):
+            continue  # same-domain absolute - that's localize_media_refs' job
+        if _is_tracking_pixel(tag, url):
+            report.external_media_removed.append(f"{url} (tracking beacon)")
+            tag.decompose()
+            continue
+        if dry_run:
+            continue
+        data = _fetch_url_bytes(url)
+        if not data:
+            report.external_media_removed.append(f"{url} (unreachable)")
+            tag.decompose()
+            continue
+        name = re.sub(r"[^\w.\-]+", "_", urlsplit(url).path.rsplit("/", 1)[-1] or "img")[:80]
+        if "." not in name:
+            name += ".img"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        dest = assets_dir / name
+        i = 1
+        while dest.exists() and dest.stat().st_size != len(data):
+            dest = assets_dir / f"{Path(name).stem}_{i}{Path(name).suffix}"
+            i += 1
+        dest.write_bytes(data)
+        rel = os.path.relpath(dest, site_root).replace(os.sep, "/")
+        tag["src"] = rel
+        report.external_media_localized.append(f"{url} -> {rel}")
+
+
+# Legacy Flash/YouTube <object>/<embed> blocks are dead weight AND live third-party requests -
+# a youtube <object> still pulls the player, which pulls googleads/doubleclick. Drop them.
+_EMBED_URL_ATTRS = ("data", "src", "value")
+
+
 def clean_iframes(soup, report):
     """PBN checklist item 24/25: no iframes/embeds to external resources, at all."""
     for iframe in soup.find_all("iframe"):
@@ -2598,6 +3012,16 @@ def clean_iframes(soup, report):
         if src and is_external(src) and domain_of(src) not in IFRAME_LIBRARY_DOMAINS:
             report.removed_iframes.append(src)
             iframe.decompose()
+    # <object>/<embed> (old YouTube/Flash embeds) - same rule. These are what quietly load
+    # googleads/doubleclick on a "clean" page, and Flash doesn't even run any more.
+    for tag in soup.find_all(["object", "embed"]):
+        urls = [unwayback(str(tag.get(a) or "")) for a in _EMBED_URL_ATTRS]
+        urls += [unwayback(str(p.get("value") or "")) for p in tag.find_all("param")]
+        hit = next((u for u in urls if u and is_external(u)
+                    and domain_of(u) not in IFRAME_LIBRARY_DOMAINS), None)
+        if hit:
+            report.external_embeds_removed.append(f"<{tag.name}> {hit}")
+            tag.decompose()
 
 
 def scan_content_flags(soup, report):
@@ -3661,6 +4085,9 @@ def clean_html_file(
     ensure_icon_fonts(soup, html_path, report, dry_run=dry_run)
     clean_links_a(soup, site_domain, report, keep_contact_info=keep_contact_info)
     localize_media_refs(soup, html_path, site_domain, report, dry_run=dry_run, cancelled=cancelled)
+    # Third-party images (paypal button, google thumbs): pull them local, or drop the element -
+    # a restored page must not hot-link or beacon out to anyone.
+    localize_external_media(soup, html_path, site_domain, report, dry_run=dry_run, cancelled=cancelled)
     if not keep_contact_info:
         strip_contact_info(soup, report, old_domain=old_domain)
     else:
@@ -3668,6 +4095,13 @@ def clean_html_file(
         # restored page never keeps the old owner's address (info@old.com -> info@site.in).
         normalize_email_domains(soup, site_domain, report)
     clean_iframes(soup, report)
+    # A kept script whose jQuery plugin never got archived can only throw on every page load.
+    drop_scripts_with_missing_plugins(soup, html_path, report)
+    # Whatever inline JS survives is real behaviour - get it out of <head> into a deferred file.
+    externalize_inline_scripts(soup, html_path, report, dry_run=dry_run)
+    # ...and if those survivors need jQuery while the export never shipped it, self-host it now
+    # (last, so it sees the scripts that actually remain).
+    ensure_jquery(soup, html_path, report, dry_run=dry_run)
     scan_content_flags(soup, report)
     detect_and_report_logo(soup, report)
     # Domain override given -> rebrand from it: generate a text wordmark logo named after the

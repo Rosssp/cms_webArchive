@@ -18,13 +18,22 @@ strips the toolbar and recovers anything still missing.
 
 import re
 import sys
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import urlsplit, unquote
+from urllib.parse import urljoin, urlsplit, unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import clean_wayback_site as cw  # noqa: E402
 import image_providers  # noqa: E402
+
+_CSS_URL_RE = re.compile(r"url\(\s*['\"]?([^'\")]+?)['\"]?\s*\)", re.I)
+# web.archive.org throttles hard when stampeded (a 1.5s fetch turns into a 10s timeout), so keep
+# concurrency low and polite - 4 is ~4x faster than serial while staying under the throttle.
+_CSS_FETCH_WORKERS = 4
+_CSS_FETCH_TIMEOUT = 8
 
 _WB_RE = re.compile(r"/web/(\d+)[a-z_]*/(https?://.+)$", re.I)
 _ASSET_TYPES = {"stylesheet", "image", "font", "script", "media"}
@@ -112,6 +121,87 @@ def _scroll_to_bottom(page):
     page.wait_for_timeout(400)
 
 
+def _fetch_one(url, retries=1):
+    """One archive asset. Retries once - a throttled archive drops the first connection ("SSL:
+    UNEXPECTED_EOF" / timeout) but usually answers the retry."""
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            })
+            with urllib.request.urlopen(req, timeout=_CSS_FETCH_TIMEOUT) as r:
+                if r.status == 200:
+                    return r.read()
+            return None
+        except Exception:  # noqa: BLE001 - a missing asset is normal; just skip it
+            if attempt >= retries:
+                return None
+            time.sleep(0.4)
+    return None
+
+
+def _fetch_css_assets(files_dir, css_items, url_to_local, used, log=None):
+    """Pull in the images a stylesheet references but the BROWSER never requested - :hover
+    backgrounds, sprites on blocks that didn't render, etc. They're invisible to the response
+    capture, so without this they're simply missing (menu backgrounds vanish).
+
+    Crucially this must happen HERE, at download time: each url(...) is resolved against the
+    stylesheet's OWN archive URL, which we still know. Once everything is flattened into
+    index_files/ that context is gone, and the cleaner's later recovery can't reconstruct the
+    original URL at all - it just burns minutes on 404s. Fetched in parallel; each stylesheet is
+    rewritten to reference the local file by bare name (CSS and images share index_files/)."""
+    todo, per_css = {}, {}
+    for css_url, css_path in css_items:
+        try:
+            text = css_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        refs = []
+        for m in _CSS_URL_RE.finditer(text):
+            ref = (m.group(1) or "").strip()
+            if not ref or ref.startswith(("data:", "#", "http://", "https://", "//")):
+                continue
+            abs_url = urljoin(css_url, ref)
+            refs.append((ref, abs_url))
+            if abs_url not in url_to_local:
+                todo[abs_url] = None
+        if refs:
+            per_css[css_path] = (text, refs)
+    if todo:
+        urls = list(todo)
+        with ThreadPoolExecutor(max_workers=_CSS_FETCH_WORKERS) as ex:
+            for url, data in zip(urls, ex.map(_fetch_one, urls)):
+                todo[url] = data
+        for url, data in todo.items():
+            if not data:
+                continue
+            name = _sanitize_name(url)
+            stem, dot, ext = name.rpartition(".")
+            cand, i = name, 1
+            while cand in used:
+                cand = (f"{stem}_{i}.{ext}" if dot else f"{name}_{i}")
+                i += 1
+            used.add(cand)
+            (files_dir / cand).write_bytes(data)
+            url_to_local[url] = f"index_files/{cand}"
+        if log:
+            log(f"CSS assets: {sum(1 for v in todo.values() if v)}/{len(todo)} recovered")
+    # rewrite every stylesheet to point at the local copies (bare name - same folder)
+    for css_path, (text, refs) in per_css.items():
+        new = text
+        for ref, abs_url in refs:
+            local = url_to_local.get(abs_url)
+            if local:
+                new = new.replace(ref, local.split("/")[-1])
+        if new != text:
+            try:
+                css_path.write_text(new, encoding="utf-8")
+            except OSError:
+                pass
+
+
 def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
     """Download `archive_url` (a web.archive.org page URL) into <dest_root>/<domain>/. Calls
     progress(percent, message) as it goes. Returns {'site_dir', 'domain'}. The folder name IS
@@ -166,7 +256,7 @@ def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
             browser.close()
 
     _p(80, "Сохраняю ассеты локально")
-    url_to_local, used = {}, set()
+    url_to_local, used, css_items = {}, set(), []
     for url, data in assets.items():
         if not data:
             continue
@@ -183,6 +273,13 @@ def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
         unwrapped = cw.unwayback(url)
         if unwrapped != url:
             url_to_local[unwrapped] = rel
+        if cand.lower().endswith(".css"):
+            css_items.append((url, files_dir / cand))
+
+    # Backgrounds/sprites the browser never asked for (hover states, hidden blocks) - fetch them
+    # now, while we still know each stylesheet's original URL to resolve them against.
+    _p(86, "Дотягиваю фоновые картинки из CSS")
+    _fetch_css_assets(files_dir, css_items, url_to_local, used, log=lambda m: _p(86, m))
 
     _p(90, "Переписываю ссылки на локальные")
     for url in sorted(url_to_local, key=len, reverse=True):
@@ -196,7 +293,13 @@ def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
     # unstyled. index_files/ is OUR local folder and never appears in the real archive, so any
     # wayback prefix sitting in front of it is always junk: strip it. (Fixes old table/WP themes
     # whose many stylesheets otherwise all fail -> blank page.)
-    html = re.sub(r"(?:https?:)?//web\.archive\.org/web/\d+[a-z_]*/(?=index_files/)", "", html)
+    # The prefix comes in three flavours - absolute, protocol-relative and ROOT-relative:
+    #   https://web.archive.org/web/<ts>cs_/index_files/reset.css
+    #   //web.archive.org/web/<ts>/index_files/all.js
+    #   /web/<ts>im_/index_files/headerSP.jpg      <- no host at all (the archive's own rewrite)
+    # All three are junk in front of our local folder, and the last one silently broke the
+    # header banner (the file WAS downloaded, the ref just pointed nowhere).
+    html = re.sub(r"(?:(?:https?:)?//web\.archive\.org)?/web/\d+[a-z_]*/(?=index_files/)", "", html)
 
     (site_dir / "index.html").write_text(html, encoding="utf-8")
     _p(100, "Готово")
