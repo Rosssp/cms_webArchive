@@ -4728,16 +4728,32 @@ def ensure_landmarks(soup, report):
         c.name = "section"
         renamed += 1
     wrapped = 0
-    if soup.find("main") is None and hdr is not None:
-        main = soup.new_tag("main")
-        hdr.insert_after(main)
-        nxt = main.next_sibling
-        while nxt is not None:
-            cur, nxt = nxt, nxt.next_sibling
-            if getattr(cur, "name", None) == "footer":
+    if soup.find("main") is None:
+        # <main> must NOT depend on a <header> existing. It used to, and that quietly voided the
+        # structural guarantee on every site whose header is generated later by header_gen inside
+        # auto_link_menu: at this point there is no <header> yet, so no <main> was ever created and
+        # the page shipped with no content landmark at all (bikenfoot, sylhet: 0/0/0; gigaworks: no
+        # <main>). Wrap whatever sits between the header and the footer - or simply everything, when
+        # the page has neither.
+        kids = [c for c in root.find_all(recursive=False) if getattr(c, "name", None)]
+        start = kids.index(hdr) + 1 if hdr is not None and hdr in kids else 0
+        content = []
+        for c in kids[start:]:
+            if c is ftr:
                 break
-            if getattr(cur, "name", None):
-                main.append(cur.extract())
+            if c.name in ("script", "style", "link", "meta", "noscript"):
+                continue
+            # A wrapper that still CONTAINS the header/footer must never be pulled into <main>
+            # (happens when they are nested rather than direct children of the content root).
+            if (hdr is not None and c.find(hdr.name) is not None and hdr in c.descendants) or \
+               (ftr is not None and ftr in c.descendants):
+                break
+            content.append(c)
+        if content:
+            main = soup.new_tag("main")
+            content[0].insert_before(main)
+            for c in content:
+                main.append(c.extract())
                 wrapped += 1
     if renamed or wrapped:
         report.semantic_tags_applied.append(f"детерминированно: div→section {renamed}, main-обёртка {wrapped} блоков")
