@@ -1,0 +1,6 @@
+- [AI semantics feature](ai-semantics-feature.md) — optional Haiku pass in the cleaner: tag semantics, section labels, meta; auto-on when ANTHROPIC_API_KEY set
+- [Nav linking rules](nav-linking-rules.md) — header MUST link the hero; footer = full sitemap (all sections); never leave empty '#'. Spec: site_studio/NAV_LINKING.md
+- [Fix script not file; restart server](fix-script-not-file-restart-server.md) — fix root cause in the SCRIPT, not one output file; studio server (debug=False) needs RESTART to apply script changes
+- [Generated header feature](generated-header-feature.md) — header_gen.py auto-builds a header (6 variants, colors from site, auto light/dark, CSS burger) for sites with no header
+- [Wayback download traps](wayback-download-traps.md) — 2 download bugs (asset-URL prefix, over-aggressive anchor strip) that blanked sites & deleted menus; check raw .bak first when a clean looks broken
+- [Расширять, а не подгонять](extend-dont-narrow-fix.md) — чинить баг расширением общей очистки, НЕ под один сломанный сайт; на каждое ослабление правила — отрицательный тест
