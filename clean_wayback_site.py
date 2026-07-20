@@ -1209,11 +1209,25 @@ _TYPEKIT_RULE_RE = re.compile(r"@import[^;]*typekit[^;]*;", re.I)
 
 
 def _strip_font_loading_rules(css):
-    """Remove the site's OWN webfont loading (@font-face rules + typekit @imports) from a CSS blob,
-    KEEPING everything else. A CMS/Blogger skin block mixes dozens of @font-face rules straight into
-    ~90KB of layout CSS, so dropping the whole <style> (the old behaviour) nuked the theme and left
-    the page unstyled. We inject our own font, so only the font rules need to go."""
-    css = _FONT_FACE_RULE_RE.sub("", css)
+    """Drop only the webfont loading that CANNOT work offline - @font-face rules whose src points at
+    a font CDN, and typekit @imports - KEEPING everything else, layout CSS and local fonts alike.
+
+    Two bugs shaped this. First, dropping the whole <style> on any @font-face nuked CMS/Blogger
+    skins that mix dozens of font rules into ~90KB of theme CSS (page rendered unstyled). Then the
+    replacement stripped EVERY @font-face on the premise "we inject our own font anyway" - which
+    stopped being true once the rule became "keep the font the archive had". On firsttalk.in that
+    deleted the self-hosted Inter/Open Sans faces while their 11 .woff files sat right there in the
+    folder, so the page then looked font-less and got flattened to Arial. A local @font-face is the
+    archived font: keep it."""
+    def _drop_if_external(m):
+        rule = m.group(0)
+        srcs = re.findall(r"url\(\s*['\"]?([^'\")]+)", rule, re.I)
+        host_of = lambda u: safe_urlsplit(u).netloc.lower().lstrip("www.")
+        if srcs and all(host_of(u) and any(host_of(u).endswith(h) for h in _FONT_CDN_HOSTS) for u in srcs):
+            return ""  # every source is a dead CDN - the rule can never load anything locally
+        return rule
+
+    css = _FONT_FACE_RULE_RE.sub(_drop_if_external, css)
     css = _TYPEKIT_RULE_RE.sub("", css)
     return css
 
@@ -1628,7 +1642,20 @@ def inject_google_fonts(soup, fonts_param, html_path=None):
     # to the browser's default serif.
     if not fonts_param:
         _strip_dead_font_links(soup, head, html_path)
+        # "Does this page state a font?" must look at the site's LOCAL STYLESHEETS too, not just at
+        # the HTML. By this point clean_head_styles has already moved every inline <style> out into
+        # <stem>-custom.css, so a site whose whole typography lives in CSS looks font-less here and
+        # would be flattened to Arial - which is how firsttalk.in lost its self-hosted Inter/Open
+        # Sans even though the .woff2 files were sitting in its own folder.
         declares_font = bool(FONT_FAMILY_RE.search(str(soup)))
+        if not declares_font and html_path is not None:
+            for css_path in _local_stylesheet_paths(soup, html_path):
+                try:
+                    if FONT_FAMILY_RE.search(css_path.read_text(encoding="utf-8", errors="replace")):
+                        declares_font = True
+                        break
+                except OSError:
+                    continue
         if not declares_font and html_path is not None:
             css_body = "* { font-family: Arial, Helvetica, sans-serif; }\n"
             fonts_css_path = html_path.with_name(f"{html_path.stem}-fonts.css")
