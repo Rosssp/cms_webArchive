@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from clean_wayback_site import BeautifulSoup, PARSER, _ensure_pillow, normalize_font_family, read_text_safe, collapse_blank_lines  # noqa: E402
+from clean_wayback_site import safe_urlsplit, safe_urljoin, BeautifulSoup, PARSER, _ensure_pillow, normalize_font_family, read_text_safe, collapse_blank_lines  # noqa: E402
 
 _CSS_RULE_RE = re.compile(r"([^{}]+)\{([^{}]*)\}")
 _BG_URL_RE = re.compile(r"background(?:-image)?\s*:\s*[^;]*?url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", re.IGNORECASE)
@@ -1047,6 +1047,9 @@ NAV_CONTAINER_TAGS = ("header", "nav", "footer")
 HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
 _NAV_UNRESOLVED_HREFS = {"#", "", "/", "#!", "javascript:void(0)", "javascript:void(0);", "javascript:;"}
 _HEADER_MAX_LINKS = 4
+# How many links may point at one and the same section before further "matches" are treated
+# as noise (a site-name word shared by the heading and dozens of menu labels matches everything).
+_MAX_LINKS_PER_SECTION = 3
 _NAV_CLASS_RE = re.compile(r"(?:^|[\s_-])(?:nav|navbar|menu|topnav|nav-links|main-menu|primary-menu|navigation|header)(?:[\s_-]|$)", re.I)
 _MOBILE_CLASS_RE = re.compile(r"(?:mobile|burger|hamburger|offcanvas|drawer)", re.I)
 _SOCIAL_CLASS_RE = re.compile(r"(?:social|share)", re.I)
@@ -1054,11 +1057,21 @@ _LABEL_TRAILING_DROP = {"us", "now", "more", "info", "page", "here", "section"}
 _LABEL_STOPWORDS = {"the", "a", "an", "of", "to", "and", "or", "it", "in", "on", "for", "with", "your", "our", "my"}
 
 
+# Split on whitespace and punctuation ONLY - never inside a word. Python's \w covers letters and
+# digits but NOT combining marks (Mn/Mc), so `[^\W_]+` shatters every Indic word at its vowel
+# signs: ਗੁਰਮੁਖੀ became ['ਗ','ਰਮ'] and Vietnamese "Giới thiệu" became ['Gi','i','thi','u'] - menu
+# labels and match keys turned to gibberish on exactly the archives we clean most.
+_TOKEN_SPLIT_RE = re.compile(r"[\s ]+|[!-/:-@\[-`{-~‐-⁞«»]+")
+
+
+def _tokenize(text):
+    """Words of `text` in ANY script (Latin, Cyrillic, Vietnamese, Gurmukhi, Bengali, Arabic...)."""
+    return [t for t in _TOKEN_SPLIT_RE.split((text or "").strip()) if t]
+
+
 def _slug_words(text, max_words=None):
     text = (text or "").strip().lower().replace("’", "'")
-    # [^\W_] = unicode letters/digits (not just a-z) so matching works for ANY language -
-    # Cyrillic, Greek, etc. - not only Latin.
-    words = re.findall(r"[^\W_]+", text, re.UNICODE)
+    words = _tokenize(text)
     if max_words:
         words = words[:max_words]
     return words
@@ -1235,7 +1248,7 @@ def _content_sections(soup):
         h = sec.find(HEADING_TAGS)
         h_text = re.sub(r"\s+", " ", h.get_text(" ", strip=True)).strip() if h else ""
         cls_words = [w for w in _slug_words(_cls(sec))
-                     if w not in ("section", "container", "wrapper", "row", "col", "content", "grid")]
+                     if w not in _SECTION_LABEL_NOISE and not _ANIM_CLASS_RE.match(w)]
         title = tag_text or h_text or " ".join(w.capitalize() for w in cls_words[:3])
         keys = (set(_slug_words(h_text)) | set(_slug_words(tag_text))
                 | set(cls_words) | set(_slug_words(sec.get("id") or "")))
@@ -1308,10 +1321,56 @@ def _best_section(link_text, sections, used):
     return best[1]
 
 
+def _in_protected_cms_menu(a):
+    """True if this link belongs to a genuine CMS-generated menu (see _is_cms_menu). Those are the
+    site's real navigation - we may neutralize a dead href inside them, but never delete the item."""
+    for parent in a.parents:
+        if getattr(parent, "name", None) in ("ul", "nav", "div") and _is_cms_menu(parent):
+            return True
+        if getattr(parent, "name", None) == "body":
+            break
+    return False
+
+
+# Class tokens that say nothing about WHAT a section is - layout scaffolding plus the animation/
+# hover/utility families. A section with no heading takes its label from its classes, so without
+# this a `<section class="wow fadeInUp animated">` became the menu item "Animated" (tuonggohungthinh
+# turned "Giới thiệu" into "Animated"). Never name a section after how it animates.
+_SECTION_LABEL_NOISE = {
+    "section", "container", "wrapper", "row", "col", "content", "grid", "inner", "outer",
+    "block", "box", "item", "wrap", "main", "area", "holder", "flex", "clearfix",
+}
+_ANIM_CLASS_RE = re.compile(
+    r"^(?:wow|animated?|animate|aos|hvr|sr|delay|duration|infinite|"
+    r"(?:fade|slide|zoom|bounce|flip|roll|light|rotate|swing|puff|pulse|shake|wobble|tada)"
+    r"(?:in|out|up|down|left|right|x|y)*"
+    r"|d(?:elay)?-?\d+|\d+s)$", re.I)
+
+
+def _matched_section(link_text, sections):
+    """The section a link GENUINELY refers to - by word overlap with the section's heading/class/
+    id/eyebrow - or None when nothing matches. Unlike `_best_section` this never falls back to
+    "the first available section": silently pointing an unmatched menu item at an unrelated block
+    is how a whole mega-menu ended up on one anchor."""
+    lw = set(_slug_words(link_text))
+    if not lw:
+        return None
+    best, score = None, 0
+    for s in sections:
+        n = len(lw & s["keys"])
+        if n > score:
+            best, score = s, n
+    return best
+
+
 def _short_label(text):
     """A brief header-style label from a link's text: drop trailing filler ('Us', 'Now'...) and
-    stopwords, cap at 2 words. 'About Us' -> 'About', 'How It Works' -> 'How Works'."""
-    words = re.findall(r"[A-Za-z0-9]+", text or "")
+    stopwords, cap at 2 words. 'About Us' -> 'About', 'How It Works' -> 'How Works'.
+
+    The word split MUST be Unicode-aware. With the old [A-Za-z0-9]+ every non-Latin script fell
+    apart mid-word - Vietnamese "Giới thiệu" split into ['Gi','i','thi','u'] and the menu item
+    became "Gi i". These archives are Vietnamese/Punjabi/Bengali/Cyrillic far more often than not."""
+    words = _tokenize(text)
     while words and words[-1].lower() in _LABEL_TRAILING_DROP:
         words.pop()
     sig = [w for w in words if w.lower() not in _LABEL_STOPWORDS] or words
@@ -1482,7 +1541,7 @@ def auto_link_menu(site_dir):
             low = href.lower()
             if low in _NAV_UNRESOLVED_HREFS or low.startswith("javascript"):
                 return True
-            parts = urlsplit(href)
+            parts = safe_urlsplit(href)
             netloc = parts.netloc.lower()
             if netloc.startswith("www."):
                 netloc = netloc[4:]
@@ -1640,23 +1699,52 @@ def auto_link_menu(site_dir):
         #     placeholders, icon-only social links. A link WITH visible text gets a section anchor
         #     (contextual word-match, else the first/any section); an icon-only link (social, no
         #     text) just loses its dead href so it stops looking clickable. ---
-        for a in soup.find_all("a", href=True):
+        _anchor_use = {}  # section-element id -> how many links already point at it
+        for a in list(soup.find_all("a", href=True)):
             low = (a.get("href") or "").strip().lower()
             if low not in _NAV_UNRESOLVED_HREFS and not low.startswith("javascript"):
                 continue
             if _is_dropdown_toggle(a):
                 continue  # a real dropdown toggle legitimately uses "#" - leave it
             txt = a.get_text(" ", strip=True)
-            if txt and sections:
-                sec = _best_section(txt, sections, set()) or sections[0]
-                a["href"] = "#" + _ensure_section_anchor(sec)
-                linked.append(f'{rel_self}: cta "{txt[:24]}" -> {a["href"]}')
-                dirty = True
-            elif not txt:
+            if not txt:
                 # icon-only dead link (social etc.) -> drop the dead href, keep the empty <a>
                 del a["href"]
                 relabeled.append(f'{rel_self}: dropped dead href on icon-only <a> ({_cls(a)[:24]})')
                 dirty = True
+                continue
+            # Only anchor a link that GENUINELY matches a section. Falling back to "the first
+            # section" pointed a 135-item mega-menu at one and the same anchor - worse than
+            # leaving it dead, and it hides the fact that nothing matched.
+            sec = _matched_section(txt, sections) if sections else None
+            # One section must not swallow the whole menu. On danvanhaiphong the org's name
+            # ("dân vận") is both the first section's heading AND part of dozens of menu labels,
+            # so 45 items "matched" the same anchor - a technically-real overlap that means
+            # nothing. Past a few links the match is noise: treat the rest as unmatched.
+            if sec is not None:
+                key = id(sec["el"])
+                if _anchor_use.get(key, 0) >= _MAX_LINKS_PER_SECTION:
+                    sec = None
+                else:
+                    _anchor_use[key] = _anchor_use.get(key, 0) + 1
+            if sec is not None:
+                a["href"] = "#" + _ensure_section_anchor(sec)
+                linked.append(f'{rel_self}: "{txt[:24]}" -> {a["href"]}')
+            elif _in_protected_cms_menu(a):
+                # The site's REAL multi-page menu (WordPress &c). Deleting its items guts the
+                # site's navigation - keep every item, just stop it being a dead link.
+                del a["href"]
+                relabeled.append(f'{rel_self}: cms-menu "{txt[:24]}" (href dropped, item kept)')
+            elif a.find_parent(["header", "nav", "footer"]) is not None:
+                # Nothing to point at, and it sits in the menu -> a menu item that leads nowhere
+                # is pure noise on a restored single-page site. Drop it.
+                _remove_nav_item(a)
+                removed.append(f'{rel_self}: nav "{txt[:24]}" (no matching section, removed)')
+            else:
+                # In the page body keep the text/layout, just stop pretending it's a link.
+                del a["href"]
+                relabeled.append(f'{rel_self}: stripped dead href on "{txt[:24]}"')
+            dirty = True
 
         if dirty:
             _write_soup(p, soup)

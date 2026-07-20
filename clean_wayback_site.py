@@ -108,6 +108,8 @@ per-site if the default heuristics keep/drop the wrong thing.
 """
 
 import argparse
+import functools
+import json
 import os
 import random
 import re
@@ -117,11 +119,32 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def safe_urlsplit(url):
+    """`urlsplit` that never raises. Archived pages carry genuinely malformed hrefs - leftover
+    template/BBCode junk like `http://[t vi=/ ]/en/home[/t]`, an unbalanced `[` in the host - and
+    the stdlib answers those with ValueError("Invalid IPv6 URL"). ONE such link anywhere killed the
+    entire cleanup mid-run (bambooship.vn). Junk must degrade, not crash: report no scheme and no
+    host, so every caller treats it as a non-external, unusable reference and the link-cleaning
+    steps neutralize it like any other dead link. (Nothing to do with the machine's real IPv6.)"""
+    try:
+        return urlsplit(url)
+    except ValueError:
+        return SplitResult("", "", url or "", "", "")
+
+
+def safe_urljoin(base, url):
+    """`urljoin` that never raises - it parses through the same stdlib path as `safe_urlsplit`."""
+    try:
+        return urljoin(base, url)
+    except ValueError:
+        return url or ""
 
 # --------------------------------------------------------------------------------------
 # CONFIG - tune per-site if needed
@@ -244,7 +267,8 @@ WAYBACK_TOOLBAR_CSS_NAMES = {"banner-styles.css", "iconochive.css"}
 # weights every font is linked at (kept to 3 - light/regular/bold covers a page's
 # hierarchy without bloating the Google Fonts request).
 FONT_WEIGHTS = "400;500;700"
-PRESET_FONTS = ("Jost", "Montserrat")
+# Only a UI suggestion for the studio's font field. NOTHING in the cleaner may fall back to
+# this: an un-asked-for font silently re-brands a restored site (see inject_google_fonts).
 DEFAULT_GOOGLE_FONTS = f"Jost:wght@{FONT_WEIGHTS}"
 
 # Standard .htaccess for every restored PBN site - gzip compression, serve
@@ -542,7 +566,7 @@ def unwayback(text):
 
 def domain_of(url):
     try:
-        netloc = urlsplit(url).netloc.lower()
+        netloc = safe_urlsplit(url).netloc.lower()
     except ValueError:
         return ""
     if netloc.startswith("www."):
@@ -551,7 +575,7 @@ def domain_of(url):
 
 
 def is_external(url):
-    parts = urlsplit(url)
+    parts = safe_urlsplit(url)
     return bool(parts.scheme) or url.startswith("//")
 
 
@@ -576,7 +600,7 @@ def looks_hashed(stem):
 
 def to_relative(url, site_domain):
     """Turn a same-site absolute URL into a root-relative path for a clean static export."""
-    parts = urlsplit(url)
+    parts = safe_urlsplit(url)
     path = parts.path or "/"
     rebuilt = urlunsplit(("", "", path, parts.query, parts.fragment))
     return rebuilt or "/"
@@ -643,6 +667,9 @@ class Report:
         self.semantic_title = None
         self.semantic_description = None
         self.semantic_tags_applied = []  # e.g. "div.top-bar -> header"
+        self.landmarks_repaired = []     # bogus nav/header wrapping the whole page -> div
+        self.sliders_fixed = None        # sliders left in a sane static state
+        self.reveal_unhidden = 0         # scroll-reveal blocks made visible (their JS is gone)
         self.headings_normalized = []  # e.g. "h4 -> h3"
         self.base_tag_removed = None  # the killed <base href="..."> if any
         self.sri_stripped = 0  # integrity/crossorigin attrs removed (they'd block local assets)
@@ -774,6 +801,10 @@ class Report:
             lines.append(f"© year bumped to current: {self.owner_trace_year_updates}")
         if self.icon_font_selfhosted:
             lines.append("icons: self-hosted a working Font Awesome locally (broken icon webfont replaced)")
+        if self.sliders_fixed:
+            lines.append(f"static slider fix: {self.sliders_fixed}")
+        if self.reveal_unhidden:
+            lines.append(f"scroll-reveal blocks un-hidden (their animation JS was stripped): {self.reveal_unhidden}")
         if self.glyphicons_rewritten:
             lines.append(f"icons: Bootstrap glyphicons remapped to Font Awesome: {self.glyphicons_rewritten}")
         if self.custom_icons_rewritten:
@@ -1063,14 +1094,14 @@ def classify_script(tag):
         return "drop"
     if is_external(src) and domain_of(src) not in LIBRARY_DOMAINS:
         return "drop"
-    if src and Path(urlsplit(src).path).stem.lower() in FOUNDATIONAL_JS_STEMS:
+    if src and Path(safe_urlsplit(src).path).stem.lower() in FOUNDATIONAL_JS_STEMS:
         return "keep"
     if any(k in combined for k in SCRIPT_DROP_KEYWORDS):
         return "drop"
     if any(k in combined for k in SCRIPT_KEEP_KEYWORDS):
         return "keep"
     if src:
-        stem = Path(urlsplit(src).path).stem
+        stem = Path(safe_urlsplit(src).path).stem
         return "drop" if looks_hashed(stem) else "ambiguous"
     return "drop" if not text.strip() else "ambiguous"
 
@@ -1097,7 +1128,7 @@ def clean_stylesheet_links(soup, report, site_domain=None):
         if "stylesheet" not in rel:
             continue
         clean_href = unwayback(href)
-        fname = Path(urlsplit(clean_href).path).name
+        fname = Path(safe_urlsplit(clean_href).path).name
         if fname in WAYBACK_TOOLBAR_CSS_NAMES:
             report.removed_links_css.append(href)
             tag.decompose()
@@ -1247,20 +1278,18 @@ def normalize_font_family(family_param):
 
 def font_param_from_name(name):
     """'Jost' -> 'Jost:wght@400;500;700' (the standard 3 weights). If the input already
-    carries ':wght@...' it's kept (just case-normalized); empty -> the default font."""
+    carries ':wght@...' it's kept (just case-normalized); empty -> empty.
+
+    Empty must NOT become a default family: "no font asked for" means "keep the fonts the
+    archived page already had", and returning Jost here would re-brand the site behind the
+    caller's back."""
     name = (name or "").strip()
     if not name:
-        return DEFAULT_GOOGLE_FONTS
+        return ""
     if ":" in name:
         return normalize_font_family(name)
     base = name.split(":")[0].strip()
     return normalize_font_family(f"{base}:wght@{FONT_WEIGHTS}")
-
-
-def random_preset_font_param():
-    """A random preset font (Jost/Montserrat) at the standard weights - what the cleanup
-    pass drops in automatically so restored sites don't all share one typeface."""
-    return font_param_from_name(random.choice(PRESET_FONTS))
 
 
 def _local_stylesheet_paths(soup, html_path):
@@ -1318,24 +1347,31 @@ def detect_site_font(soup, html_path):
             continue
         _collect_font_family_tokens(read_text_safe(css_path), tokens)
 
-    for name in tokens:
+    # Rank candidates by HOW OFTEN the theme declares them, not by document order. The real
+    # brand font is stated over and over (body, headings, buttons); a one-off like
+    # "SFMono-Regular" in a code block would otherwise win just for appearing first.
+    counts, first_seen = {}, {}
+    for i, name in enumerate(tokens):
         key = name.lower()
         if key in GENERIC_FONT_KEYWORDS or key in SYSTEM_FONT_NAMES or key in ICON_FONT_NAMES:
             continue
         if any(hint in key for hint in ICON_FONT_HINTS):
             continue
-        # A blocklist can't enumerate every OS-default/icon-font name a theme might
-        # use - ask Google Fonts itself whether this family actually exists there
-        # before committing to it (avoids repeating the Glyphicons/Menlo mistake for
-        # whatever the next unlisted one turns out to be).
-        if _google_font_exists(name):
-            return font_param_from_name(name)
+        counts[key] = counts.get(key, 0) + 1
+        first_seen.setdefault(key, (i, name))
+    # A blocklist can't enumerate every OS-default/icon-font name a theme might use - ask Google
+    # Fonts itself whether the family exists there (and get its canonical spelling) before
+    # committing to it (avoids repeating the Glyphicons/Menlo mistake for the next unlisted one).
+    for key in sorted(counts, key=lambda k: (-counts[k], first_seen[k][0])):
+        canonical = _google_font_canonical(first_seen[key][1])
+        if canonical:
+            return font_param_from_name(canonical)
     return None
 
 
-def _google_font_exists(name):
-    """True if Google Fonts' css2 API actually serves this family - a made-up/system/
-    icon-font name 400s or comes back without any @font-face rule."""
+def _google_font_serves(name):
+    """True if Google Fonts' css2 API actually serves this EXACT family spelling - a made-up/
+    system/icon-font name 400s or comes back without any @font-face rule."""
     import urllib.error
     import urllib.parse
     import urllib.request
@@ -1344,16 +1380,70 @@ def _google_font_exists(name):
         url = f"https://fonts.googleapis.com/css2?family={urllib.parse.quote(name)}&display=swap"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200 and b"@font-face" in resp.read(500)
+            return resp.status == 200 and b"@font-face" in resp.read()
     except (urllib.error.URLError, OSError):
         return False
 
 
+_GF_METADATA_URL = "https://fonts.google.com/metadata/fonts"
+
+
+@functools.lru_cache(maxsize=1)
+def _google_font_index():
+    """{lowercased family -> canonical family} for EVERY Google Font, fetched once (~1900 names,
+    <1s). Empty dict if unreachable - the caller then falls back to probing spellings."""
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(_GF_METADATA_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            txt = resp.read().decode("utf-8", "replace")
+        if txt.startswith(")]}'"):
+            txt = txt.split("\n", 1)[1]  # strip Google's XSSI guard prefix
+        data = json.loads(txt)
+        return {f["family"].lower(): f["family"]
+                for f in data.get("familyMetadataList", []) if f.get("family")}
+    except Exception:  # noqa: BLE001 - offline/blocked/shape change: fall back to probing
+        return {}
+
+
+@functools.lru_cache(maxsize=512)
+def _google_font_canonical(name):
+    """The EXACT Google Fonts spelling of `name`, or None if Google doesn't have that family.
+
+    CSS family names are case-INSENSITIVE, but the Google Fonts API is not: a theme that writes
+    `font-family: poppins` (perfectly valid CSS) made the old existence probe return HTTP 400, so
+    EVERY candidate "didn't exist" and the cleaner silently dropped in a random preset - the
+    restored site lost its real typeface (danvanhaiphong: poppins -> Jost). Resolve through the
+    canonical family list instead, which also fixes spellings no title-casing would guess
+    ("pt sans" -> "PT Sans", "ibm plex sans" -> "IBM Plex Sans")."""
+    n = (name or "").strip().strip("\"'")
+    if not n:
+        return None
+    idx = _google_font_index()
+    if idx:
+        return idx.get(n.lower())
+    # List unavailable (offline): probe a few plausible spellings directly.
+    tried = []
+    for cand in (n, n.title(),
+                 " ".join(w.upper() if len(w) <= 3 else w.capitalize() for w in n.split())):
+        if cand in tried:
+            continue
+        tried.append(cand)
+        if _google_font_serves(cand):
+            return cand
+    return None
+
+
 def resolve_font_input(raw, soup=None, html_path=None):
-    """UI/CLI helper: empty -> try to detect a font already used on the page (needs
-    soup+html_path; falls back to a random preset if nothing usable is found, or if
-    no soup/html_path was given at all); a bare name ('Jost') -> that name at the 3
-    standard weights; an explicit 'Family:wght@...' -> kept as typed."""
+    """UI/CLI helper: empty -> use the font the ARCHIVED PAGE actually used; a bare name ('Jost')
+    -> that name at the 3 standard weights; an explicit 'Family:wght@...' -> kept as typed.
+
+    Returns "" when the page declares no Google-available brand font. That is deliberate: the
+    restored page must look like the snapshot (a site set in Arial/Verdana keeps Arial/Verdana),
+    so we do NOT drop in a random preset any more - that silently re-branded every plain site
+    (danvanhaiphong lost Poppins to Jost, sanjhapunjab's system stack became Jost).
+    inject_google_fonts() turns "" into "leave the site's own fonts alone"."""
     raw = (raw or "").strip()
     if raw:
         return font_param_from_name(raw)
@@ -1361,7 +1451,7 @@ def resolve_font_input(raw, soup=None, html_path=None):
         detected = detect_site_font(soup, html_path)
         if detected:
             return detected
-    return random_preset_font_param()
+    return ""
 
 
 def _primary_font_family(fonts_param):
@@ -1414,7 +1504,14 @@ def download_google_font_locally(fonts_param, dest_dir, html_root):
         url = m.group(1).strip("'\" ")
         fmt = m.group(2).lower()
         ext = _FONT_FORMAT_EXTS.get(fmt, ".woff2")
-        data = _fetch_url_bytes(url)
+        # One unreachable weight must not abort the whole font (or the run): keep the original
+        # url() for that face and carry on with the ones that did download.
+        try:
+            data = _fetch_url_bytes(url)
+        except Exception:  # noqa: BLE001
+            return m.group(0)
+        if not data:
+            return m.group(0)
         fname = f"{primary_slug}-{counter}{ext}"
         counter += 1
         (dest_dir / fname).write_bytes(data)
@@ -1473,25 +1570,12 @@ def _shield_icons_from_font_resets(css_text):
     return _FONT_RESET_RULE_RE.sub(repl, css_text)
 
 
-def inject_google_fonts(soup, fonts_param, html_path=None):
-    fonts_param = normalize_font_family(fonts_param)
-    head = soup.find("head")
-    if not head:
-        return
 
-    for tag in head.find_all(attrs={"data-site-studio-font": True}):
-        tag.decompose()
-
-    # Any OLD font connection still left in <head> - not just ones this tool added
-    # before - gets dropped too, so the page never ends up double-loading two font
-    # services at once (the original theme's own Google Fonts/Typekit/etc <link>,
-    # which clean_stylesheet_links leaves alone because fonts.googleapis.com/
-    # fonts.gstatic.com are "library" domains, plus any leftover preconnect hints).
-    # This also covers a LOCAL mirror - wayback often saves the Google Fonts CSS
-    # *response* itself as a local file (named just "css", no extension - the source
-    # URL is "fonts.googleapis.com/css?family=..." with no ".css" in the path) and
-    # rewrites the <link> to point at that local copy instead of the live URL, so a
-    # plain href substring check for "fonts.googleapis.com" never catches it.
+def _strip_dead_font_links(soup, head, html_path):
+    """Drop every OLD font connection left in <head> - the theme's own Google Fonts/Typekit
+    <link>, leftover preconnect hints, and the LOCAL MIRROR wayback often saves of the Google
+    Fonts CSS response (a file named just "css", so an href substring check never catches it).
+    Without this the page double-loads two font services, or keeps hitting a dead one."""
     for link in list(head.find_all("link")):
         href = link.get("href") or ""
         rel = link.get("rel") or []
@@ -1528,6 +1612,34 @@ def inject_google_fonts(soup, fonts_param, html_path=None):
                 except (ValueError, OSError):
                     pass  # outside assets_dir, or a move hiccup - leave it for the later sweep
 
+
+def inject_google_fonts(soup, fonts_param, html_path=None):
+    fonts_param = normalize_font_family(fonts_param)
+    head = soup.find("head")
+    if not head:
+        return
+
+    for tag in head.find_all(attrs={"data-site-studio-font": True}):
+        tag.decompose()
+
+    # No Google-available brand font on this page -> KEEP WHAT THE ARCHIVE HAD. Overriding a site
+    # that was set in Arial/Verdana with some preset would change the very look we're restoring.
+    # Only when the page declares no font at all do we state a plain Arial stack, so it isn't left
+    # to the browser's default serif.
+    if not fonts_param:
+        _strip_dead_font_links(soup, head, html_path)
+        declares_font = bool(FONT_FAMILY_RE.search(str(soup)))
+        if not declares_font and html_path is not None:
+            css_body = "* { font-family: Arial, Helvetica, sans-serif; }\n"
+            fonts_css_path = html_path.with_name(f"{html_path.stem}-fonts.css")
+            fonts_css_path.write_text(css_body, encoding="utf-8")
+            link = soup.new_tag("link", rel="stylesheet", href=fonts_css_path.name)
+            link["data-site-studio-font"] = "local"
+            head.append(link)
+        return
+
+    _strip_dead_font_links(soup, head, html_path)
+
     # Self-hosted, not CDN: download the actual font FILES from Google Fonts into the
     # project and rewrite @font-face to local paths, instead of a live <link> to
     # fonts.googleapis.com that hits Google on every single page load. Falls back to
@@ -1550,15 +1662,14 @@ def inject_google_fonts(soup, fonts_param, html_path=None):
         # The requested family isn't downloadable (not on Google Fonts, or the fetch failed).
         # NEVER fall back to a live <link> to fonts.googleapis.com: that leaks an external
         # request on every page load and, for a non-Google family, just 403s and renders
-        # nothing. Retry with a known-good preset instead, so the page still gets a real,
-        # self-hosted webfont.
-        for preset in PRESET_FONTS:
-            cand = normalize_font_family(f"{preset}:wght@{FONT_WEIGHTS}")
-            local_css = _try_selfhost(cand)
-            if local_css:
-                fonts_param = cand
-                primary = _primary_font_family(cand)
-                break
+        # nothing.
+        #
+        # And never fall back to a PRESET either. That used to drop in Jost/Montserrat and
+        # push a `* { font-family: Jost !important }` override, silently RE-BRANDING a site
+        # whose own font was perfectly fine - one flaky font download was enough to lose
+        # danvanhaiphong's Poppins. The rule is: keep whatever the archive used. If we cannot
+        # self-host, we touch nothing and the site's own CSS keeps rendering its own fonts.
+        return
 
     parts = []
     if local_css:
@@ -2011,6 +2122,218 @@ def ensure_jquery(soup, html_path, report, dry_run=False):
     else:
         (soup.find("head") or soup.find("body")).append(tag)
     report.jquery_selfhosted = f"{JQUERY_VERSION} -> {rel} (page used jQuery with none loaded)"
+
+
+# Scroll-reveal libraries (WOW.js, AOS, ScrollReveal, animate.css wrappers) hide an element and
+# only un-hide it when JS sees it scroll into view. We strip that JS, so anything the visitor
+# hadn't scrolled to at snapshot time stays hidden FOREVER - whole bands of the page render blank
+# (tuonggohungthinh: 38 hidden blocks, cards simply absent).
+_REVEAL_CLASS_RE = re.compile(
+    r"(?:^|\s)(?:wow|animated|animate__animated|aos-init|sr|scrollreveal|reveal|"
+    r"fade-?up|fade-?in|slide-?up|slide-?in|zoom-?in)(?:\s|$)", re.I)
+_REVEAL_ATTRS = ("data-wow-delay", "data-wow-duration", "data-wow-offset", "data-wow-iteration",
+                 "data-aos", "data-aos-delay", "data-aos-duration", "data-sr-id", "data-scroll-reveal")
+# the declarations that keep it invisible - dropped so the element falls back to its normal state
+_REVEAL_HIDE_DECL_RE = re.compile(
+    r"\s*(?:visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0+)?|animation-name\s*:\s*none)\s*;?", re.I)
+# CSS-side equivalent, for themes that hide via a stylesheet rule instead of an inline style
+_CSS_REVEAL_HIDE_RE = re.compile(
+    r"(\.wow|\[data-aos\][^{,]*|\.scrollreveal)([^{]*)\{([^}]*)\}", re.I)
+
+
+def unhide_scroll_reveal(soup, report, html_path=None):
+    """Make scroll-reveal content visible again. The animation library's JS is gone, so its
+    "hidden until scrolled into view" state is permanent - this returns the element to its
+    revealed state DETERMINISTICALLY (no JS re-added, nothing re-downloaded).
+
+    We only strip the *hiding* declarations, never the animation itself: the class (e.g.
+    `wow fadeInUp`) plus the site's own animate.css keyframes then drive the animation on load,
+    so the page still looks alive. Where the keyframes aren't archived the element simply shows -
+    which is the whole point: visible-without-animation beats invisible.
+
+    Deliberately targeted: an element must carry a reveal-library marker (class or data-attr).
+    Deliberate off-screen hiding (`position:absolute; left:-9999px` a11y text, bambooship) and
+    normal hidden dropdowns/modals are left completely alone."""
+    n = 0
+    for tag in soup.find_all(True):
+        style = tag.get("style") or ""
+        cls = " ".join(tag.get("class", []))
+        is_reveal = bool(_REVEAL_CLASS_RE.search(cls)) or any(tag.has_attr(a) for a in _REVEAL_ATTRS)
+        if not is_reveal:
+            continue
+        if tag.has_attr("data-aos"):
+            # AOS reveals via a class its own CSS keys off - add it rather than fight the stylesheet
+            classes = tag.get("class", [])
+            if "aos-animate" not in classes:
+                tag["class"] = classes + ["aos-animate"]
+                n += 1
+        if not style or not _REVEAL_HIDE_DECL_RE.search(style):
+            continue
+        new_style = _REVEAL_HIDE_DECL_RE.sub("", style).strip().strip(";").strip()
+        if new_style:
+            tag["style"] = new_style
+        else:
+            del tag["style"]
+        n += 1
+    if n:
+        report.reveal_unhidden = n
+    # Some themes hide the reveal elements from a stylesheet instead ( .wow{visibility:hidden} ).
+    # Without the JS that rule is permanent too - neutralize just that declaration.
+    if html_path is not None:
+        for css_path in sorted(html_path.parent.rglob("*.css")):
+            if any(part in QUARANTINE_DIR_NAMES for part in css_path.relative_to(html_path.parent).parts):
+                continue
+            try:
+                txt = read_text_safe(css_path)
+            except OSError:
+                continue
+            if ".wow" not in txt and "data-aos" not in txt:
+                continue
+
+            def _fix(m):
+                body = _REVEAL_HIDE_DECL_RE.sub("", m.group(3))
+                return f"{m.group(1)}{m.group(2)}{{{body}}}"
+
+            new = _CSS_REVEAL_HIDE_RE.sub(_fix, txt)
+            if new != txt:
+                try:
+                    css_path.write_text(new, encoding="utf-8")
+                except OSError:
+                    pass
+    return n
+
+
+# Sliders/carousels are JS widgets. We strip the JS, so whatever state the library had written
+# into the DOM at snapshot time freezes there - and that state is usually NOT "showing slide 1".
+_SLIDER_TRACK_RE = re.compile(
+    r"(?:^|\s)(?:owl-stage|swiper-wrapper|slick-track|carousel-inner|bxslider|flexslider)(?:\s|$)", re.I)
+_SLIDER_BOX_RE = re.compile(
+    r"(?:^|\s)(?:owl-carousel|owl-stage|swiper|slick|carousel|n2-ss|n2-section-smartslider|"
+    r"flexslider|bx-wrapper|rev_slider|tp-banner|elementor-background-slideshow|"
+    r"ls-container|master-slider)[\w-]*(?:\s|$)", re.I)
+_TRANSFORM_DECL_RE = re.compile(r"\s*(?:-webkit-)?transform\s*:[^;]*;?|\s*(?:-webkit-)?transition\s*:[^;]*;?", re.I)
+_CAROUSEL_ITEM_RE = re.compile(r"(?:^|\s)carousel-item(?:\s|$)", re.I)
+_BS3_ITEM_RE = re.compile(r"(?:^|\s)item(?:\s|$)", re.I)
+# One slide, whatever the library calls it.
+_SLIDE_ITEM_RE = re.compile(
+    r"(?:^|\s)(?:owl-item|slick-slide|swiper-slide|carousel-item|flex-active-slide|ls-slide)(?:\s|$)", re.I)
+# The edge-duplicate marker each looping library uses.
+_SLIDE_CLONE_RE = re.compile(
+    r"(?:^|\s)(?:cloned|clone|slick-cloned|swiper-slide-duplicate[\w-]*|bx-clone)(?:\s|$)", re.I)
+_INLINE_HIDDEN_RE = re.compile(r"\s*display\s*:\s*none\s*;?", re.I)
+
+
+def fix_static_sliders(soup, report):
+    """Leave every slider in a sane STATIC state - it must never render as a blank band.
+
+    Three things the stripped JS leaves behind, all fixed deterministically (no library is
+    re-added, nothing is downloaded):
+
+    1. Bootstrap carousel with no `.active` slide. The CSS only shows `.carousel-item.active`, so
+       with none marked the whole carousel renders EMPTY - kyx.vn had 4 slides and 12 images and
+       displayed nothing. Activate the first slide (and its indicator).
+    2. A track frozen mid-scroll: the library wrote `transform: translate3d(-1234px,0,0)` on
+       .owl-stage/.swiper-wrapper, so slide 1 sits off-screen and the visitor sees blank inside an
+       overflow:hidden box. Drop that inline transform/transition so the track starts at slide 1.
+    3. A slider whose slides were built by JS from JSON (Smart Slider 3, Elementor slideshow):
+       nothing is in the HTML at all, leaving a tall empty band (bambooship: 500px of nothing).
+       Nothing can be restored, so collapse the empty shell instead of shipping a hole.
+    """
+    activated = untracked = collapsed = 0
+
+    for box in soup.find_all(class_=re.compile(r"carousel", re.I)):
+        # Bootstrap 4/5 call a slide `.carousel-item`; Bootstrap 3 - very common in archived
+        # sites - calls it plain `.item`. Matching only the modern name silently skipped every
+        # BS3 carousel, which renders just as blank without an `.active` slide.
+        items = box.find_all(class_=_CAROUSEL_ITEM_RE)
+        if not items:
+            inner = box if "carousel-inner" in " ".join(box.get("class") or []).lower() \
+                else box.find(class_=re.compile(r"(?:^|\s)carousel-inner(?:\s|$)", re.I))
+            if inner is not None:
+                items = inner.find_all(class_=_BS3_ITEM_RE, recursive=False) \
+                    or inner.find_all(class_=_BS3_ITEM_RE)
+        if not items or any("active" in (i.get("class") or []) for i in items):
+            continue
+        items[0]["class"] = list(items[0].get("class", [])) + ["active"]
+        activated += 1
+        ind = box.find_all(attrs={"data-bs-slide-to": True}) or box.find_all(attrs={"data-slide-to": True})
+        if ind and not any("active" in (x.get("class") or []) for x in ind):
+            ind[0]["class"] = list(ind[0].get("class", [])) + ["active"]
+
+    # Every looping slider duplicates its edge slides so the wrap-around looks seamless. That is a
+    # RUNTIME trick and each library names it differently - Owl `.cloned`, Slick `.slick-cloned`,
+    # Swiper `.swiper-slide-duplicate`, bxSlider `.bx-clone`, FlexSlider `.clone`. With the JS
+    # stripped these stay in the DOM as visible DUPLICATE content (the same logo or testimonial
+    # rendered twice). Drop them - but only while a real, non-clone slide survives, so a slider
+    # whose every item happens to be marked as a clone is never emptied.
+    decloned = 0
+    for track in soup.find_all(class_=_SLIDER_TRACK_RE):
+        items = track.find_all(class_=_SLIDE_ITEM_RE)
+        clones = [i for i in items if _SLIDE_CLONE_RE.search(" ".join(i.get("class") or []))]
+        if not clones or len(clones) >= len(items):
+            continue
+        for c in clones:
+            c.decompose()
+            decloned += 1
+
+    # Same failure mode as the missing `.active` above, but library-agnostic: some sliders hide
+    # every slide but the current one with an INLINE `display:none` and reveal it from JS. With
+    # the JS gone all of them stay hidden and the slider is a blank band. If literally every slide
+    # is inline-hidden (i.e. nothing is left to show), un-hide the first one. The all-hidden guard
+    # is what keeps this from touching a slider that already has a visible slide.
+    for track in soup.find_all(class_=_SLIDER_TRACK_RE):
+        slides = [s for s in track.find_all(class_=_SLIDE_ITEM_RE)
+                  if not _SLIDE_CLONE_RE.search(" ".join(s.get("class") or []))]
+        if not slides or not all(_INLINE_HIDDEN_RE.search(s.get("style") or "") for s in slides):
+            continue
+        first = slides[0]
+        newstyle = _INLINE_HIDDEN_RE.sub("", first.get("style") or "").strip().strip(";").strip()
+        if newstyle:
+            first["style"] = newstyle
+        else:
+            del first["style"]
+        activated += 1
+
+    for track in soup.find_all(class_=_SLIDER_TRACK_RE):
+        style = track.get("style") or ""
+        if "transform" not in style.lower() and "transition" not in style.lower():
+            continue
+        new = _TRANSFORM_DECL_RE.sub("", style).strip().strip(";").strip()
+        if new:
+            track["style"] = new
+        else:
+            del track["style"]
+        untracked += 1
+
+    # Collapse JS-templated slider shells that carry NOTHING (Smart Slider 3 / RevSlider / Elementor
+    # slideshow build their slides in JS from JSON, so the archived HTML has only empty divs that
+    # CSS still gives a 500px height - a hole in the page). Judge by CONTENT, not by class name:
+    # any slider box with no text, no media and no inline background image can only render blank.
+    # Outermost first, so removing a parent takes its equally-empty children with it.
+    boxes = sorted(soup.find_all(class_=_SLIDER_BOX_RE), key=lambda t: len(list(t.parents)))
+    for box in boxes:
+        if box.decomposed or not box.find_parent("body"):
+            continue  # already removed together with an ancestor
+        # NB: ignore <style>/<script> text - Smart Slider embeds its whole stylesheet INSIDE the
+        # slider div, which made "does it have text?" always true and the empty shell survive.
+        visible_text = "".join(
+            t for t in box.find_all(string=True)
+            if getattr(t.parent, "name", "") not in ("script", "style")
+        ).strip()
+        if visible_text or box.find(["img", "video", "iframe", "picture", "svg", "canvas"]):
+            continue  # real content - keep
+        if "background-image" in (box.get("style") or "").lower():
+            continue  # a CSS background IS visible content
+        if any("background-image" in (d.get("style") or "").lower() for d in box.find_all(True)):
+            continue
+        box.decompose()
+        collapsed += 1
+
+    if activated or untracked or collapsed or decloned:
+        report.sliders_fixed = (f"activated first slide: {activated}, "
+                                f"un-frozen tracks: {untracked}, empty shells collapsed: {collapsed}, "
+                                f"duplicate cloned slides removed: {decloned}")
+    return activated, untracked, collapsed, decloned
 
 
 def clean_data_and_event_attrs(soup):
@@ -2722,7 +3045,7 @@ def recover_asset_bytes(original_url, timestamp=None):
     best-match snapshot of that same URL either way. Returns (bytes, ext) on success,
     or (None, ext) if nothing could be recovered. Shared by the CSS asset recovery
     below and the broken-resource auto-cleanup in site_edit.py."""
-    ext = Path(urlsplit(original_url).path).suffix.lower()
+    ext = Path(safe_urlsplit(original_url).path).suffix.lower()
     enabled = getattr(_REC_TL, "enabled", False)
     if enabled:
         # This site's assets are clearly not archived, or we already tried this exact URL and it
@@ -2804,7 +3127,7 @@ def _recover_css_asset(raw_url, css_path, report, site_domain):
     if "#" in original_url:
         original_url, fragment = original_url.split("#", 1)
         fragment = "#" + fragment
-    name = Path(urlsplit(original_url).path).name or "asset"
+    name = Path(safe_urlsplit(original_url).path).name or "asset"
     # Framework icon fonts (Bootstrap glyphicons, Font Awesome, ...) never actually lived at
     # "<site domain>/<file>" - they shipped from the framework/CDN - so hitting the archive
     # for them is pure wasted time: each is a slow CDX round-trip that always fails AND the
@@ -3064,7 +3387,7 @@ def localize_media_refs(soup, html_path, site_domain, report, dry_run=False, can
             u = unwayback((url or "").strip())
             if not (u and is_external(u) and matches_suffix(domain_of(u), {bare})):
                 continue
-            name = Path(urlsplit(u.split("?")[0].split("#")[0]).path).name or "asset"
+            name = Path(safe_urlsplit(u.split("?")[0].split("#")[0]).path).name or "asset"
             if name in local_by_name or name in seen:
                 continue
             seen.add(name)
@@ -3103,7 +3426,7 @@ def localize_media_refs(soup, html_path, site_domain, report, dry_run=False, can
         u = unwayback((url or "").strip())
         if not u or not (is_external(u) and matches_suffix(domain_of(u), {bare})):
             return url, False  # not a same-domain absolute ref - leave it
-        name = Path(urlsplit(u.split("?")[0].split("#")[0]).path).name or "asset"
+        name = Path(safe_urlsplit(u.split("?")[0].split("#")[0]).path).name or "asset"
         found = local_by_name.get(name)
         if found:
             rel = os.path.relpath(found, site_root).replace(os.sep, "/")
@@ -3320,12 +3643,22 @@ def localize_external_media(soup, html_path, site_domain, report, dry_run=False,
             continue
         if dry_run:
             continue
-        data = _fetch_url_bytes(url)
+        # _fetch_url_bytes RAISES on failure (it re-raises the last error) - it does not return
+        # None. A single dead third-party image (404/timeout/DNS) therefore killed the whole
+        # cleanup mid-run: mikatoronen died here with "HTTP Error 404: Not Found" and the site was
+        # left half-cleaned, with the error surfaced on the card. An unreachable decoration must
+        # only cost us that one element.
+        try:
+            data = _fetch_url_bytes(url)
+        except Exception as e:  # noqa: BLE001 - any network/HTTP failure means "can't have it"
+            data, why = None, type(e).__name__
+        else:
+            why = "empty response"
         if not data:
-            report.external_media_removed.append(f"{url} (unreachable)")
+            report.external_media_removed.append(f"{url} (unreachable: {why})")
             tag.decompose()
             continue
-        name = re.sub(r"[^\w.\-]+", "_", urlsplit(url).path.rsplit("/", 1)[-1] or "img")[:80]
+        name = re.sub(r"[^\w.\-]+", "_", safe_urlsplit(url).path.rsplit("/", 1)[-1] or "img")[:80]
         if "." not in name:
             name += ".img"
         assets_dir.mkdir(parents=True, exist_ok=True)
@@ -4009,7 +4342,7 @@ def _rewrite_domain_absolute_links(soup, site_domain):
         href = (a["href"] or "").strip()
         if not is_external(href) or not matches_suffix(domain_of(href), {bare}):
             continue
-        parts = urlsplit(href)
+        parts = safe_urlsplit(href)
         rest = parts.path or "/"
         if parts.query:
             rest += "?" + parts.query
@@ -4383,6 +4716,28 @@ def ensure_landmarks(soup, report):
         report.semantic_tags_applied.append(f"детерминированно: div→section {renamed}, main-обёртка {wrapped} блоков")
 
 
+# A block containing any of these is a page WRAPPER - it can never itself be nav/header/footer.
+_LANDMARK_TAGS = ("main", "header", "footer", "nav")
+
+
+def repair_landmark_nesting(soup, report=None):
+    """Heal structurally impossible landmark nesting, whoever produced it (AI pass, a weird theme,
+    an older run of this tool). A <nav>/<header>/<footer>/<aside> that CONTAINS <main> (or a
+    header+footer pair) is a mislabelled page wrapper: it makes every section invisible to the
+    menu-anchor logic, so the restored page ends up with a menu that links nowhere. Demote such a
+    wrapper back to a neutral <div>, keeping every attribute and child untouched (tag rename only -
+    box-model neutral, no CSS selector on class/id breaks). Runs deterministically, no AI needed."""
+    fixed = []
+    for tag in soup.find_all(["nav", "header", "footer", "aside"]):
+        if tag.find("main") is not None or (tag.find("header") is not None and tag.find("footer") is not None):
+            cls = " ".join(tag.get("class", [])[:2])
+            fixed.append(f"<{tag.name}{('.' + cls.split()[0]) if cls else ''}> wrapped page landmarks -> div")
+            tag.name = "div"
+    if fixed and report is not None:
+        report.landmarks_repaired = fixed
+    return fixed
+
+
 def apply_semantic_tags(soup, report):
     """Recover HTML5 semantics on a bad-markup export. Two passes, neither restructures content:
       1) DETERMINISTIC header - the top nav bar becomes (or is wrapped in) <header>; a hero band
@@ -4433,6 +4788,14 @@ def apply_semantic_tags(soup, report):
         # exactly the "hero got tagged <header>" case the deterministic pass avoids for the header.
         if _SEM_HERO_RE.search(cls) and newtag in ("header", "footer", "nav", "main", "aside"):
             newtag = "section"
+        # STRUCTURAL INVARIANT: a block that CONTAINS other landmarks is a page wrapper, never a
+        # landmark itself. Without this the model can label the outer wrapper <nav> (it holds the
+        # whole site, so it holds every link) and produce <nav><header><main><footer></nav> - which
+        # is not just wrong semantics: _content_sections treats everything inside a nav/header/
+        # footer as chrome, so EVERY section disappears and no menu anchor can attach. Seen on
+        # danvanhaiphong ("div -> nav" over 838 descendants). Applies to any model output.
+        if newtag in ("nav", "header", "footer", "aside") and ch.find(_LANDMARK_TAGS) is not None:
+            newtag = "section" if ch.name == "div" else "keep"
         if newtag == "keep" or newtag == ch.name:
             continue
         if newtag in taken:  # don't create a duplicate main/header/footer
@@ -4523,6 +4886,11 @@ def clean_html_file(
     promote_src(soup)
     add_lazy_loading(soup, report)
     clean_data_and_event_attrs(soup)
+    # The reveal-animation JS is gone, so anything it left hidden would stay hidden forever.
+    unhide_scroll_reveal(soup, report, html_path)
+    # Same idea for sliders: without their JS they must still show slide 1, and a slider whose
+    # slides were JS-generated must not leave a tall empty band.
+    fix_static_sliders(soup, report)
     # DETERMINISTIC page header (runs WITH OR WITHOUT the AI key): make the site's real top nav -
     # even a bare <div>/<center> full of links with no nav class - the page <header>. Old exports
     # whose menu is just a link-heavy div were previously missed entirely; the AI pass below only
@@ -4537,6 +4905,10 @@ def clean_html_file(
     # in dry-run (no LLM spend on a preview) and whenever no ANTHROPIC_API_KEY is configured.
     if not dry_run:
         apply_semantic_tags(soup, report)
+    # Deterministic safety net over the AI pass (rule: AI may only IMPROVE, never break the
+    # structure). Demotes any nav/header/footer that swallowed the page's landmarks - that
+    # otherwise hides every section from the menu-anchor step.
+    repair_landmark_nesting(soup, report)
     # Fix the heading outline so levels never skip (h2 then h3, never h4). Deterministic - runs
     # with or without the AI pass, after tag-semantics so it sees the final structure.
     normalize_heading_levels(soup, report)

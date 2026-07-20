@@ -26,7 +26,8 @@ from urllib.parse import urljoin, urlsplit, unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import clean_wayback_site as cw  # noqa: E402
+import clean_wayback_site as cw
+from clean_wayback_site import safe_urlsplit, safe_urljoin  # noqa: E402
 import image_providers  # noqa: E402
 
 _CSS_URL_RE = re.compile(r"url\(\s*['\"]?([^'\")]+?)['\"]?\s*\)", re.I)
@@ -47,7 +48,7 @@ def _original_url(archive_url):
 
 
 def _sanitize_name(url):
-    path = urlsplit(cw.unwayback(url)).path
+    path = safe_urlsplit(cw.unwayback(url)).path
     name = unquote(Path(path).name) or "asset"
     name = re.sub(r"[^\w.\-]+", "_", name).strip("._") or "asset"
     # Cap the length. Blogspot/Google asset names are 100+ char hashes; combined with a deep
@@ -194,7 +195,7 @@ def _fetch_css_assets(files_dir, css_items, url_to_local, used, log=None):
             ref = (m.group(1) or "").strip()
             if not ref or ref.startswith(("data:", "#", "http://", "https://", "//")):
                 continue
-            abs_url = urljoin(css_url, ref)
+            abs_url = safe_urljoin(css_url, ref)
             refs.append((ref, abs_url))
             if abs_url not in url_to_local:
                 todo[abs_url] = None
