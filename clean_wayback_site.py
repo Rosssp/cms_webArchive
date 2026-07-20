@@ -608,6 +608,7 @@ def to_relative(url, site_domain):
 
 class Report:
     def __init__(self):
+        self.audit_warnings = []
         self.removed_scripts = []
         self.ambiguous_scripts_dropped = []
         self.removed_links_css = []
@@ -678,6 +679,14 @@ class Report:
 
     def render(self):
         lines = ["=== cleanup report ===", ""]
+        # Losses vs the archive go FIRST - they are the only findings that mean "this clean is
+        # bad", and burying them under a thousand "removed 40 scripts" lines is how they got
+        # missed before.
+        if self.audit_warnings:
+            lines.append("!!! СВЕРКА С АРХИВОМ — ЧТО ПОТЕРЯЛОСЬ:")
+            for w in self.audit_warnings:
+                lines.append(f"  !!! {w}")
+            lines.append("")
         lines.append(f"scripts removed: {len(self.removed_scripts)}")
         for s in self.removed_scripts[:50]:
             lines.append(f"  - {s}")
@@ -4538,7 +4547,57 @@ _SEM_NAVBAR_RE = re.compile(
 
 
 def _sem_cls(el):
-    return " ".join(el.get("class", [])) if hasattr(el, "get") else ""
+    """Class AND id together - every semantic check must see both.
+
+    Old sites mark structure with ids, not classes: `<div id="top">`, `<div id="footer">`,
+    `<div id="navigation">`. Reading only `class` made those invisible, so a site whose real footer
+    was `<div id="footer">` shipped with no footer at all, and its top bar was never recognised as
+    the header. site_edit already matched on id; the cleaner did not, and the two disagreeing about
+    the same page is what produced half of today's landmark bugs."""
+    if not hasattr(el, "get"):
+        return ""
+    return (" ".join(el.get("class", []) or []) + " " + (el.get("id") or "")).strip()
+
+
+def can_be_header(el, root=None):
+    """THE single answer to "may this element become the page <header>?".
+
+    This check used to live in four places with four different signal sets - one read only the
+    class, another class+id, a third took the first <nav> in the document, a fourth required an
+    href. They disagreed about the same page, so a rule fixed in one path left the others open: the
+    CTA button pair "Get In Touch / Connect" was rejected by the deterministic path and then walked
+    straight in through the model's plan, twice. One function, used by every path, is the only way
+    that class of bug stops coming back."""
+    if getattr(el, "name", None) is None:
+        return False
+    ident = _sem_cls(el)
+    if _SEM_HERO_RE.search(ident) or _CTA_CLASS_RE.search(ident):
+        return False                      # a hero band or a CTA button pair is content
+    if _MOBILE_PANEL_RE.search(ident):
+        return False                      # an off-canvas drawer is not the page header
+    if el.find_parent(lambda p: p is not el and _SEM_HERO_RE.search(_sem_cls(p))) is not None:
+        return False                      # sitting inside a hero makes it part of the hero
+    if el.name in ("main", "body", "html", "footer"):
+        return False
+    if _too_big_for_header(el, root):
+        return False                      # a header is a bar, not a third of the page
+    links = [a for a in el.find_all("a") if a.get_text(strip=True)]
+    if len(links) < 2:
+        return False                      # a header carries navigation
+    return True
+
+
+def _too_big_for_header(el, root=None):
+    """True when a block is too much of the page to be its header bar.
+
+    The footer has had a 40% cap for a while; the header never got one, so a whole left-hand column
+    (menu + a "Mayor's Corner" content block) could be promoted to <header> - and everything inside
+    a header stops counting as content, so those sections vanish from the menu. A header is a bar."""
+    body = (root.find_parent("body") if root is not None else None) or el.find_parent("body")
+    if body is None:
+        return False
+    total = len(body.get_text(" ", strip=True)) or 1
+    return len(el.get_text(" ", strip=True)) > total * 0.4
 
 
 def _looks_like_nav_block(el):
@@ -4547,16 +4606,51 @@ def _looks_like_nav_block(el):
     menu bar (lots of short links, little else) from a hero band (a couple of CTA buttons + big
     heading text), so old exports whose nav is just `<div>`/`<center>` full of links still get a
     proper <header> instead of being missed."""
-    if getattr(el, "name", None) not in ("div", "ul", "center", "nav", "table"):
+    if getattr(el, "name", None) not in ("div", "ul", "center", "nav", "table", "td", "tr", "p", "section"):
         return False
     links = [a for a in el.find_all("a") if a.get_text(strip=True)]
     if len(links) < 3:
         return False
-    if el.find(_SEM_HEADINGS):
-        return False  # a nav bar carries no <h1..h3> of its own - that's content
     link_text = sum(len(a.get_text(" ", strip=True)) for a in links)
     total = len(el.get_text(" ", strip=True)) or 1
-    return link_text / total > 0.55  # predominantly links -> it's the menu
+    ratio = link_text / total
+    heading = el.find(_SEM_HEADINGS)
+    if heading is not None:
+        # A heading used to veto the block outright, on the logic that a nav bar has none. But
+        # menus do carry small labels - sylhetcitycorporation's real menu (26 links, 81% of its
+        # text) holds a "Menu" caption, so it was rejected and an 8-link services list eight levels
+        # deeper became the header instead. Veto only when the block is not overwhelmingly links,
+        # or when the heading is long enough to be actual content rather than a caption.
+        if ratio < 0.75 or len(heading.get_text(" ", strip=True)) > 30:
+            return False
+    return ratio > 0.55  # predominantly links -> it's the menu
+
+
+# A class like page-header / site-header / masthead names the header bar outright. Themes use it
+# constantly and it carries no nav/menu token, so the navbar regex alone missed it (bikenfoot's
+# div.page-header held the whole 14-link menu and was never recognised).
+_SEM_HEADER_CLASS_RE = re.compile(r"(?:^|[\s_-])(?:(?:page|site|main|top|global|primary)[\s_-]?)?"
+                                  r"(?:header|masthead|topbar|top[\s_-]?nav)\d*(?:[\s_-]|$)", re.I)
+
+
+_CTA_CLASS_RE = re.compile(r"(?:^|[\s_-])(?:cta|call-to-action|buttons?|btns?|actions?)(?:[\s_-]|$)", re.I)
+
+
+def _is_header_like(el):
+    """The site's header BAR: named as a header by its class (or a navbar/nav) and actually
+    carrying navigation. The link requirement is what keeps a decorative `.page-header` title
+    band - a heading with no menu in it - from being mistaken for the site header."""
+    if getattr(el, "name", None) is None:
+        return False
+    cls = _sem_cls(el)
+    if _SEM_HERO_RE.search(cls) or _CTA_CLASS_RE.search(cls):
+        return False  # a hero band or a CTA button pair is content, never the site header
+    if el.find_parent(lambda p: p is not el and _SEM_HERO_RE.search(_sem_cls(p))) is not None:
+        return False  # sitting inside a hero makes it part of the hero
+    named = bool(_SEM_HEADER_CLASS_RE.search(cls) or _SEM_NAVBAR_RE.search(cls))
+    if not named and el.name != "nav" and el.find("nav") is None:
+        return False
+    return len([a for a in el.find_all("a") if a.get_text(strip=True)]) >= 2
 
 
 def _promote_header(soup, root):
@@ -4582,9 +4676,49 @@ def _promote_header(soup, root):
                 if getattr(c, "name", None) not in (None, "script", "style", "link", "meta", "br", "noscript")]
         if len(kids) == 1 and kids[0].name in _WRAP:
             root = kids[0]
-        else:
-            break
+            continue
+        # The page wrapper often is NOT an only child: modern themes park an off-canvas mobile
+        # menu and a dim overlay next to it (bikenfoot: div.site + h-offcanvas-panel + overlay).
+        # Requiring a single child meant we never descended, and the real nav five levels down
+        # was never even looked at. Descend into the one child that carries essentially the whole
+        # page, as long as its siblings are comparatively tiny.
+        if 1 < len(kids) <= 5:
+            # If a sibling already IS the header bar, we are at the right level - descending into
+            # the (much heavier) content block would step straight PAST it. bikenfoot's wrapper
+            # holds skip-link + page-header + page-content + page-footer, and page-content alone
+            # outweighed the rest 3:1, so the header sitting right there was skipped every time.
+            if any(_is_header_like(k) for k in kids):
+                break
+            weight = lambda k: len(k.get_text(" ", strip=True)) + 40 * len(k.find_all("a"))
+            ranked = sorted(((weight(k), k) for k in kids), key=lambda x: -x[0])
+            biggest, others = ranked[0], sum(w for w, _ in ranked[1:])
+            # Never descend INTO the menu itself: links weigh heavily, so a nav bar easily outweighs
+            # the article next to it, and stepping inside it leaves only <a> tags to scan - the nav
+            # is then invisible to both the loop below and the deep fallback.
+            if (biggest[1].name in _WRAP and biggest[0] >= 3 * max(others, 1)
+                    and not _looks_like_nav_block(biggest[1])
+                    and not _SEM_NAVBAR_RE.search(_sem_cls(biggest[1]))):
+                root = biggest[1]
+                continue
+        break
     children = [c for c in root.find_all(recursive=False) if getattr(c, "name", None)]
+    # A block the model already labelled as the header wins outright - that label is a judgement
+    # about meaning, which is exactly what the scan below can only approximate.
+    # The model sometimes labels two blocks "header" (a leftover empty wrapper plus the real bar),
+    # so take the one that actually carries navigation - sanjhapunjab ended up with an EMPTY
+    # <header> and its real 40-link menu left as a plain <div>.
+    planned_headers = [c for c in children if _role_of(c) == "header"]
+    planned_headers.sort(key=lambda c: -len([a for a in c.find_all("a") if a.get_text(strip=True)]))
+    for ch in planned_headers[:1]:
+        if can_be_header(ch, root):
+            old_name = ch.name
+            ch.name = "header"
+            if ch.find("nav") is None:
+                for sub in ch.find_all(["div", "ul"], recursive=True):
+                    if len([a for a in sub.find_all("a") if a.get_text(strip=True)]) >= 2:
+                        sub.name = "nav"
+                        break
+            return old_name
     for ch in children[:6]:
         cls = _sem_cls(ch)
         if _SEM_HERO_RE.search(cls):
@@ -4594,8 +4728,9 @@ def _promote_header(soup, root):
         # Only a link-dominated block (nav tag / navbar class / contains <nav> / _looks_like_nav_block)
         # is taken as the header; ordinary content blocks are skipped, not treated as a stop signal.
         is_nav = (ch.name == "nav" or bool(_SEM_NAVBAR_RE.search(cls))
-                  or ch.find("nav") is not None or _looks_like_nav_block(ch))
-        if not is_nav:
+                  or ch.find("nav") is not None or _looks_like_nav_block(ch)
+                  or _is_header_like(ch))
+        if not is_nav or not can_be_header(ch, root):
             continue
         if ch.name == "nav":
             # a bare top <nav> -> wrap it (plus an immediately-preceding logo-only sibling) in
@@ -4618,6 +4753,115 @@ def _promote_header(soup, root):
                     sub.name = "nav"
                     break
         return old
+
+    # Nothing nav-like among the top-level blocks. On old table/<center> layouts the menu is buried
+    # several wrappers deep and carries NO class at all (sylhetcitycorporation: a bare <div> with 27
+    # links at depth 4-8), so the scan above can't reach it and the page shipped with no <header>.
+    # Fall back to the SHALLOWEST link-dominated block anywhere on the page - shallowest because the
+    # menu sits near the top of the tree, while link lists deep inside content do not.
+    # Rank by LINK COUNT first, depth only as a tie-break: the site menu is the richest link list
+    # on the page. Going by depth alone picked whichever small link group happened to sit highest -
+    # on sylhetcitycorporation that was a 3-link sub-list instead of the real 27-link menu.
+    best = None
+    for el in root.find_all(["nav", "div", "ul", "center", "table", "td", "tr", "p", "section"]):
+        if el.find_parent("footer") is not None or el.find_parent("header") is not None:
+            continue
+        if not _looks_like_nav_block(el) or not can_be_header(el, root):
+            continue
+        links = len([a for a in el.find_all("a") if a.get_text(strip=True)])
+        depth = len(list(el.parents))
+        if best is None or (-links, depth) < (-best[0], best[1]):
+            best = (links, depth, el)
+    if best is not None:
+        ch = best[2]
+        header = soup.new_tag("header")
+        ch.insert_before(header)
+        header.append(ch.extract())
+        if header.find("nav") is None:
+            ch.name = "nav" if ch.name in ("div", "ul", "center") else ch.name
+        return "deep-nav"
+    return None
+
+
+_SEM_FOOTER_CLASS_RE = re.compile(r"(?:^|[\s_-])(?:(?:page|site|main|global|bottom)[\s_-]?)?"
+                                  r"(?:footer|colophon|bottom[\s_-]?bar)\d*(?:[\s_-]|$)", re.I)
+_COPYRIGHT_RE = re.compile(r"©|&copy;|copyright|all rights reserved", re.I)
+# Drawers, burger panels and dim overlays sit last in the body and often end with a copyright line,
+# so without this they get mistaken for the page footer.
+_MOBILE_PANEL_RE = re.compile(r"offcanvas|off-canvas|offscreen|drawer|burger|hamburger|mobile-menu|"
+                              r"overlay|modal|popup|sidenav|side-nav", re.I)
+
+
+def _promote_footer(soup, root):
+    """Deterministically mark the page footer - the counterpart of _promote_header, which for a
+    long time had no equivalent: only the AI pass could ever produce a <footer>, so WITHOUT a key a
+    site whose footer bar is a plain `div.page-footer` (bikenfoot, sylhet) shipped with none at all
+    and the header/main/footer guarantee was only two-thirds true.
+
+    Two signals, both checked on the LAST few top-level blocks only, so nothing mid-page is grabbed:
+    a footer-ish class, or a closing block that carries a copyright notice."""
+    if root.find("footer") is not None:
+        return None
+
+    # Search the whole subtree, not just direct children: on an old <center>/<table> layout the
+    # labelled footer sits several wrappers down, and looking only one level deep found nothing
+    # (sylhetcitycorporation shipped with no footer although the model had labelled one).
+    body_all = root.find_parent("body") or root
+    body_len = len(body_all.get_text(" ", strip=True)) or 1
+    for ch in root.find_all(True):
+        if _role_of(ch) != "footer":
+            continue
+        txt = ch.get_text(" ", strip=True)
+        if not txt:
+            continue
+        # A footer is a CLOSING BAR, never the page. The model labelled a block holding almost the
+        # whole of sylhetcitycorporation as "footer"; applying that verbatim turned the entire site
+        # into a <footer> and left <main> with nothing. Size is the check the label cannot give us.
+        if len(txt) > body_len * 0.4:
+            continue
+        old_name = ch.name
+        ch.name = "footer"
+        return old_name
+
+    def _off_limits(el):
+        # An off-canvas drawer / mobile menu / overlay is NOT the footer, even though it sits last
+        # in the body and often ends with a copyright line. bikenfoot's mobile panel was grabbed as
+        # the footer while the real div.page-footer, nested inside the page wrapper, was ignored.
+        if _SEM_HERO_RE.search(_sem_cls(el)) or el.name in ("header", "main", "nav"):
+            return True
+        for anc in [el, *el.parents]:
+            if getattr(anc, "name", None) is None:
+                break
+            if _MOBILE_PANEL_RE.search(_sem_cls(anc)):
+                return True
+            if anc.name in ("header", "nav"):
+                return True
+        return False
+
+    # Class-based, searched over the WHOLE subtree (not just direct children): the footer bar is
+    # usually nested inside the page wrapper, exactly like the header is.
+    cands = [el for el in root.find_all(["div", "section", "center", "table"])
+             if _SEM_FOOTER_CLASS_RE.search(_sem_cls(el)) and not _off_limits(el)]
+    if cands:
+        outer = [c for c in cands if not any(c is not o and c in o.descendants for o in cands)]
+        ch = (outer or cands)[-1]
+        old = ch.name
+        ch.name = "footer"
+        return old
+
+    children = [c for c in root.find_all(recursive=False)
+                if getattr(c, "name", None) not in (None, "script", "style", "link", "meta", "noscript")]
+    tail = children[-4:]
+    # No footer class anywhere: take the closing block that states a copyright, as long as it is a
+    # small closing bar and not a whole content column that happens to end with one.
+    for ch in reversed(tail):
+        if _off_limits(ch):
+            continue
+        text = ch.get_text(" ", strip=True)
+        if _COPYRIGHT_RE.search(text) and len(text) <= 600 and ch.find(("h1", "h2")) is None:
+            old = ch.name
+            ch.name = "footer"
+            return old
     return None
 
 
@@ -4675,6 +4919,76 @@ def apply_semantic_meta(soup, site_domain, report):
 _HEADING_RE = re.compile(r"^h[1-6]$")
 
 
+def drop_empty_headings(soup, report):
+    """Remove headings that carry nothing. An `<h1></h1>` left behind by a stripped widget is an
+    invisible element that still counts as a heading: sanjhapunjab shipped three <h1>, one of them
+    empty, which is what made its outline look broken. A heading holding only an image stays - that
+    is a logo heading, real content."""
+    dropped = demoted = 0
+    for h in soup.find_all(_HEADING_RE):
+        if h.get_text(strip=True):
+            continue
+        if h.find(["img", "svg", "picture", "video"]) is not None:
+            # A heading holding ONLY a logo image is a logo, not a heading - themes wrap the site
+            # logo in <h1> and that made sanjhapunjab ship three <h1> on one page. Keep the element
+            # and its classes (so the site's CSS still styles the logo) but stop it counting as a
+            # heading, which is what breaks the h1->h2->h3 outline.
+            h.name = "div"
+            demoted += 1
+            continue
+        h.decompose()
+        dropped += 1
+    if dropped or demoted:
+        report.headings_normalized.append(
+            f"пустых заголовков удалено: {dropped}, лого-заголовков разжаловано в div: {demoted}")
+    return dropped + demoted
+
+
+def strip_dead_css_urls(html_path, report):
+    """Drop url(...) references from local CSS when the file simply isn't there.
+
+    Recovery does its best, but whatever it can't fetch stays in the stylesheet as a live request
+    to a file that does not exist - the browser logs ERR_FILE_NOT_FOUND for every one of them
+    (sanjhapunjab: dropdown.css asking for a bg-menu.jpg that was never archived). A background
+    that cannot load is not worth a console error, so the declaration goes."""
+    if html_path is None:
+        return 0
+    removed = 0
+    for css in html_path.parent.rglob("*.css"):
+        try:
+            text = css.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        out, changed = text, False
+        for m in re.finditer(r"url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", text, re.I):
+            ref = m.group(1).strip()
+            if not ref or ref.startswith(("data:", "http://", "https://", "//", "#")):
+                continue
+            target = (css.parent / ref.split("?")[0].split("#")[0]).resolve()
+            if target.exists():
+                continue
+            # kill the whole declaration this url() belongs to, not just the url token, so no
+            # `background-image:;` stub is left behind
+            start = out.rfind(";", 0, out.find(m.group(0))) + 1 if m.group(0) in out else -1
+            if start <= 0:
+                out = out.replace(m.group(0), "none")
+            else:
+                end = out.find(";", start)
+                decl = out[start:end if end != -1 else len(out)]
+                if "url(" in decl:
+                    out = out[:start] + (out[end:] if end != -1 else "")
+            changed = True
+            removed += 1
+        if changed:
+            try:
+                css.write_text(out, encoding="utf-8")
+            except OSError:
+                pass
+    if removed:
+        report.removed_links_css.append(f"мёртвых url() в CSS вычищено: {removed}")
+    return removed
+
+
 def normalize_heading_levels(soup, report):
     """Make the document's heading outline have NO skipped levels: after an h2 the next-deeper
     heading is h3, never h4. Deterministic, no AI, changes only the tag LEVEL (never the text).
@@ -4687,18 +5001,648 @@ def normalize_heading_levels(soup, report):
     headings = body.find_all(_HEADING_RE)
     if not headings:
         return
-    baseline = int(headings[0].name[1])  # keep the first heading's level as the outline's top
+    # The outline must start at <h1> and step down one level at a time: h1 -> h2 -> h3. Keeping the
+    # first heading's ORIGINAL level (the old behaviour) meant a page whose top heading was an <h3>
+    # shipped with no <h1> at all - every site in the set had none. Exactly one <h1>: the first
+    # heading is the page title; everything below it starts at <h2>, so a listing page of thirty
+    # article titles does not become thirty <h1>.
     stack = []
-    for h in headings:
+    for idx, h in enumerate(headings):
         lvl = int(h.name[1])
         while stack and stack[-1] >= lvl:
             stack.pop()
         stack.append(lvl)
-        out = min(6, baseline + len(stack) - 1)
+        out = 1 if idx == 0 else min(6, max(2, len(stack)))
         new_name = f"h{out}"
         if h.name != new_name:
             report.headings_normalized.append(f"{h.name} -> {new_name}")
             h.name = new_name
+
+
+def _role_candidates(soup, limit=12):
+    """Blocks worth considering for the header/footer roles, with just enough signal for a model
+    to judge them: class, link count and a text sample."""
+    body = soup.find("body")
+    if body is None:
+        return []
+    out, seen = [], set()
+    pool = [el for el in body.find_all(["header", "footer", "nav", "div", "section", "center"])
+            if el.find_parent(["header", "footer"]) is None]
+    for el in pool:
+        links = len([a for a in el.find_all("a") if a.get_text(strip=True)])
+        text = el.get_text(" ", strip=True)
+        if links < 2 and not _COPYRIGHT_RE.search(text[:400]):
+            continue
+        if len(text) > 4000:
+            continue  # a whole page column, not a bar
+        key = (text[:80], links)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"el": el, "tag": el.name, "cls": _sem_cls(el), "links": links, "text": text})
+    out.sort(key=lambda c: len(c["text"]))
+    return out[:limit]
+
+
+def verify_landmark_roles(soup, report):
+    """Let the model check WHICH block got the header/footer role - the one question rules keep
+    getting wrong (an off-canvas drawer ending in a copyright line reads exactly like a footer;
+    a sidebar of 'Archives / Select month' links reads exactly like a nav).
+
+    Strictly a corrective layer on top of the deterministic pass: it can only MOVE a role to a
+    better block or drop an obviously wrong one. Whether the page ends up with a header at all
+    stays a deterministic guarantee (site_edit rebuilds one if this drops it), so behaviour with
+    no API key is unchanged."""
+    try:
+        sys.path.insert(0, str(Path(__file__).parent / "site_studio"))
+        import semantics
+    except Exception:  # noqa: BLE001
+        return
+    if not semantics.available():
+        return
+    cands = _role_candidates(soup)
+    if not cands:
+        return
+    cur_hdr, cur_ftr = soup.find("header"), soup.find("footer")
+    picks = {"header": None, "footer": None}
+    payload = []
+    for i, c in enumerate(cands):
+        if c["el"] is cur_hdr:
+            picks["header"] = i
+        if c["el"] is cur_ftr:
+            picks["footer"] = i
+        payload.append({"i": i, "tag": c["tag"], "cls": c["cls"],
+                        "links": c["links"], "text": c["text"][:150]})
+    try:
+        verdict = semantics.verify_landmarks(picks, payload)
+    except Exception:  # noqa: BLE001 - the model is an improvement, never a dependency
+        return
+    if not verdict:
+        return
+    # NOT "main": candidates here are capped at ~4000 chars so the model can read them, which means
+    # the only <main> this pass could ever pick is a small one - it kept overwriting a correctly
+    # assembled <main> with a 3% scrap. The content region comes from assemble_main_from_plan.
+    for role, cur in (("header", cur_hdr), ("footer", cur_ftr)):
+        want = verdict.get(role)
+        chosen = cands[want]["el"] if want is not None and 0 <= want < len(cands) else None
+        if chosen is cur:
+            continue
+        # MOVE only, never merely drop. The model returning null for a role it can't identify must
+        # not cost the page a landmark it already had - danvanhaiphong went from header/main/footer
+        # to no footer that way, because nothing downstream rebuilds a footer.
+        if chosen is None:
+            continue
+        if chosen.name not in ("div", "section", "center", "nav"):
+            continue
+        # Same plausibility bar the deterministic paths use. Without it this pass could install a
+        # 2-link breadcrumb as <header> while demoting the real 40-link menu, or turn a mid-page
+        # block into <footer> - and everything inside a header/footer stops counting as content.
+        chosen_links = len([a for a in chosen.find_all("a") if a.get_text(strip=True)])
+        chosen_text = chosen.get_text(" ", strip=True)
+        body_el = soup.find("body")
+        body_len = len(body_el.get_text(" ", strip=True)) if body_el else 1
+        if cur is not None and (cur is chosen or chosen in cur.parents or cur in chosen.descendants):
+            continue  # never hand the role to an ancestor/descendant of the current holder
+        if role == "header":
+            cur_links = len([a for a in cur.find_all("a") if a.get_text(strip=True)]) if cur is not None else 0
+            if not can_be_header(chosen) or chosen_links < cur_links:
+                continue
+        if role == "footer":
+            if not chosen_text or len(chosen_text) > max(body_len * 0.4, 1):
+                continue
+            if _MOBILE_PANEL_RE.search(_sem_cls(chosen)):
+                continue
+        if cur is not None and cur.name == role:
+            cur.name = "div"
+            report.semantic_tags_applied.append(f"агент: снял ошибочный <{role}>")
+        chosen.name = role
+        report.semantic_tags_applied.append(f'агент: <{role}> -> class="{_clip_cls(chosen)}"')
+
+
+def _clip_cls(el):
+    return (" ".join(el.get("class") or []) or el.name)[:40]
+
+
+CONTRACT_RULES = """Контракт на результат очистки (проверяется на КАЖДОЙ странице):
+  1. ровно один <header>, один <main>, один <footer>
+  2. внутри <main> нет header/footer/nav-лендмарков
+  3. <main> держит >=25% текста страницы
+  4. ровно один <h1>, уровни заголовков без скачков
+  5. меню не выпотрошено (если в исходнике было >=3 пункта — осталось >=2)
+  6. не осталось вебархивных ссылок и абсолютного <base href>
+  7. служебные метки разметки не утекли в HTML"""
+
+
+def verify_output_contract(soup, report, original_html=None):
+    """Проверить готовую страницу по списку правил, одинаковому для ВСЕХ сайтов.
+
+    Почему это важнее регресс-набора: тесты покрывают те сайты, что у меня есть, а пользователь
+    берёт новые домены пачками. Правило, зашитое в скрипт, ловит нарушение на архиве, которого я
+    никогда не видел, - и делает это в момент очистки, а не через неделю жалобой «опять криво».
+
+    Каждый пункт здесь стоит потому, что уже случался: два <header> (второй появлялся посреди
+    статьи), <main> с 3% текста, меню, выпотрошенное до одного пункта, страница без единого <h1>,
+    служебные data-wb-role в готовом HTML."""
+    bad = []
+    body = soup.find("body")
+    if body is None:
+        # No <body> at all: a <frameset> document, or a capture that saved only the shell. Returning
+        # an empty list here declared such a page FULLY COMPLIANT while it had zero landmarks and
+        # zero content - the contract's worst possible answer.
+        if soup.find("frameset") is not None:
+            bad.append("<frameset>: контент в отдельных фреймах, страница не собрана — нужен ручной разбор")
+        else:
+            bad.append("нет <body> — страница пустая или это не HTML-документ")
+        report.audit_warnings = list(getattr(report, "audit_warnings", [])) + [
+            "НАРУШЕН КОНТРАКТ: " + b for b in bad]
+        return bad
+    total = len(body.get_text(" ", strip=True)) or 1
+
+    # Count only PAGE-LEVEL landmarks. WordPress themes put <header class="entry-header"> and
+    # <footer class="entry-footer"> inside every <article>; counting those made the contract shout
+    # on every blog capture. A contract that cries wolf gets ignored, and then it hides the real
+    # violations - which is worse than having no contract at all.
+    def _page_level(tag):
+        return [el for el in soup.find_all(tag)
+                if el.find_parent(["article", "aside"]) is None
+                and el.find_parent(tag) is None]
+
+    hdrs, mains, ftrs = _page_level("header"), _page_level("main"), _page_level("footer")
+    if len(hdrs) != 1:
+        bad.append(f"<header> должен быть ровно один, найдено {len(hdrs)}")
+    if len(mains) != 1:
+        bad.append(f"<main> должен быть ровно один, найдено {len(mains)}")
+    if len(ftrs) != 1:
+        bad.append(f"<footer> должен быть ровно один, найдено {len(ftrs)}")
+
+    if mains:
+        m = mains[0]
+        inner = m.find(["header", "footer"])
+        if inner is not None:
+            bad.append(f"<{inner.name}> лежит ВНУТРИ <main> (контент станет невидим для меню)")
+        share = len(m.get_text(" ", strip=True)) / total
+        if share < 0.25:
+            bad.append(f"<main> держит всего {share:.0%} текста — выбран не тот блок")
+        # A page whose whole body is a few words passes any RATIO check trivially: 25% of nothing is
+        # still nothing. An iframe shell or a capture that lost its content looks compliant without
+        # an absolute floor.
+        if total < 200 and soup.find(["iframe", "frame", "frameset"]) is not None:
+            bad.append("на странице почти нет текста, контент остался во фрейме/iframe")
+
+    lv = [int(h.name[1]) for h in soup.find_all(_HEADING_RE)]
+    if lv:
+        if lv.count(1) != 1:
+            bad.append(f"<h1> должен быть ровно один, найдено {lv.count(1)}")
+        skips = [(a, b) for a, b in zip(lv, lv[1:]) if b > a + 1]
+        if skips:
+            bad.append(f"скачки уровней заголовков: {skips[:3]}")
+
+    if hdrs:
+        menu_now = len([a for a in hdrs[0].find_all("a") if a.get_text(strip=True)])
+        if original_html:
+            try:
+                before = BeautifulSoup(original_html, PARSER)
+                menu_was = 0
+                for el in before.find_all(["nav", "ul", "div"]):
+                    ident = " ".join(el.get("class") or []) + " " + (el.get("id") or "")
+                    if re.search(r"nav|menu", ident, re.I) and el.find_parent("footer") is None:
+                        menu_was = max(menu_was, len([a for a in el.find_all("a") if a.get_text(strip=True)]))
+                if menu_was >= 3 and menu_now < 2:
+                    bad.append(f"меню выпотрошено: было {menu_was} пунктов, осталось {menu_now}")
+            except Exception:  # noqa: BLE001
+                pass
+
+    html_now = str(soup)
+    if re.search(r"/web/\d{8,}", html_now):
+        bad.append("остались вебархивные ссылки /web/<timestamp>/")
+    if re.search(r"<base[^>]*href=[\"']\s*(?:https?:)?//", html_now, re.I):
+        bad.append("остался <base href> с абсолютным адресом (убьёт все стили)")
+    if _ROLE_ATTR in html_now:
+        bad.append(f"служебные метки {_ROLE_ATTR} утекли в готовый HTML")
+    # NB: when this runs inside clean_html_file the marks have already been stripped from the SAME
+    # soup object, so the check above can only ever fire when the contract is handed a document
+    # re-read from disk - which is exactly how site_edit calls it at the end of auto_link_menu.
+
+    if bad:
+        report.audit_warnings = list(getattr(report, "audit_warnings", [])) + [
+            "НАРУШЕН КОНТРАКТ: " + b for b in bad]
+    return bad
+
+
+def repair_landmarks_in_main(soup, report):
+    """Lift a <header>/<footer> that ended up INSIDE <main> back out to page level.
+
+    Detecting this and shipping it anyway is pointless: everything inside a header/footer stops
+    counting as content for the menu logic, so those sections silently disappear from the menu and
+    their links get pruned. It happens whenever the real menu sits nested inside a content block -
+    <main> is then wrapped around it (tuonggohungthinh: <header id="wapper_menu"> inside <main>).
+
+    A small bar is MOVED out (header before <main>, footer after it). A big one is not a bar at all,
+    so it is demoted back to <div> rather than dragged across the page."""
+    main = soup.find("main")
+    body = soup.find("body")
+    if main is None or body is None:
+        return 0
+    total = len(body.get_text(" ", strip=True)) or 1
+    fixed = 0
+    for tag in ("header", "footer"):
+        for el in list(main.find_all(tag)):
+            share = len(el.get_text(" ", strip=True)) / total
+            if share > 0.25:
+                el.name = "div"  # too big to be a bar - it was mislabelled, not misplaced
+                report.semantic_tags_applied.append(f"{tag} внутри main был слишком большим -> div")
+            elif soup.find(tag) is not el and soup.find(tag) is not None and soup.find(tag) is not el:
+                el.name = "div"  # a duplicate: the page already has this landmark elsewhere
+                report.semantic_tags_applied.append(f"дубль <{tag}> внутри main -> div")
+            else:
+                if tag == "header":
+                    main.insert_before(el.extract())
+                else:
+                    main.insert_after(el.extract())
+                report.semantic_tags_applied.append(f"<{tag}> вынесен из <main> на уровень страницы")
+            fixed += 1
+    return fixed
+
+
+def audit_against_original(original_html, soup, report, html_path=None):
+    """Compare the CLEANED page against the archive it came from and shout when the cleanup lost
+    something. This is the regression net for the whole tool.
+
+    Every structural bug this project has hit was of one shape - the output silently lost something
+    the input had - and none of them showed up in a per-phase report saying "ok":
+      * the site's font replaced by a preset, or its @font-face rules deleted;
+      * a menu that went from 8 items to 1 because nothing could be anchored;
+      * <header>/<main>/<footer> missing entirely;
+      * images or headings disappearing with a failed asset recovery.
+    Checking input against output catches all of those at once, including bugs not yet imagined,
+    and needs no API key. Findings go to report.audit_warnings so a bad clean announces itself.
+    """
+    warn = []
+    try:
+        before = BeautifulSoup(original_html, PARSER)
+    except Exception:  # noqa: BLE001 - never let the audit itself break a clean
+        return warn
+
+    def _nav_links(s):
+        best = 0
+        for el in s.find_all(["nav", "ul", "div"]):
+            ident = " ".join(el.get("class") or []) + " " + (el.get("id") or "")
+            if not re.search(r"nav|menu", ident, re.I):
+                continue
+            if el.find_parent("footer") is not None:
+                continue
+            best = max(best, len([a for a in el.find_all("a") if a.get_text(strip=True)]))
+        return best
+
+    # 1) landmarks. Only <main> is final at this point: the header (and a generated one) is wired
+    # afterwards by site_edit.auto_link_menu, so demanding it here just cries wolf on every site
+    # whose header is generated - gigaworks reported "НЕТ <header>" while ending up with one.
+    main = soup.find("main")
+    if main is None:
+        warn.append("НЕТ <main> в результате")
+    else:
+        # A <main> holding a sliver of the page means the content region was mis-chosen, not that
+        # the page is short - sylhetcitycorporation shipped a <main> wrapping only its
+        # "Developed by" credit while the whole site sat outside it.
+        body_now = soup.find("body")
+        share = len(main.get_text(" ", strip=True)) / max(
+            len((body_now or soup).get_text(" ", strip=True)), 1)
+        if share < 0.25:
+            warn.append(f"<main> держит всего {share:.0%} текста — выбран не тот блок")
+
+    # 2) the menu must not be gutted
+    nb, na = _nav_links(before), _nav_links(soup)
+    if nb >= 3 and na < max(2, nb // 2):
+        warn.append(f"меню сжалось: было {nb} пунктов, стало {na}")
+
+    # 3) the site's own font must survive (the archive's font is the one we keep)
+    # A declaration is a STACK ("georgia, palatino, serif") - compare the individual families, or
+    # the whole stack reads as one exotic missing font and every page cries "пропали шрифты".
+    def fam(s):
+        out = set()
+        for m in FONT_FAMILY_RE.finditer(str(s)):
+            for part in m.group(1).split(","):
+                part = part.strip().strip("'\"").lower()
+                if part:
+                    out.add(part)
+        return out
+    lost = fam(before) - fam(soup)
+    # Generic keywords and the OS default stacks are not "the site's font" - losing `impact` or
+    # `palatino` says nothing, losing `Inter` says everything.
+    real_lost = {f for f in lost if f and not re.match(
+        r"^(inherit|initial|unset|serif|sans-serif|monospace|cursive|var\(|arial|helvetica|"
+        r"times|times new roman|georgia|verdana|tahoma|impact|palatino|courier|geneva|"
+        r"lucida|monaco|menlo|consolas|segoe|system-ui|-apple-system|blinkmacsystemfont)", f)}
+    if real_lost and html_path is not None:
+        css_text = ""
+        for p in html_path.parent.glob("*.css"):
+            try:
+                css_text += p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        still = {f for f in real_lost if f in css_text.lower()}
+        gone = real_lost - still
+        if gone:
+            warn.append(f"пропали шрифты сайта: {', '.join(sorted(gone)[:4])}")
+
+    # 4) content must not evaporate
+    hb, ha = len(before.find_all(_HEADING_RE)), len(soup.find_all(_HEADING_RE))
+    if hb >= 3 and ha < hb * 0.6:
+        warn.append(f"заголовков стало меньше: {hb} -> {ha}")
+    ib, ia = len(before.find_all("img")), len(soup.find_all("img"))
+    if ib >= 3 and ia < ib * 0.5:
+        warn.append(f"картинок стало меньше: {ib} -> {ia}")
+    tb = len(before.get_text(" ", strip=True))
+    ta = len(soup.get_text(" ", strip=True))
+    if tb > 500 and ta < tb * 0.6:
+        warn.append(f"текста стало меньше: {tb} -> {ta} символов")
+
+    if warn:
+        report.audit_warnings = warn
+    return warn
+
+
+_ROLE_ATTR = "data-wb-role"
+
+
+def _layout_root(body):
+    """The level whose children are the page's top-level blocks (past the single wrappers that old
+    and modern themes alike put around everything)."""
+    root = body
+    for _ in range(6):
+        kids = [c for c in root.find_all(recursive=False)
+                if getattr(c, "name", None) not in (None, "script", "style", "link", "meta", "br", "noscript")]
+        if len(kids) == 1 and kids[0].name in ("div", "center", "form", "section", "main", "table", "tbody"):
+            root = kids[0]
+            continue
+        # A page wrapper is often NOT an only child (off-canvas panel + overlay sit beside it).
+        # Without this, the model was handed "blocks" one of which was the entire page, and its
+        # labels were useless through no fault of its own.
+        if 2 <= len(kids) <= 6:
+            weight = lambda k: len(k.get_text(" ", strip=True)) + 40 * len(k.find_all("a"))
+            ranked = sorted(((weight(k), k) for k in kids), key=lambda x: -x[0])
+            biggest, others = ranked[0], sum(w for w, _ in ranked[1:])
+            if (biggest[1].name in ("div", "center", "form", "section", "main", "table", "tbody")
+                    and biggest[0] >= 3 * max(others, 1)
+                    and not _looks_like_nav_block(biggest[1])):
+                root = biggest[1]
+                continue
+        if len(kids) >= 2:
+            break
+        if not kids:
+            break
+        root = kids[0]
+    return root
+
+
+def plan_layout(soup, report):
+    """Ask the model what each top-level block IS, before anything is assembled, and stamp the
+    answer on the elements as data-wb-role.
+
+    Assembly used to guess ("everything after the header up to the footer is <main>") and every
+    unusual archive broke that guess in a new way - a comments block wrapped around the footer, a
+    logo inside an <h1>, a services list mistaken for the menu. Each repair broke the previous
+    site. Labels remove the guessing: header on top, content into <main>, footer at the bottom.
+    Silent no-op without an API key, so the deterministic path is unchanged."""
+    body = soup.find("body")
+    if body is None:
+        return {}
+    try:
+        sys.path.insert(0, str(Path(__file__).parent / "site_studio"))
+        import semantics
+    except Exception:  # noqa: BLE001
+        return {}
+    if not semantics.available():
+        return {}
+    root = _layout_root(body)
+    blocks = [c for c in root.find_all(recursive=False)
+              if getattr(c, "name", None) not in (None, "script", "style", "link", "meta", "br", "noscript")]
+    if len(blocks) < 2:
+        return {}
+    if len(blocks) > 40:
+        # A flat old-school body with 60 top-level nodes is exactly the page that needs labelling
+        # most; skipping it was backwards. Label the substantial blocks and leave the rest alone.
+        blocks = sorted(blocks, key=lambda b: -len(b.get_text(" ", strip=True)))[:40]
+        blocks.sort(key=lambda b: len(list(b.previous_elements)))
+    payload = []
+    for i, b in enumerate(blocks):
+        heading = b.find(_SEM_HEADINGS)
+        text = b.get_text(" ", strip=True)
+        payload.append({
+            "i": i, "tag": b.name, "cls": _sem_cls(b), "id": b.get("id") or "",
+            "links": len([a for a in b.find_all("a") if a.get_text(strip=True)]),
+            "chars": len(text), "pos": f"{i+1}/{len(blocks)}",
+            "heading": heading.get_text(" ", strip=True) if heading else "",
+            "text": text[:120],
+        })
+    try:
+        roles = semantics.label_blocks(payload)
+    except Exception:  # noqa: BLE001 - the model is an improvement, never a dependency
+        return {}
+    if not roles or len(roles) != len(blocks):
+        return {}
+    roles = validate_plan(blocks, roles, body)
+    if roles is None:
+        report.semantic_tags_applied.append(
+            "разметка агента отклонена проверкой — сборка идёт детерминированно")
+        return {}
+    plan = {}
+    for b, role in zip(blocks, roles):
+        b[_ROLE_ATTR] = role
+        plan[id(b)] = role
+    report.semantic_tags_applied.append(
+        "агент разметил блоки до сборки: " + ", ".join(f"{r}" for r in roles))
+    return plan
+
+
+def assemble_main_from_plan(soup, report):
+    """Build <main> from the labelled blocks, BEFORE anything else may invent one.
+
+    The older AI tag-pass can hand "main" to a single nested block; once that exists, the
+    plan-driven builder skipped itself ("main already present") and sanjhapunjab shipped a <main>
+    holding 3% of the page while 57% sat outside it. Deciding here, right after labelling, means
+    the landmark reflects the labels and nothing downstream has to guess."""
+    body = soup.find("body")
+    if body is None or soup.find("main") is not None:
+        return 0
+    root = _layout_root(body)
+    planned = [c for c in root.find_all(recursive=False)
+               if getattr(c, "name", None) and _role_of(c)]
+    wanted = [c for c in planned if _role_of(c) in ("hero", "content", "comments", "sidebar")]
+    if not wanted:
+        return 0
+    # Take a CONTIGUOUS run only. Extracting scattered blocks and appending them one after another
+    # physically moves later content above whatever sat between them - the page would render in a
+    # different order than the archive, which is the one thing this tool must never do.
+    first = planned.index(wanted[0])
+    run = []
+    for c in planned[first:]:
+        if _role_of(c) in ("hero", "content", "comments", "sidebar"):
+            run.append(c)
+        elif _role_of(c) == "ignore" and not c.get_text(" ", strip=True):
+            continue  # an empty spacer between content blocks doesn't break the run
+        else:
+            break
+    if not run:
+        return 0
+    body_len = len(body.get_text(" ", strip=True)) or 1
+    if sum(len(c.get_text(" ", strip=True)) for c in run) < body_len * 0.25:
+        return 0  # the run is a scrap - let the deterministic builder decide instead
+    main = soup.new_tag("main")
+    run[0].insert_before(main)
+    n = 0
+    for c in run:
+        main.append(c.extract())
+        n += 1
+    report.semantic_tags_applied.append(f"main собран по разметке агента: {n} блоков")
+    return n
+
+
+def validate_plan(blocks, roles, body):
+    """Sanity-check the model's labelling as a WHOLE before a single tag is applied.
+
+    Guarding one field at a time (header must have links, footer must have text, footer must not be
+    huge...) is endless, because each new archive breaks a different assumption. This checks the
+    plan the way a person would look at it: is there exactly one header and does it hold a menu, is
+    the footer a closing bar rather than the page, did anything with real content get thrown away,
+    is the answer degenerate. A plan that fails is DISCARDED whole - the deterministic path then
+    runs exactly as it does with no API key, which is a known-good outcome rather than a gamble.
+
+    Returns the (possibly corrected) roles, or None to discard the plan entirely.
+    """
+    if not roles or len(roles) != len(blocks):
+        return None
+    total = len(body.get_text(" ", strip=True)) or 1
+    size = [len(b.get_text(" ", strip=True)) for b in blocks]
+    links = [len([a for a in b.find_all("a") if a.get_text(strip=True)]) for b in blocks]
+    roles = list(roles)
+
+    # Degenerate answers: every block the same role, or nothing labelled as content at all.
+    if len(set(roles)) <= 1:
+        return None
+
+    # Nothing may be discarded while it holds real content - "ignore" on a quarter of the page is
+    # the model mis-reading a layout, not a decoration.
+    for i, r in enumerate(roles):
+        if r == "ignore" and size[i] > total * 0.25:
+            roles[i] = "content"
+
+    # A footer is a closing bar. If the labelled one carries most of the page, the label is wrong.
+    for i, r in enumerate(roles):
+        if r == "footer" and size[i] > total * 0.4:
+            roles[i] = "content"
+
+    # A header sits at the TOP of the page. Without this, a pair of CTA buttons in the middle of a
+    # hero band ("Get In Touch / Connect") satisfied "2+ links" and became gigaworks' <header>,
+    # inside <main>, while its real 6-item menu was lost.
+    for i, r in enumerate(roles):
+        if r == "header" and i > 2:
+            roles[i] = "content"
+
+    # Exactly one header, and it has to actually carry navigation.
+    heads = [i for i, r in enumerate(roles) if r == "header"]
+    if len(heads) > 1:
+        best = max(heads, key=lambda i: links[i])
+        for i in heads:
+            if i != best:
+                roles[i] = "ignore" if size[i] == 0 else "content"
+        heads = [best]
+    # A header is a bar, not a third of the page - the footer rule had this bound, the header
+    # didn't, so a huge block with two links could turn a third of the site into chrome.
+    if heads and size[heads[0]] > total * 0.4:
+        roles[heads[0]] = "content"
+        heads = []
+    if heads and not can_be_header(blocks[heads[0]], body):
+        roles[heads[0]] = "content" if size[heads[0]] else "ignore"
+
+    # At most one footer - keep the last, later blocks are more plausibly the closing bar.
+    feet = [i for i, r in enumerate(roles) if r == "footer"]
+    for i in feet[:-1]:
+        roles[i] = "content"
+
+    # Something must remain as the page content, otherwise <main> would be empty.
+    if not any(r in ("hero", "content", "comments", "sidebar") for r in roles):
+        return None
+    kept = sum(size[i] for i, r in enumerate(roles)
+               if r in ("hero", "content", "comments", "sidebar"))
+    if kept < total * 0.3:
+        return None  # the plan would strand most of the page outside <main>
+    return roles
+
+
+def _role_of(el):
+    return (el.get(_ROLE_ATTR) or "") if hasattr(el, "get") else ""
+
+
+def _strip_role_marks(soup):
+    for el in soup.find_all(attrs={_ROLE_ATTR: True}):
+        del el[_ROLE_ATTR]
+
+
+def _content_host(body, hdr=None, ftr=None):
+    """The single element that actually holds the page's content, for pages whose landmarks are
+    buried in old <center>/<table> scaffolding. Picked as the deepest element still carrying almost
+    all of the body text: going deeper than that would start cutting content away."""
+    best, body_len = None, len(body.get_text(" ", strip=True)) or 1
+    node = body
+    for _ in range(8):
+        nxt = None
+        for c in node.find_all(recursive=False):
+            if getattr(c, "name", None) in (None, "script", "style", "link", "meta", "br", "noscript"):
+                continue
+            if c is hdr or c is ftr or c.name in ("header", "footer", "main"):
+                continue
+            if len(c.get_text(" ", strip=True)) >= body_len * 0.7:
+                nxt = c
+                break
+        if nxt is None:
+            # A two-column page (content 65% / sidebar 35%) clears no 70% bar. Giving up here left
+            # the page with NO <main> at all, because the scrap one had already been removed.
+            if best is None:
+                cands = [c for c in node.find_all(recursive=False)
+                         if getattr(c, "name", None) not in (None, "script", "style", "link", "meta", "br", "noscript")
+                         and c is not hdr and c is not ftr
+                         and c.name not in ("header", "footer", "main")]
+                if cands:
+                    best = max(cands, key=lambda c: len(c.get_text(" ", strip=True)))
+            break
+        best, node = nxt, nxt
+    return best
+
+
+def _section_container(root, hdr=None, ftr=None):
+    """The element whose DIRECT children are the page's content blocks.
+
+    Sectioning used to look only at root's own children, but real themes bury the content two to
+    four wrappers deep (`.site > .page-content > .content > .style-189 > [sections]`), so almost
+    nothing qualified: sanjhapunjab had 36 headings and produced ONE section, bikenfoot 16 headings
+    and one. With no sections there is nothing for the header anchors to point at, which is what
+    made the menu-linking pass strip menus down to a single item.
+
+    Breadth-first, so the SHALLOWEST container holding 2+ heading-bearing blocks wins: page areas
+    sit high in the tree, while lists of cards/articles sit deeper - picking the deepest match would
+    turn every news card into a <section>."""
+    queue = [(root, 0)]
+    while queue:
+        el, depth = queue.pop(0)
+        if depth > 6:
+            continue
+        # Old sites put every content block in a <td>/<tr>/<center>; a div-only whitelist could not
+        # even traverse them, which is why table layouts produced zero sections and their menus were
+        # then stripped for having nothing to anchor to.
+        kids = [c for c in el.find_all(recursive=False)
+                if getattr(c, "name", None) in ("div", "section", "article", "td", "tr", "tbody",
+                                                "table", "center", "li", "ul", "main")]
+        good = [c for c in kids
+                if c is not hdr and c is not ftr
+                and not _SEM_HERO_RE.search(_sem_cls(c))
+                and c.find(_SEM_HEADINGS) is not None
+                and not (hdr is not None and hdr in c.descendants)
+                and not (ftr is not None and ftr in c.descendants)]
+        if len(good) >= 2:
+            return el
+        queue.extend((c, depth + 1) for c in kids)
+    return None
 
 
 def ensure_landmarks(soup, report):
@@ -4720,14 +5664,45 @@ def ensure_landmarks(soup, report):
             break
     hdr, ftr = soup.find("header"), soup.find("footer")
     renamed = 0
-    for c in [c for c in root.find_all(recursive=False) if getattr(c, "name", None)]:
+    sec_root = _section_container(root, hdr, ftr) or root
+    for c in [c for c in sec_root.find_all(recursive=False) if getattr(c, "name", None)]:
         if c is hdr or c is ftr or c.name != "div":
             continue
         if _SEM_HERO_RE.search(_sem_cls(c)) or c.find(_SEM_HEADINGS) is None:
             continue  # only a heading-bearing content block becomes a <section>
+        if hdr is not None and hdr in c.descendants:
+            continue
+        if ftr is not None and ftr in c.descendants:
+            continue
         c.name = "section"
         renamed += 1
     wrapped = 0
+    # PLAN-DRIVEN ASSEMBLY: when the model labelled the blocks, <main> is simply "the run of blocks
+    # that are page content" - no guessing about what sits between the header and the footer, which
+    # is the guess that kept breaking (a comments block wrapped around the footer, a credit line
+    # mistaken for the whole content region).
+    planned = [c for c in _layout_root(body).find_all(recursive=False)
+               if getattr(c, "name", None) and _role_of(c)]
+    if planned and soup.find("main") is None:
+        wanted = [c for c in planned if _role_of(c) in ("hero", "content", "comments", "sidebar")]
+        if wanted:
+            main = soup.new_tag("main")
+            wanted[0].insert_before(main)
+            for c in wanted:
+                main.append(c.extract())
+                wrapped += 1
+            body_len_f = len(body.get_text(" ", strip=True)) or 1
+            for c in planned:
+                if _role_of(c) != "footer" or c.name == "footer":
+                    continue
+                if soup.find("footer") is not None:
+                    break  # a footer already exists - a second one is never right
+                txt_f = c.get_text(" ", strip=True)
+                if not txt_f or len(txt_f) > body_len_f * 0.4:
+                    continue
+                c.name = "footer"
+            report.semantic_tags_applied.append(f"main собран по разметке агента: {wrapped} блоков")
+
     if soup.find("main") is None:
         # <main> must NOT depend on a <header> existing. It used to, and that quietly voided the
         # structural guarantee on every site whose header is generated later by header_gen inside
@@ -4736,24 +5711,79 @@ def ensure_landmarks(soup, report):
         # <main>). Wrap whatever sits between the header and the footer - or simply everything, when
         # the page has neither.
         kids = [c for c in root.find_all(recursive=False) if getattr(c, "name", None)]
-        start = kids.index(hdr) + 1 if hdr is not None and hdr in kids else 0
+        # <main> is a flow element - never build one inside a table, it would be hoisted out by the
+        # parser and wreck an old table layout.
+        if root.name in ("table", "tbody", "thead", "tfoot", "tr"):
+            kids = []
+        # The header is not always a direct child here (it can be promoted from a nav buried in a
+        # wrapper). Start after the LAST child that is - or contains - the header, so <main> always
+        # begins past it. Bailing out on a nested header instead, as an earlier version did, meant
+        # danvanhaiphong ended up with no <main> at all.
+        start = 0
+        for i, c in enumerate(kids):
+            if c is hdr or (hdr is not None and hdr in c.descendants):
+                start = i + 1
         content = []
         for c in kids[start:]:
-            if c is ftr:
+            # Stop at the footer (or the block holding it) - keeps <main> a contiguous run, so
+            # nothing is reordered on the page.
+            if c is ftr or (ftr is not None and ftr in c.descendants):
                 break
             if c.name in ("script", "style", "link", "meta", "noscript"):
                 continue
-            # A wrapper that still CONTAINS the header/footer must never be pulled into <main>
-            # (happens when they are nested rather than direct children of the content root).
-            if (hdr is not None and c.find(hdr.name) is not None and hdr in c.descendants) or \
-               (ftr is not None and ftr in c.descendants):
-                break
             content.append(c)
         if content:
             main = soup.new_tag("main")
             content[0].insert_before(main)
             for c in content:
                 main.append(c.extract())
+                wrapped += 1
+            # <main> is supposed to hold the page's content. When the header sits deep inside a
+            # wrapper, "everything after it" can be almost nothing - on sylhetcitycorporation
+            # <main> ended up wrapping just the "Developed by" line while all 27 menu links and
+            # the entire body text stayed outside it. If what we wrapped is a scrap of the page,
+            # undo it and wrap the biggest content container instead.
+            body_len = len(body.get_text(" ", strip=True)) or 1
+            if len(main.get_text(" ", strip=True)) < body_len * 0.25:
+                for c in list(main.find_all(recursive=False)):
+                    main.insert_before(c.extract())
+                main.decompose()
+                wrapped = 0
+                host = _content_host(body, hdr, ftr)
+                if host is not None:
+                    main = soup.new_tag("main")
+                    host.insert_before(main)
+                    main.append(host.extract())
+                    wrapped = 1
+
+        # Whatever content still sits AFTER <main> belongs inside it. The contiguous run stops at
+        # the footer, which left sanjhapunjab with its comments block - 30% of the page - stranded
+        # as a sibling of <main>. Absorb every following block that is not, and does not hold, the
+        # header or the footer.
+        main = soup.find("main")
+        if main is not None:
+            for sib in list(main.next_siblings):
+                if getattr(sib, "name", None) is None:
+                    continue
+                if sib.name in ("script", "style", "link", "meta", "noscript", "header", "footer"):
+                    continue
+                if hdr is not None and hdr in sib.descendants:
+                    continue
+                if sib.find("header") is not None:
+                    continue
+                # A trailing content block that HAPPENS to contain the footer must not stay outside
+                # <main> just because of that - sanjhapunjab's comments block (30% of the page) sits
+                # around the footer, so skipping it stranded a third of the content. Lift the footer
+                # out to body level first, then the block itself can be absorbed.
+                inner_ftr = sib.find("footer")
+                if inner_ftr is not None:
+                    if inner_ftr is sib or inner_ftr.parent is None:
+                        continue
+                    sib.insert_after(inner_ftr.extract())
+                    ftr = inner_ftr
+                if not sib.get_text(" ", strip=True) and sib.find(["img", "svg", "video"]) is None:
+                    continue  # empty spacer div, nothing to move
+                main.append(sib.extract())
                 wrapped += 1
     if renamed or wrapped:
         report.semantic_tags_applied.append(f"детерминированно: div→section {renamed}, main-обёртка {wrapped} блоков")
@@ -4795,7 +5825,8 @@ def apply_semantic_tags(soup, report):
     body = soup.find("body")
     if body is None:
         return
-    root = body.find("main") or body
+    # Same reason as above: scanning inside <main> invents a second <header> within it.
+    root = body
 
     # 1) Deterministic page header from the real top nav (never a hero).
     old_hdr = _promote_header(soup, root)
@@ -4838,6 +5869,20 @@ def apply_semantic_tags(soup, report):
         # footer as chrome, so EVERY section disappears and no menu anchor can attach. Seen on
         # danvanhaiphong ("div -> nav" over 838 descendants). Applies to any model output.
         if newtag in ("nav", "header", "footer", "aside") and ch.find(_LANDMARK_TAGS) is not None:
+            newtag = "section" if ch.name == "div" else "keep"
+        if newtag == "keep" or newtag == ch.name:
+            continue
+        # Plausibility, the same bar the deterministic passes use. Without it this pass could name
+        # an empty spacer <footer>, hand <main> to a 20-character block (after which the real
+        # builder skips itself because "main already exists"), or turn a whole content column into
+        # <nav> - and everything inside a nav/header/footer stops counting as content.
+        _txt = ch.get_text(" ", strip=True)
+        _body_len = len((soup.find("body") or soup).get_text(" ", strip=True)) or 1
+        if newtag in ("header", "footer", "nav", "main", "aside") and not _txt:
+            newtag = "keep"
+        elif newtag in ("header", "footer", "nav") and len(_txt) > _body_len * 0.4:
+            newtag = "section" if ch.name == "div" else "keep"
+        elif newtag == "main" and len(_txt) < _body_len * 0.25:
             newtag = "section" if ch.name == "div" else "keep"
         if newtag == "keep" or newtag == ch.name:
             continue
@@ -4938,11 +5983,27 @@ def clean_html_file(
     # even a bare <div>/<center> full of links with no nav class - the page <header>. Old exports
     # whose menu is just a link-heavy div were previously missed entirely; the AI pass below only
     # refines. (If there's genuinely no nav, auto_link_menu generates a header as the last step.)
+    # The model labels the blocks FIRST, so header/footer/main below are placed by MEANING rather
+    # than by position heuristics. No key -> returns {} and everything downstream behaves as before.
+    plan_layout(soup, report)
     _hdr_root = soup.find("body")
     if _hdr_root is not None:
-        _old_hdr = _promote_header(soup, _hdr_root.find("main") or _hdr_root)
+        # Header and footer FIRST, then <main>. The other way round, _promote_header searched
+        # inside the freshly built <main> while the header block sat outside it, so the real menu
+        # was invisible to it.
+        # Search from BODY, never from <main>. Narrowing to <main> hid the real header whenever the
+        # page had one - and any modern theme capture ships its own <main id="site-main">, so the
+        # scan ran INSIDE it and wrapped a post-navigation or breadcrumb into a second <header>
+        # mid-article: a fixed bar over the content, sections lost, article links deleted as if
+        # they were menu items, copyright injected into the middle of the text.
+        _old_hdr = _promote_header(soup, _hdr_root)
         if _old_hdr is not None:
             report.semantic_tags_applied.append(f"{_old_hdr} -> header (верхний нав, детерминированно)")
+        _old_ftr = _promote_footer(soup, _hdr_root)
+        if _old_ftr is not None:
+            report.semantic_tags_applied.append(f"{_old_ftr} -> footer (детерминированно)")
+        verify_landmark_roles(soup, report)
+        assemble_main_from_plan(soup, report)
     # AI (Haiku) tag-semantics: promote top-level <div> soup into HTML5 landmarks, so the menu/
     # section logic below (and the final markup) sees real header/nav/main/section/footer. Skipped
     # in dry-run (no LLM spend on a preview) and whenever no ANTHROPIC_API_KEY is configured.
@@ -4954,6 +6015,7 @@ def clean_html_file(
     repair_landmark_nesting(soup, report)
     # Fix the heading outline so levels never skip (h2 then h3, never h4). Deterministic - runs
     # with or without the AI pass, after tag-semantics so it sees the final structure.
+    drop_empty_headings(soup, report)
     normalize_heading_levels(soup, report)
     # Deterministic <main> + <section> landmarks (box-model-neutral, runs without the AI key too).
     ensure_landmarks(soup, report)
@@ -5013,6 +6075,8 @@ def clean_html_file(
     if not dry_run:
         _audit_stylesheets(soup, html_path, site_domain, report)
 
+    repair_landmarks_in_main(soup, report)  # лендмарк внутри <main> — чиним, а не только сообщаем
+    _strip_role_marks(soup)  # служебные метки разметки не должны уехать в готовый HTML
     _p(82, "Записываю страницу")
     new_text = collapse_blank_lines(str(soup))
 
@@ -5040,7 +6104,14 @@ def clean_html_file(
                 local_css_texts.append(read_text_safe(css_path))
     _p(96, "Убираю неиспользуемые файлы")
     remove_unused_local_assets(html_path, new_text, report, dry_run=dry_run, extra_texts=local_css_texts)
+    strip_dead_css_urls(html_path, report)
     _audit_final_output(html_path, report)  # universal "did it come out broken?" self-check
+    # ...and the input-vs-output net: everything the archive had must still be here.
+    for _w in audit_against_original(original_text, soup, report, html_path):
+        print(f"[audit] ВНИМАНИЕ: {_w}")
+    # Контракт: одинаковые правила для ЛЮБОГО сайта, включая те, которых я никогда не видел.
+    for _w in verify_output_contract(soup, report, original_text):
+        print(f"[contract] НАРУШЕНО: {_w}")
 
     report_path = html_path.with_name(html_path.name + ".cleanup-report.txt")
     rendered = report.render()

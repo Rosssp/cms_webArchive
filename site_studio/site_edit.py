@@ -15,6 +15,7 @@ of the file before the first mutation in a session.
 import json
 import os
 import re
+from datetime import datetime
 import shutil
 import subprocess
 import sys
@@ -1045,6 +1046,58 @@ def flatten_recovered_assets(html_path):
 
 NAV_CONTAINER_TAGS = ("header", "nav", "footer")
 HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+
+# Old sites rarely use <h1>-<h6>: a section title is bold text, a <font size="4">, or a styled
+# <td>. Those ARE headings to a visitor, so they must be anchorable - otherwise a whole site
+# collapses to a single anchor and its menu gets stripped for having nowhere to point.
+_VISUAL_HEADING_TAGS = ("b", "strong", "font", "big", "caption", "legend", "th", "dt", "summary")
+_VISUAL_HEADING_STYLE_RE = re.compile(
+    r"font-weight\s*:\s*(?:bold|[6-9]00)|font-size\s*:\s*(?:[2-9]\d|1\d\d)(?:px|pt)|"
+    r"font-size\s*:\s*(?:1\.[3-9]|[2-9])(?:em|rem)", re.I)
+# NB: the trailing \d* matters. Old sites number their heading classes - "heading1", "heading2",
+# "title2", "head3" - and a word-boundary-only pattern matched none of them, so a page whose every
+# section title was <p class="heading1"> produced zero sections and its menu had nothing to anchor
+# to. Numbered variants are a convention, not a one-site quirk.
+_VISUAL_HEADING_CLASS_RE = re.compile(
+    r"(?:^|[\s_-])(?:title|heading|head|headline|caption|subject|subtitle|"
+    r"section[-_]?(?:name|title)|page[-_]?title|post[-_]?title|entry[-_]?title)\d*(?:[\s_-]|$)",
+    re.I)
+
+
+def _looks_like_heading(el):
+    """True when `el` READS as a heading even though it isn't an <hN>.
+
+    A short, prominent line of text: bold/large/`.title`-classed, no links inside (a menu item is
+    not a heading) and short enough to be a title rather than a paragraph."""
+    name = getattr(el, "name", None)
+    if name is None:
+        return False
+    if name in HEADING_TAGS:
+        return True
+    txt = el.get_text(" ", strip=True)
+    if not (2 <= len(txt) <= 90):
+        return False
+    if el.find("a") is not None or el.find(HEADING_TAGS) is not None:
+        return False
+    if name in _VISUAL_HEADING_TAGS:
+        return True
+    style = el.get("style") or ""
+    if _VISUAL_HEADING_STYLE_RE.search(style):
+        return True
+    if _VISUAL_HEADING_CLASS_RE.search(_cls(el)):
+        return True
+    return False
+
+
+def _find_heading_like(el):
+    """The first real-or-visual heading inside `el` (or None)."""
+    hit = el.find(HEADING_TAGS)
+    if hit is not None:
+        return hit
+    for cand in el.find_all(_VISUAL_HEADING_TAGS + ("div", "p", "span", "td")):
+        if _looks_like_heading(cand):
+            return cand
+    return None
 _NAV_UNRESOLVED_HREFS = {"#", "", "/", "#!", "javascript:void(0)", "javascript:void(0);", "javascript:;"}
 _HEADER_MAX_LINKS = 4
 # How many links may point at one and the same section before further "matches" are treated
@@ -1144,8 +1197,13 @@ def _find_header_nav(soup):
         el = soup.find(tn)
         if el and _nav_menu_links(el):
             return el
-    for el in soup.find_all(["div", "ul"]):
-        if (_NAV_CLASS_RE.search(_cls(el)) and not _MOBILE_CLASS_RE.search(_cls(el))
+    for el in soup.find_all(["div", "ul", "nav"]):
+        # Match the id as well as the class. _has_site_menu already did, and the mismatch was a
+        # trap: <ul id="navigation" class="dropdown"> was invisible HERE (so the menu was never
+        # wired) yet visible THERE (so header generation was suppressed) - the site ended up with
+        # an unwired menu whose dead links the final sweep then deleted one by one.
+        ident = _cls(el) + " " + (el.get("id") or "")
+        if (_NAV_CLASS_RE.search(ident) and not _MOBILE_CLASS_RE.search(ident)
                 and not el.find_parent("footer") and len(_nav_menu_links(el)) >= 2):
             return el
     return None
@@ -1181,6 +1239,23 @@ def _has_site_menu(soup):
     return False
 
 
+def _site_menu_element(soup):
+    """The existing top menu container itself (same rules as _has_site_menu, which only answers
+    yes/no). Returned so a page that HAS a menu but no <header> can have that very menu wrapped
+    into one, instead of being left with no header at all."""
+    for el in soup.find_all(["nav", "ul", "div"]):
+        ident = _cls(el) + " " + (el.get("id") or "")
+        if not _NAV_CLASS_RE.search(ident) or _MOBILE_CLASS_RE.search(ident):
+            continue
+        if el.find_parent("footer") or el.find_parent(["nav", "ul"]) is not None:
+            continue
+        links = [a for a in el.find_all("a") if a.get("href")]
+        menu_lis = el.find_all("li", class_=re.compile(r"menu-item|nav-item", re.I))
+        if len(links) >= 2 or len(menu_lis) >= 2:
+            return el
+    return None
+
+
 def _find_mobile_navs(soup, exclude_ids):
     """Duplicate/mobile nav containers (class hints mobile/burger/offcanvas/drawer) to mirror
     the header's decisions into, so the mobile menu gets the same anchors and labels."""
@@ -1207,14 +1282,68 @@ def _fallback_section_blocks(soup, nav_desc):
     direct children that carry a heading as the sections instead. Skips nav/header/footer
     (and their descendants) and non-element nodes; returns block elements in document order."""
     root = soup.find("main") or soup.body or soup
+    # Descend past the wrapper(s) themes put around everything. Looking only at the direct children
+    # of <body> found ONE "section" - the wrapper itself - on the extremely common
+    # <body><div id="wrapper">…whole page…</div></body>. With a single section to anchor to, the
+    # sweep below then deleted every other menu item, which is the "8 items -> 1" menu gutting.
+    for _ in range(6):
+        kids = [c for c in root.find_all(recursive=False)
+                if getattr(c, "name", None) not in (None, "script", "style", "link", "meta", "br", "noscript")]
+        heading_kids = [c for c in kids if _find_heading_like(c) is not None]
+        if len(heading_kids) >= 2:
+            break
+        if len(kids) == 1 and kids[0].name in ("div", "center", "form", "section", "main", "table", "tbody", "tr", "td"):
+            root = kids[0]
+            continue
+        if len(heading_kids) == 1 and heading_kids[0].name in ("div", "center", "section", "table", "tbody", "tr", "td", "main"):
+            root = heading_kids[0]
+            continue
+        break
     out = []
     for ch in root.find_all(recursive=False):
         if not getattr(ch, "name", None) or ch.name in ("nav", "header", "footer", "script", "style"):
             continue
         if id(ch) in nav_desc:
             continue
-        if ch.find(HEADING_TAGS):
+        if _find_heading_like(ch) is not None:
             out.append(ch)
+    return out
+
+
+_AI_SECTION_LABELS = {}
+
+
+def _ai_section_starts(soup, nav_desc):
+    """Blocks the model says begin a section, for pages with no usable headings at all."""
+    root = soup.find("main") or soup.body or soup
+    cands = []
+    for el in root.find_all(["div", "p", "section", "td", "table", "center"]):
+        if id(el) in nav_desc or el.find_parent(["header", "footer", "nav"]) is not None:
+            continue
+        txt = el.get_text(" ", strip=True)
+        if not (20 <= len(txt) <= 1200):
+            continue
+        if el.find(["div", "p", "table"]) is not None:
+            continue  # take leaf-ish blocks, not wrappers holding the whole page
+        cands.append(el)
+        if len(cands) >= 30:
+            break
+    if len(cands) < 2:
+        return []
+    try:
+        import semantics
+        if not semantics.available():
+            return []
+        rows = semantics.find_section_starts(
+            [{"i": i, "tag": c.name, "cls": _cls(c), "text": c.get_text(" ", strip=True)}
+             for i, c in enumerate(cands)])
+    except Exception:  # noqa: BLE001 - no key / bad JSON -> deterministic behaviour unchanged
+        return []
+    out = []
+    for row in (rows or []):
+        i = row.get("i")
+        if isinstance(i, int) and 0 <= i < len(cands):
+            out.append((cands[i], row.get("label") or ""))
     return out
 
 
@@ -1232,7 +1361,27 @@ def _content_sections(soup):
     out = []
     # Prefer real <section> tags; fall back to heading-bearing top-level blocks when the page
     # has none (bad-semantics exports where sections are plain <div>s).
-    for sec in (soup.find_all("section") or _fallback_section_blocks(soup, nav_desc)):
+    # "sections or fallback" was all-or-nothing: a page where the cleaner produced a single
+    # <section> while twelve real content blocks stayed <div> never reached the fallback, so the
+    # menu had one anchor target and the rest of its items were deleted. Two is the threshold - one
+    # section is not an outline.
+    _secs = [s for s in soup.find_all("section") if id(s) not in nav_desc]
+    if len(_secs) < 2:
+        _seen_ids = {id(s) for s in _secs}
+        _extra = [b for b in _fallback_section_blocks(soup, nav_desc) if id(b) not in _seen_ids]
+        _secs = _secs + _extra
+    # Still nothing? The page has no headings at all - not even bold/large text we can recognise.
+    # Ask the model where a reader would see a new topic begin. This is a question about MEANING:
+    # no rule separates "Mayor's Corner" (a section title) from a bold word inside a paragraph.
+    # Without it such pages get zero sections, and with nothing to anchor to the menu is stripped
+    # to a single item.
+    if len(_secs) < 2:
+        _ai_secs = _ai_section_starts(soup, nav_desc)
+        if _ai_secs:
+            _seen_ids = {id(s) for s in _secs}
+            _secs = _secs + [b for b, _lbl in _ai_secs if id(b) not in _seen_ids]
+            _AI_SECTION_LABELS.update({id(b): lbl for b, lbl in _ai_secs})
+    for sec in _secs:
         if id(sec) in nav_desc:
             continue
         # NOTE: the hero/banner band is NOT skipped - it's a real, linkable section. The header
@@ -1257,7 +1406,7 @@ def _content_sections(soup):
         p = sec.find("p")
         sample = re.sub(r"\s+", " ", p.get_text(" ", strip=True)).strip()[:200] if p else ""
         out.append({"el": sec, "text": title, "keys": keys, "sample": sample,
-                    "kind": None, "ai_label": None, "is_hero": is_hero})
+                    "kind": None, "ai_label": _AI_SECTION_LABELS.get(id(sec)), "is_hero": is_hero})
     # The first section in document order is the hero/top block even if it carries no hero-ish
     # class - the header's guaranteed "top" link points here.
     if out:
@@ -1411,6 +1560,49 @@ def _assign_footer_slot(slot, sec, changes):
         del a["target"]
     _set_link_text(a, _section_label(sec) or anchor)
     changes.append(f'{a.get_text(" ", strip=True)} -> #{anchor}')
+
+
+# Recognising an EXISTING copyright line is what keeps this pass idempotent - anything not matched
+# here gets a second line appended on the next clean. Kept deliberately broad, and the localiser is
+# additionally required to keep the © sign so a translated line always matches.
+_COPYRIGHT_LINE_RE = re.compile(r"©|&copy;|\(c\)\s*\d{4}|copyright|all rights reserved|"
+                                r"tous droits|derechos reservados|全著作權|판权|판권|"
+                                r"bản quyền|bảo lưu|版权所有|著作権|حقوق|सर्वाधिकार|"
+                                r"все права защищены|усі права", re.I)
+
+
+def _ensure_footer_copyright(footer, domain, soup):
+    """Guarantee the page ends with a copyright line: `© <year> <domain>. All rights reserved.`
+
+    Added only when the footer states nothing of the sort - a site that already says it keeps its
+    own wording. On a non-English page the sentence is translated by the model when a key is
+    configured (a Vietnamese site ending in an English sentence looks machine-made); without a key
+    the English line is still written, so the guarantee holds either way."""
+    if footer is None:
+        return False
+    if _COPYRIGHT_LINE_RE.search(footer.get_text(" ", strip=True)):
+        return False
+    year = datetime.now().year
+    name = (domain or "").strip().rstrip("/") or "this site"
+    text = f"© {year} {name}. All rights reserved."
+    lang = ""
+    root = soup.find("html")
+    if root is not None:
+        lang = (root.get("lang") or "").split("-")[0].lower()
+    if lang and lang not in ("en", ""):
+        try:
+            import semantics
+            if semantics.available():
+                localized = semantics.localize_copyright(text, lang, name, year)
+                if localized:
+                    text = localized
+        except Exception:  # noqa: BLE001 - the English line is a fine fallback
+            pass
+    p = soup.new_tag("p")
+    p["class"] = ["site-copyright"]
+    p.string = text
+    footer.append(p)
+    return True
 
 
 def _rebuild_footer_sitemap(footer, sections):
@@ -1601,6 +1793,7 @@ def auto_link_menu(site_dir):
             header_nav = None  # hands off - don't wire, don't cap, don't relabel, don't generate
         if header_nav is not None:
             kept = 0
+            orphans = []
             for a in _nav_menu_links(header_nav):
                 orig = a.get_text(" ", strip=True)
                 key = " ".join(_slug_words(orig))
@@ -1620,9 +1813,41 @@ def auto_link_menu(site_dir):
                     linked.append(f'{rel_self}: header "{orig}" -> {a["href"]} ("{label}")')
                     dirty = True
                 else:
-                    _remove_nav_item(a)
-                    removed.append(f'{rel_self}: header "{orig}" (no section to point at)')
-                    dirty = True
+                    # Don't delete yet: on a site with no sections to anchor to, EVERY item is
+                    # unresolvable and deleting them all guts the visible menu (sylhet went from
+                    # 8 items to 1). Decide after the loop, once we know how many survive.
+                    orphans.append((a, orig))
+
+            # A menu is part of how the page LOOKS, so it must never be emptied to satisfy the
+            # linking pass. Unresolvable items are dropped only while at least two real menu items
+            # survive; otherwise they stay put and merely lose their href, so the bar still reads
+            # like the site's menu instead of a lone orphaned word.
+            # The menu must mirror what the page actually HAS. Once the sections run out, the
+            # remaining menu items point nowhere, and a bar full of dead words is worse than a
+            # short honest one - so they go. (An earlier version kept them href-less to avoid
+            # "gutting" the menu; that just left rows of unclickable text.) If this empties the
+            # menu completely the real fault is upstream - the page produced no sections - and the
+            # header invariant will generate a proper one.
+            if orphans:
+                # Two different situations, and they need opposite handling:
+                #  - the page HAS sections and the menu simply has more items than there are
+                #    targets -> the extra items lead nowhere, remove them (this is the rule).
+                #  - the page has NO sections at all (old table layout, no headings) -> removing
+                #    them empties the menu completely and the header ships as a blank bar, which
+                #    is strictly worse than a menu whose items don't scroll anywhere. Keep the
+                #    items, just drop the dead href. Regeneration cannot save this case: a
+                #    <header> already exists, so every generate branch is gated off.
+                if sections:
+                    for a, orig in orphans:
+                        _remove_nav_item(a)
+                        removed.append(f'{rel_self}: header "{orig}" (нет секции — удалён)')
+                else:
+                    for a, orig in orphans:
+                        if a.get("href"):
+                            del a["href"]
+                    relabeled.append(f'{rel_self}: на странице нет секций — {len(orphans)} пунктов '
+                                     f'меню оставлены без href (иначе хедер пустой)')
+                dirty = True
 
         # The header MUST carry a link to the HERO (the first/top block). Resolving broken links
         # already sends the first one there (hero is the first unused section), but if the header
@@ -1650,6 +1875,25 @@ def auto_link_menu(site_dir):
         # NOTE: deliberately NOT gated on `sections`. Old table-layout sites have no <section> and
         # no headings at all, so there's nothing to anchor to - but they still need a header, and
         # build_header ships the logo bar alone in that case.
+        # INVARIANT: a cleaned page must never ship without a <header>. The old condition left a
+        # hole - when the site HAS a menu but nothing managed to wrap it, generation was suppressed
+        # (rightly, to avoid a duplicate nav) and no header was built either, so bikenfoot and
+        # sylhetcitycorporation came out with none at all. Wrap the site's own menu instead: it is
+        # the real header, and it beats bolting a second one on top of it.
+        if soup.find("header") is None:
+            existing_menu = _site_menu_element(soup)
+            if existing_menu is not None:
+                if existing_menu.name == "header":
+                    pass
+                else:
+                    hdr = soup.new_tag("header")
+                    existing_menu.insert_before(hdr)
+                    hdr.append(existing_menu.extract())
+                    if hdr.find("nav") is None and existing_menu.name in ("div", "ul"):
+                        existing_menu.name = "nav"
+                    linked.append(f"{rel_self}: WRAPPED existing site menu in <header>")
+                    dirty = True
+
         if (header_nav is None and soup.find("header") is None
                 and not _has_site_menu(soup)):
             try:
@@ -1665,6 +1909,23 @@ def auto_link_menu(site_dir):
                     dirty = True
             except Exception as ex:  # noqa: BLE001 - header generation is best-effort
                 unresolved.append(f'{rel_self}: header generation failed: {ex}')
+
+        # Last resort, so "there is always a header" holds even if every branch above declined or
+        # threw: no <header> on the page at this point means we build one, no conditions attached.
+        if soup.find("header") is None:
+            try:
+                import header_gen
+                info = header_gen.build_header(
+                    soup, p, sections, site_domain_full or bare,
+                    ensure_anchor=_ensure_section_anchor, section_label=_section_label,
+                )
+                if info:
+                    linked.append(f'{rel_self}: GENERATED header (last-resort invariant)')
+                    dirty = True
+                else:
+                    unresolved.append(f'{rel_self}: НЕТ <header> — build_header вернул пусто')
+            except Exception as ex:  # noqa: BLE001
+                unresolved.append(f'{rel_self}: НЕТ <header> — генерация упала: {ex}')
 
         # --- mobile navs: mirror header decisions onto matching links ---
         exclude = {id(header_nav)} if header_nav is not None else set()
@@ -1692,6 +1953,42 @@ def auto_link_menu(site_dir):
             if fchanges:
                 for c in fchanges:
                     linked.append(f'{rel_self}: footer {c}')
+                dirty = True
+
+        # Footer links follow the SAME rule as the header: once the sections run out, a menu item
+        # that points nowhere is dead weight and gets removed rather than kept as unclickable text.
+        if footer is not None and not _is_cms_menu(footer):
+            fsections = len(sections)
+            fkept = 0
+            for a in list(_nav_menu_links(footer)):
+                if not _broken(a):
+                    fkept += 1
+                    continue
+                if fkept < fsections:
+                    fkept += 1
+                    continue
+                _remove_nav_item(a)
+                removed.append(f'{rel_self}: footer "{a.get_text(" ", strip=True)[:24]}" (нет секции — удалён)')
+                dirty = True
+
+        # STRUCTURE IS A GUARANTEE: header/main/footer must exist on EVERY page, including ancient
+        # table layouts that have no closing bar to promote. If nothing could be turned into a
+        # footer, build one - an empty structural slot is not acceptable, and the copyright line
+        # below gives it real content.
+        if soup.find("footer") is None and soup.body is not None:
+            new_ftr = soup.new_tag("footer")
+            new_ftr["class"] = ["wb-footer"]
+            soup.body.append(new_ftr)
+            linked.append(f"{rel_self}: СОЗДАН <footer> (на странице его не было)")
+            dirty = True
+        footer = soup.find("footer")
+
+        # Every restored page ends with a copyright line. PBN pages get published as-is, and a site
+        # with no closing line reads as unfinished; the archive often lost it with the widget that
+        # rendered it. Written only when the footer has none - never duplicated.
+        if footer is not None:
+            if _ensure_footer_copyright(footer, site_domain_full or bare, soup):
+                linked.append(f"{rel_self}: footer — добавлена строка копирайта")
                 dirty = True
 
         # --- final sweep: any link STILL pointing nowhere (dead "#"/"/"/empty/js) that the
@@ -1748,6 +2045,29 @@ def auto_link_menu(site_dir):
 
         if dirty:
             _write_soup(p, soup)
+
+        # FINAL landmark check - here, not inside the cleaner, because this is the first moment the
+        # markup is actually finished (the header can still be generated a few lines above). Checked
+        # earlier it reported "НЕТ <header>" on pages that ended up with a perfectly good one.
+        final = _read_soup(p)
+        # The FULL contract, checked here rather than inside the cleaner. The cleaner runs before
+        # this function, so its own check could not see what happens below - the header cap, the
+        # deletion of unresolvable menu items, the rebuilt footer sitemap. The rule written to catch
+        # a gutted menu was blind to the very pass that guts menus. This is the last moment the
+        # markup changes, so it is the only place the contract means anything.
+        try:
+            import clean_wayback_site as _cw
+
+            class _R:
+                audit_warnings = []
+
+            _rep = _R()
+            for _v in _cw.verify_output_contract(final, _rep):
+                unresolved.append(f"{rel_self}: КОНТРАКТ — {_v}")
+        except Exception as _e:  # noqa: BLE001 - a failing check must never fail the clean
+            for _tag in ("header", "main", "footer"):
+                if final.find(_tag) is None:
+                    unresolved.append(f"{rel_self}: НЕТ <{_tag}> в готовой странице")
 
     return {"linked": linked, "relabeled": relabeled, "removed": removed, "unresolved": unresolved}
 
