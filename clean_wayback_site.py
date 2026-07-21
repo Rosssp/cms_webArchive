@@ -427,8 +427,14 @@ def normalize_charset_meta(soup):
             meta["content"] = re.sub(r"charset=[^;]+", "charset=utf-8", content, flags=re.IGNORECASE)
 
 
+# Обёртка снимается и со ссылок НЕ-http: архив заворачивает `tel:`/`mailto:` точно так же, и без
+# этого телефон остаётся href="https://web.archive.org/web/2024.../tel:19003007" — клик уводит на
+# archive.org вместо звонка. Схемы перечислены явно: «любое слово с двоеточием» съело бы обычные
+# пути, где двоеточие встречается внутри имени файла.
+_WB_LINK_SCHEMES = "tel|mailto|sms|callto|whatsapp|viber|skype|facetime|geo|bitcoin"
 WAYBACK_PREFIX_RE = re.compile(
-    r"(?:(?:https?:)?//web\.archive\.org)?/web/\d{1,14}[a-zA-Z_]*/(?=https?://|//)"
+    r"(?:(?:https?:)?//web\.archive\.org)?/web/\d{1,14}[a-zA-Z_]*/"
+    r"(?=https?://|//|(?:" + _WB_LINK_SCHEMES + r"):)"
 )
 FONT_FAMILY_RE = re.compile(r"font-family\s*:\s*([^;{}]+)", re.IGNORECASE)
 # @import of an old font service - kept CSS text gets this stripped out (rather than
@@ -4653,6 +4659,48 @@ def _is_header_like(el):
     return len([a for a in el.find_all("a") if a.get_text(strip=True)]) >= 2
 
 
+def _absorb_header_bar(header_el):
+    """Втянуть в <header> соседние сверху полосы шапки — логотип, баннер с названием, топбар.
+
+    CMS почти всегда режет шапку на два соседних блока: <div id="header"> с логотипом и
+    <div id="nav"> с меню. Шапкой выбирается тот, где ссылки, а полоса с логотипом остаётся
+    снаружи и ВЫШЕ <header> — то есть <header> перестаёт быть первым элементом страницы, а
+    логотип висит сам по себе. Пользователь это видит как «хеддер не встаёт».
+
+    Втягиваются только СОСЕДНИЕ СВЕРХУ блоки, порядок сохраняется, поэтому вид страницы не
+    меняется. Берём блок, если он либо назван шапкой (header/masthead/topbar), либо это
+    полоса-логотип (картинка почти без текста). Геройский баннер НЕ трогаем — у него есть свой
+    заметный текст, и он относится к контенту. Возвращает число втянутых блоков.
+    """
+    if header_el is None:
+        return 0
+    taken = 0
+    for _ in range(3):   # максимум три полосы: топбар + логотип + служебная строка
+        prev = header_el.find_previous_sibling(lambda t: getattr(t, "name", None) is not None)
+        if prev is None or prev.name in ("script", "style", "link", "meta", "noscript",
+                                         "header", "main", "footer", "nav"):
+            break
+        ident = _sem_cls(prev)
+        text = prev.get_text(" ", strip=True)
+        named_header = bool(_SEM_HEADER_CLASS_RE.search(ident))
+        logo_bar = bool(prev.find("img")) and len(text) <= 60
+        # Узкая служебная полоса вплотную над шапкой (телефон, язык, вход, соцсети) — часть шапки.
+        # По имени класса её не поймать: у firsttalk это id="nav-top", то есть те же слова в обратном
+        # порядке, и ни один список синонимов такое не покроет. Признак надёжнее — РАЗМЕР: полоска
+        # в пару ссылок и десяток символов не может быть содержимым страницы.
+        thin_strip = len(text) <= 120 and len(prev.find_all("a")) <= 3 and prev.find(_HEADING_RE) is None
+        # Геройская секция не является частью шапки, даже если стоит вплотную к ней.
+        if _SEM_HERO_RE.search(ident) and not named_header:
+            break
+        if not (named_header or logo_bar or thin_strip):
+            break
+        if len(text) > 400:      # это уже контент, а не полоса шапки
+            break
+        header_el.insert(0, prev.extract())
+        taken += 1
+    return taken
+
+
 def _promote_header(soup, root):
     """Deterministically make the site's primary top navigation the page <header> - a hero/intro
     band is NEVER the header. Scans the first few top-level blocks for a genuine nav signal (a
@@ -4665,7 +4713,13 @@ def _promote_header(soup, root):
     for ch in root.find_all(recursive=False):
         if getattr(ch, "name", None) in ("header", "footer") and _SEM_HERO_RE.search(_sem_cls(ch)):
             ch.name = "section"
-    if root.find("header") is not None:
+    _existing = root.find("header")
+    if _existing is not None:
+        # У готовой шапки полосы над ней тоже надо втянуть. Раньше функция выходила здесь сразу,
+        # поэтому втягивание работало ТОЛЬКО на страницах, где шапку строили с нуля: у firsttalk
+        # <header> был в исходнике, а <div id="nav-top"> так и оставался выше него — то есть
+        # <header> не был первым элементом страницы.
+        _absorb_header_bar(_existing)
         return None
     # Descend through a single generic wrapper that holds the whole page (old layouts wrap everything
     # in one <center>/<div>/<table>), so the nav that sits INSIDE it is reachable by the top-level
@@ -4718,6 +4772,7 @@ def _promote_header(soup, root):
                     if len([a for a in sub.find_all("a") if a.get_text(strip=True)]) >= 2:
                         sub.name = "nav"
                         break
+            _absorb_header_bar(ch)
             return old_name
     for ch in children[:6]:
         cls = _sem_cls(ch)
@@ -4736,12 +4791,11 @@ def _promote_header(soup, root):
             # a bare top <nav> -> wrap it (plus an immediately-preceding logo-only sibling) in
             # a fresh <header>, so the menu bar sits inside the page header where it belongs.
             header = soup.new_tag("header")
-            prev = ch.find_previous_sibling(lambda t: getattr(t, "name", None) is not None)
             ch.insert_before(header)
-            if (prev is not None and prev.name in ("a", "div")
-                    and prev.find("img") and not prev.get_text(strip=True)):
-                header.append(prev.extract())
             header.append(ch.extract())
+            # Полосы шапки, стоящие выше (логотип, топбар), втягиваются тем же общим правилом,
+            # что и в остальных ветках — раньше здесь была своя, более узкая проверка.
+            _absorb_header_bar(header)
             return "nav"
         # a navbar-classed container (or any block wrapping a <nav>) -> rename it to <header>,
         # and make sure its inner link list is a <nav>.
@@ -4752,6 +4806,7 @@ def _promote_header(soup, root):
                 if len([a for a in sub.find_all("a") if a.get_text(strip=True)]) >= 2:
                     sub.name = "nav"
                     break
+        _absorb_header_bar(ch)
         return old
 
     # Nothing nav-like among the top-level blocks. On old table/<center> layouts the menu is buried
@@ -4989,6 +5044,188 @@ def strip_dead_css_urls(html_path, report):
     return removed
 
 
+_SEM_SECTIONISH_RE = re.compile(
+    r"(?:^|[\s_-])(?:section|block|module|panel|band|row-section|content-section|"
+    r"post|entry|article|hentry)(?:[\s_-]|$)", re.I)
+_ITEM_CLASS_RE = re.compile(
+    r"(?:^|[\s_-])(?:post-item|news-item|menu-post|list-item|card|entry|product|item|tile|thumb|"
+    r"teaser|caption|excerpt|preview|article-item|blog-item|grid-item)", re.I)
+# NB: сюда НЕЛЬЗЯ добавлять col-* — это бутстраповские колонки, они есть у всего подряд,
+# включая обёртки заголовков разделов.
+_SECTION_TITLE_CLASS_RE = re.compile(
+    r"(?:^|[\s_-])(?:section-title|section-head|section-header|block-title|widget-head|"
+    r"category-title|module-title|heading-block)", re.I)
+
+
+_HEADING_CACHE_ATTR = "_wb_heading_classes"
+
+
+def classify_headings(soup):
+    """Разделить заголовки на ЗАГОЛОВКИ РАЗДЕЛОВ и ЗАГОЛОВКИ КАРТОЧЕК.
+
+    РЕЗУЛЬТАТ КЭШИРУЕТСЯ НА ДОКУМЕНТ. Функция вызывается дважды — из расстановки уровней заголовков
+    и из сборки секций, — а внутри неё работает агент, который НЕДЕТЕРМИНИРОВАН. Два вызова давали
+    РАЗНЫЕ ответы: один и тот же заголовок статьи оказывался «карточкой» при выставлении уровней и
+    «разделом» при расстановке якорей. Отсюда у sanjhapunjab одновременно выходило ноль <h2>,
+    карта из 11 разделов и меню из одного пункта.
+
+    На листинге (новости, каталог, блог) заголовок карточки и заголовок раздела — оба <h2>, но это
+    совершенно разные вещи: «Health» открывает раздел, а «Northborne Partners Advises…» это одна из
+    двадцати статей внутри него. Раньше скрипт их не различал, поэтому карточки оставались h2
+    (вместо h3) и якорь цеплялся к первой попавшейся карточке, а не к разделу.
+
+    Главный признак — ПОВТОРЯЕМОСТЬ, а не имя класса: если полсотни заголовков имеют одинаковую
+    цепочку родителей, это перечисление однотипных карточек. Работает на любом сайте и языке,
+    даже когда классы названы как угодно. Имя класса — дополнительный сигнал.
+
+    Возвращает (section_headings, card_headings).
+    """
+    from collections import Counter
+    heads = soup.find_all(_HEADING_RE)
+    if not heads:
+        return [], []
+    # Кэш живёт НА САМОМ объекте документа, а не в словаре по id(soup). Словарь по id() был прямой
+    # причиной «ноль <h2> при 11 найденных разделах»: id() это адрес в памяти, и CPython
+    # ПЕРЕИСПОЛЬЗУЕТ его после сборки мусора. Чистильщик разбирает документы пачкой, новый soup
+    # садится на адрес освобождённого, проверка по числу заголовков совпадает — и функция отдаёт
+    # теги ЧУЖОЙ, уже мёртвой страницы. Дальше вызывающий код сверяет их через id(), не находит
+    # ни одного совпадения в живом документе, и ни один заголовок не признаётся карточкой.
+    # Атрибут на объекте умирает вместе с ним, так что перепутать документы больше нечем.
+    _hit = getattr(soup, _HEADING_CACHE_ATTR, None)
+    if _hit is not None and _hit[0] == len(heads):
+        return list(_hit[1]), list(_hit[2])
+
+    def sig(h):
+        out = []
+        for anc in list(h.parents)[:3]:
+            cls = " ".join(anc.get("class") or [])[:40] if hasattr(anc, "get") else ""
+            out.append(f"{getattr(anc, 'name', '')}.{cls}")
+        return " < ".join(out)
+
+    counts = Counter(sig(h) for h in heads)
+
+    # ПРАВИЛО ВЛАДЕЛЬЦА (2026-07-20), строго:
+    #     div/section > h2 (заголовок раздела, СЮДА якорь) > h3 (карточки внутри)
+    # То есть в каждом блоке-разделе ПЕРВЫЙ заголовок — это заголовок раздела, а все следующие
+    # внутри того же блока — карточки. Признак «первый в своём блоке» работает даже там, где нет
+    # ни говорящих классов, ни повторяемости: на новостной странице «Health» идёт первым в своём
+    # <section>, а двадцать статей под ним — следующими.
+    _blocks = {}
+    for h in heads:
+        holder = None
+        for anc in h.parents:
+            if getattr(anc, "name", None) in ("section", "article", "main", "body", None):
+                holder = anc
+                break
+            cls = " ".join(anc.get("class") or []) if hasattr(anc, "get") else ""
+            if _SEM_SECTIONISH_RE.search(cls):
+                holder = anc
+                break
+        _blocks.setdefault(id(holder) if holder is not None else 0, []).append(h)
+    _first_in_block = {id(v[0]) for v in _blocks.values() if v}
+
+    sections, cards = [], []
+    for h in heads:
+        chain = [a for a in list(h.parents)[:4] if hasattr(a, "get")]
+        chain_cls = " ".join(" ".join(a.get("class") or []) for a in chain)
+        in_section_title = bool(_SECTION_TITLE_CLASS_RE.search(chain_cls))
+        in_item = bool(_ITEM_CLASS_RE.search(chain_cls))
+        repeated = counts[sig(h)] >= 3
+        # Явный маркер раздела ПОБЕЖДАЕТ повторяемость. Заголовки разделов тоже повторяются —
+        # их на странице восемь, — и первая версия из-за этого записала все восемь в карточки.
+        first_here = id(h) in _first_in_block
+        if in_section_title:
+            sections.append(h)
+        elif in_item or repeated:
+            cards.append(h)          # карточка листинга — никогда не якорь
+        elif first_here:
+            sections.append(h)       # первый заголовок своего блока = заголовок раздела
+        else:
+            cards.append(h)          # всё, что идёт следом внутри того же блока
+
+    # Страница БЕЗ заголовков разделов — это блог: список статей и виджеты, никаких «Health»
+    # и «Lifestyle» над ними. Тогда разделами становятся сами заголовки статей: якорю больше
+    # не к чему цепляться, а «нет секций» означает выпотрошенное меню.
+    # (sanjhapunjab: девять <h2> статей в div.post и ни одного категорийного заголовка.)
+    # Спросить агента — он видит СМЫСЛ: «Health» это рубрика, «Northborne Partners Advises…» это
+    # материал. Эвристика этого не отличает и уже дала несколько регрессов подряд.
+    try:
+        sys.path.insert(0, str(Path(__file__).parent / "site_studio"))
+        import semantics
+        if semantics.available():
+            _txt_heads = [h for h in heads if h.get_text(strip=True)][:30]
+            roles = semantics.classify_heading_roles([
+                {"i": i, "tag": h.name, "text": h.get_text(" ", strip=True),
+                 "cls": " ".join(h.get("class") or []),
+                 "parent_cls": " ".join((h.parent.get("class") or []) if h.parent else []),
+                 "siblings": len(h.parent.find_all(h.name)) if h.parent else 0}
+                for i, h in enumerate(_txt_heads)])
+            if roles:
+                ai_sec = {id(_txt_heads[i]) for i, v in roles.items() if v == "section"}
+                ai_card = {id(_txt_heads[i]) for i, v in roles.items() if v == "card"}
+                if ai_sec:  # пустой ответ игнорируем - он бесполезен, а не информативен
+                    # Членство считается по ТОЖДЕСТВУ. Оператор `in` у bs4 сравнивает РАЗМЕТКУ, а не
+                    # объект: два разных заголовка с одинаковой вёрсткой считаются одним и тем же,
+                    # и заголовок молча попадает не в тот список.
+                    _sec_ids = {id(h) for h in sections}
+                    sections = [h for h in heads if id(h) in ai_sec or
+                                (id(h) not in ai_card and id(h) in _sec_ids)]
+                    _keep = {id(h) for h in sections}
+                    cards = [h for h in heads if id(h) not in _keep]
+    except Exception:  # noqa: BLE001 - без ключа и при сбое работает детерминированный путь
+        pass
+
+    # Виджеты сайдбара (Search, Tags, Recent Posts, Archives) разделами не считаются — их всё равно
+    # отсеет следующий шаг. Без этой проверки счётчик разделов был завышен (24 вместо 2), запасное
+    # правило «разделов мало — повысить заголовки статей» не срабатывало, и на блоге не оставалось
+    # ни одной цели для якоря.
+    _WIDGETISH = re.compile(r"(?:^|[\s_-])(?:widget|sidebar|side-bar|secondary|aside|search|"
+                            r"archives?|categor|recent|tags?|calendar|meta|blogroll|subscribe|"
+                            r"social|share|advert|banner|promo)", re.I)
+
+    def _widgetish(h):
+        for anc in [h, *list(h.parents)[:5]]:
+            if not hasattr(anc, "get"):
+                break
+            ident = " ".join(anc.get("class") or []) + " " + (anc.get("id") or "")
+            if re.search(r"(?:^|[\s_-])section(?:[\s_-]|$)", ident, re.I):
+                return False
+            if _WIDGETISH.search(ident) or getattr(anc, "name", "") == "aside":
+                return True
+        return False
+
+    # Виджет убирается ТОЛЬКО из разделов. Если убрать его и из карточек, он не попадёт ни в один
+    # список — и тогда его заголовок не понизится до h3: у firsttalk так стало 42 <h2> вместо 9.
+    _wid = [h for h in sections if _widgetish(h)]
+    sections = [h for h in sections if not _widgetish(h)]
+    cards = cards + _wid
+
+    _real = [h for h in sections if h.get_text(strip=True)]
+    # Порог именно 3, а не 2: у sanjhapunjab нашлись ровно два <h1> (заголовки статей), условие
+    # «меньше двух» не срабатывало, и девять <h2> статей так и оставались карточками — цеплять
+    # якоря было не к чему. Два раздела на странице это ещё не навигация.
+    if len(_real) < 3 and cards:
+        promoted = [h for h in cards if h.get_text(strip=True)]
+        # берём самый крупный уровень среди карточек - это и есть заголовки статей,
+        # а не подписи внутри них
+        if promoted:
+            # Самый МНОГОЧИСЛЕННЫЙ уровень — это и есть заголовки статей. Брать самый верхний
+            # неверно: у sanjhapunjab два <h1> (два поста наверху) и девять <h2> (остальные), и
+            # верхний уровень дал бы только две цели вместо одиннадцати.
+            by_lvl = Counter(int(h.name[1]) for h in promoted)
+            top = max(by_lvl, key=lambda lv: (by_lvl[lv], -lv))
+            moved = [h for h in promoted if int(h.name[1]) == top]
+            if len(moved) >= 2:
+                sections = sections + moved
+                _moved_ids = {id(h) for h in moved}   # by identity: `in` у bs4 сравнивает разметку
+                cards = [h for h in cards if id(h) not in _moved_ids]
+    try:
+        setattr(soup, _HEADING_CACHE_ATTR, (len(heads), list(sections), list(cards)))
+    except Exception:  # noqa: BLE001 - кэш это ускорение, а не гарантия
+        pass
+    return sections, cards
+
+
 def normalize_heading_levels(soup, report):
     """Make the document's heading outline have NO skipped levels: after an h2 the next-deeper
     heading is h3, never h4. Deterministic, no AI, changes only the tag LEVEL (never the text).
@@ -5006,13 +5243,34 @@ def normalize_heading_levels(soup, report):
     # shipped with no <h1> at all - every site in the set had none. Exactly one <h1>: the first
     # heading is the page title; everything below it starts at <h2>, so a listing page of thirty
     # article titles does not become thirty <h1>.
+    # Заголовки карточек в листинге обязаны быть НА УРОВЕНЬ НИЖЕ заголовка своего раздела.
+    # На новостной странице «Health» это раздел (h2), а двадцать статей под ним — карточки, и они
+    # тоже приходили как h2. Для читателя и для поисковика это выглядит так, будто на странице
+    # двадцать равноправных разделов, а не один с двадцатью материалами.
+    _sections_h, _cards_h = classify_headings(soup)
+    _card_ids = {id(x) for x in _cards_h}
+
     stack = []
+    # Карточка обязана быть на уровень ниже СВОЕГО раздела, а не ниже жёсткой константы. Раньше
+    # стоял пол `max(3, ...)`, и на блоге, где единственный раздел — это <h1> заголовка страницы,
+    # все карточки падали на h3 и перепрыгивали h2 (sanjhapunjab: h1 + 34×h3, ни одного h2).
+    # Теперь запоминаем уровень последнего РАЗДЕЛА и ставим карточку ровно под него.
+    last_section_out = 1
     for idx, h in enumerate(headings):
         lvl = int(h.name[1])
         while stack and stack[-1] >= lvl:
             stack.pop()
         stack.append(lvl)
         out = 1 if idx == 0 else min(6, max(2, len(stack)))
+        # Первый заголовок страницы — это её заголовок, он ВСЕГДА h1 и никогда не понижается как
+        # карточка. Без этой оговорки листинг, начинающийся прямо с заголовка статьи, уезжал на h2
+        # и страница оставалась вообще без h1 (firsttalk: h2×35 + h3×106, ни одного h1).
+        if idx == 0:
+            last_section_out = 1
+        elif id(h) in _card_ids:
+            out = min(6, max(2, last_section_out + 1))
+        else:
+            last_section_out = out
         new_name = f"h{out}"
         if h.name != new_name:
             report.headings_normalized.append(f"{h.name} -> {new_name}")
@@ -5183,6 +5441,16 @@ def verify_output_contract(soup, report, original_html=None):
         share = len(m.get_text(" ", strip=True)) / total
         if share < 0.25:
             bad.append(f"<main> держит всего {share:.0%} текста — выбран не тот блок")
+        # Секции снаружи <main>. Этот пункт добавлен ПОСЛЕ РЕЦИДИВА: дефект уже чинили, он вернулся
+        # и прошёл незамеченным, потому что контракт проверял «лендмарк ВНУТРИ main», но не обратное.
+        # Секция снаружи невидима для привязки меню - её якорь ведёт в никуда, и пункты тихо теряются.
+        # ВАЖНО: сравнивать по РОДИТЕЛЮ, а не через `in m.descendants`. В bs4 оператор `in`
+        # сравнивает теги по РАЗМЕТКЕ, а не по объекту, поэтому две одинаковые секции считаются
+        # одной и той же - проверка молча пропускала дефект, ради которого её и писали.
+        # Тот же счёт, что и у чинилки: расхождение этих двух правил и было дефектом.
+        outside = sections_outside_main(soup)
+        if outside:
+            bad.append(f"секций СНАРУЖИ <main>: {len(outside)} — они невидимы для привязки меню")
         # A page whose whole body is a few words passes any RATIO check trivially: 25% of nothing is
         # still nothing. An iframe shell or a capture that lost its content looks compliant without
         # an absolute floor.
@@ -5262,6 +5530,84 @@ def repair_landmarks_in_main(soup, report):
                 report.semantic_tags_applied.append(f"<{tag}> вынесен из <main> на уровень страницы")
             fixed += 1
     return fixed
+
+
+def sections_outside_main(soup):
+    """ЕДИНСТВЕННЫЙ ответ на вопрос «какие секции лежат снаружи <main>».
+
+    Раньше на него отвечали двое и по-разному: контракт брал ЛЮБУЮ <section> без родителя <main>,
+    а чинилка ходила только по `main.next_siblings` — то есть не видела ни секций ПЕРЕД <main>, ни
+    вложенных в обёртку. Контракт исправно печатал «секций СНАРУЖИ <main>: 4», чинилка столь же
+    исправно не находила ни одной, и дефект жил между ними: секции есть, но привязка меню смотрит
+    только внутрь <main>, и карта сайта теряла разделы.
+
+    Секции внутри <header>/<footer> сюда не попадают — это часть лендмарка, а не потерянный контент.
+    """
+    main = soup.find("main")
+    if main is None:
+        return []
+    out = []
+    for s in soup.find_all("section"):
+        if s.find_parent("main") is not None:
+            continue
+        if s.find_parent(["header", "footer"]) is not None:
+            continue
+        # Секция, ВНУТРИ которой лежит <main>, — это обёртка страницы, а не потерянный блок.
+        # Формально она тоже «снаружи main», и попытка её перенести вырезает страницу целиком
+        # вместе с самим <main>: bambooship остался без заголовков, main, header и footer разом.
+        # Сравнение по ТОЖДЕСТВУ: `main in s.descendants` сверял бы разметку, а не объект.
+        if any(d is main for d in s.descendants):
+            continue
+        # Вложенная секция переезжает вместе с родителем — отдельно её трогать нельзя.
+        if any(p.name == "section" for p in s.parents if getattr(p, "name", None)):
+            continue
+        out.append(s)
+    return out
+
+
+def pull_sections_into_main(soup, report):
+    """Move any <section> that ended up as a SIBLING of <main> inside it.
+
+    Owner's rule: strictly header > main > footer, with every section inside <main>. A section left
+    outside is not a cosmetic problem - the menu logic only looks at content inside the content
+    area, so such a section is invisible to anchoring: its anchor leads nowhere and the menu quietly
+    loses items. Seen as `main > section section` closing early, with two more sections after it."""
+    main = soup.find("main")
+    body = soup.find("body")
+    if main is None or body is None:
+        return 0
+    moved = 0
+    # Сначала соседи <main>, целыми блоками — так сохраняется обёртка вместе с её оформлением.
+    for sib in list(main.next_siblings):
+        if getattr(sib, "name", None) is None:
+            continue
+        if sib.name in ("footer", "script", "style", "link", "meta", "noscript", "header"):
+            continue
+        if sib.find_parent("main") is not None:
+            continue
+        if sib.find(["header", "footer"]) is not None:
+            continue  # holds a landmark - leave it, repair_landmarks_in_main deals with that
+        if sib.name == "section" or sib.find("section") is not None:
+            main.append(sib.extract())
+            moved += 1
+    # Затем всё, что осталось снаружи по ЛЮБОЙ причине — секции ПЕРЕД <main> и упрятанные в обёртку.
+    # Порядок сохраняется: то, что шло до <main>, встаёт в его начало, остальное — в конец.
+    for s in sections_outside_main(soup):
+        if s.find_parent("main") is not None:      # мог уехать вместе с родителем на прошлом шаге
+            continue
+        before = False
+        for prev in main.previous_elements:
+            if prev is s:
+                before = True
+                break
+        if before:
+            main.insert(0, s.extract())
+        else:
+            main.append(s.extract())
+        moved += 1
+    if moved:
+        report.semantic_tags_applied.append(f"секций возвращено внутрь <main>: {moved}")
+    return moved
 
 
 def audit_against_original(original_html, soup, report, html_path=None):
@@ -6075,6 +6421,7 @@ def clean_html_file(
     if not dry_run:
         _audit_stylesheets(soup, html_path, site_domain, report)
 
+    pull_sections_into_main(soup, report)   # секции обязаны лежать внутри <main>
     repair_landmarks_in_main(soup, report)  # лендмарк внутри <main> — чиним, а не только сообщаем
     _strip_role_marks(soup)  # служебные метки разметки не должны уехать в готовый HTML
     _p(82, "Записываю страницу")

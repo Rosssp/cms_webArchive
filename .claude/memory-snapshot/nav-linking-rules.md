@@ -7,7 +7,7 @@ metadata:
   originSessionId: d2977795-0bd5-4502-a65e-166b52726951
 ---
 
-Owner-agreed rules for how `site_studio/site_edit.py::auto_link_menu` wires a restored single-page site's nav. Full spec lives in `site_studio/NAV_LINKING.md` — read it before touching nav code. These are product requirements; the owner got angry when they were wrong. Two rules that MUST hold:
+Owner-agreed rules for how `site_studio/site_edit.py::auto_link_menu` wires a restored single-page site's nav. Full spec lives in `docs/CLEANER.md (глава ЯКОРЯ, МЕНЮ, ХЕДЕР, ФУТЕР)` — read it before touching nav code. These are product requirements; the owner got angry when they were wrong. Two rules that MUST hold:
 
 1. **HEADER must always contain a link to the HERO (the first/top block).** The hero is NOT skipped — `_content_sections` includes it, flagged `is_hero` (first section + hero/intro/banner-classed ones). Header stays curated/capped at 4.
 

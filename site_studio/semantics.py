@@ -445,3 +445,167 @@ def find_section_starts(blocks):
         if i in valid and label:
             out.append({"i": i, "label": label})
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 7) Match menu items to sections when word overlap fails
+# --------------------------------------------------------------------------- #
+def match_menu_to_sections(items, sections):
+    """Decide which section each menu item should scroll to.
+
+    Word-overlap matching only works when the menu and the headings share vocabulary. It fails
+    completely when the menu is in one script and the headings in another (sanjhapunjab: an Urdu
+    menu over English/Urdu article titles), when the menu uses category names the headings never
+    repeat, or when labels are abbreviated. The result was 40 menu items with no href and no
+    anchor - neither linked nor removed.
+
+    Meaning is the only thing that connects "ساڈی تاریخ" (our history) to a history article, so
+    this is a question for the model, with the deterministic matcher kept as the first attempt.
+
+    `items`    - ["Home", "ساڈے ہیرو", ...]
+    `sections` - ["Snakes town", "Adam is lost", ...]
+    Returns a list the same length as `items`, each entry a section index or None.
+    """
+    items = list(items or [])
+    sections = list(sections or [])
+    if not available() or not items or not sections:
+        return None
+    it = "\n".join(f'{i}. "{_clip(x, 60)}"' for i, x in enumerate(items))
+    se = "\n".join(f'{i}. "{_clip(x, 70)}"' for i, x in enumerate(sections))
+    system = (
+        "You wire a restored single-page site: every menu item must scroll to the section it "
+        "belongs to. For each MENU ITEM pick the index of the SECTION it best corresponds to, by "
+        "MEANING - the two may be in different languages or scripts, and the wording rarely "
+        "matches exactly. Rules: a generic 'Home'/'Top'/'Main' item takes section 0. Never assign "
+        "the same section to more than two items - spread them out. If an item genuinely fits "
+        "nothing (a login link, a language switcher, an external service), use null. "
+        'Reply with ONLY JSON: [{"i": <item index>, "s": <section index or null>}]. No commentary.'
+    )
+    data = _ask_json(system, f"MENU ITEMS:\n{it}\n\nSECTIONS:\n{se}", max_tokens=700)
+    if not isinstance(data, list):
+        return None
+    out = [None] * len(items)
+    used = {}
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            i = int(row.get("i"))
+        except (TypeError, ValueError):
+            continue
+        s = row.get("s")
+        try:
+            s = int(s)
+        except (TypeError, ValueError):
+            s = None
+        if not (0 <= i < len(items)):
+            continue
+        if s is None or not (0 <= s < len(sections)):
+            continue
+        if used.get(s, 0) >= 2:
+            continue  # the model was told to spread; enforce it rather than trust it
+        used[s] = used.get(s, 0) + 1
+        out[i] = s
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 8) Human-readable anchor names
+# --------------------------------------------------------------------------- #
+def name_anchors(sections):
+    """Give each section a short, human anchor id: #about, #services, #contact.
+
+    The deterministic slug is built from the heading's words, which fails exactly when it matters:
+    a non-Latin heading yields nothing usable and the fallback is `#section-3536` - a URL fragment
+    that tells a visitor (and a search engine) nothing. Naming a block from its content is a
+    language question, not a string operation.
+
+    `sections` - [{"i","text","cls"}]. Returns {index: "slug"} using ASCII a-z0-9- only, or None.
+    """
+    sections = list(sections or [])
+    if not available() or not sections:
+        return None
+    listing = "\n".join(
+        f'{s.get("i")}. class="{_clip(s.get("cls"), 30)}" text="{_clip(s.get("text"), 110)}"'
+        for s in sections
+    )
+    system = (
+        "Name each section of a web page with a short URL anchor slug: lowercase ASCII letters, "
+        "digits and hyphens only, 1-3 words, no diacritics, no other script. Use the conventional "
+        "English word for what the section IS - about, services, products, contact, gallery, news, "
+        "team, pricing, faq, history, hero - even when the page is in another language, because "
+        "the slug goes in the URL. Make every slug distinct. "
+        'Reply with ONLY JSON: [{"i": <index>, "slug": "<slug>"}]. No commentary.'
+    )
+    data = _ask_json(system, f"SECTIONS:\n{listing}", max_tokens=500)
+    if not isinstance(data, list):
+        return None
+    out, seen = {}, set()
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            i = int(row.get("i"))
+        except (TypeError, ValueError):
+            continue
+        slug = re.sub(r"[^a-z0-9-]+", "-", str(row.get("slug") or "").lower()).strip("-")
+        slug = re.sub(r"-{2,}", "-", slug)[:40]
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        out[i] = slug
+    return out or None
+
+
+# --------------------------------------------------------------------------- #
+# 9) Section headings vs card headings
+# --------------------------------------------------------------------------- #
+def classify_heading_roles(items):
+    """Сказать про каждый заголовок: это ЗАГОЛОВОК РАЗДЕЛА или заголовок КАРТОЧКИ.
+
+    Детерминированно это не берётся, и попытки уже стоили нескольких регрессов. Признаки
+    противоречат друг другу: на новостном листинге заголовки статей повторяются и потому «карточки»,
+    а на блоге ровно такие же повторяющиеся заголовки статей — единственное, к чему можно цеплять
+    якорь, то есть «разделы». Отличает их только смысл: «Health» это рубрика, «Northborne Partners
+    Advises…» это материал.
+
+    `items` - [{"i","tag","text","cls","parent_cls","siblings"}] в порядке документа.
+    Возвращает {index: "section"|"card"} или None.
+    """
+    items = list(items or [])
+    if not available() or not items:
+        return None
+    listing = "\n".join(
+        f'{it.get("i")}. <{it.get("tag")}> class="{_clip(it.get("cls"), 24)}" '
+        f'parent="{_clip(it.get("parent_cls"), 28)}" siblings={it.get("siblings", 0)} '
+        f'text="{_clip(it.get("text"), 70)}"'
+        for it in items
+    )
+    system = (
+        "You are restoring an archived page into a single-page site. For EACH heading say whether "
+        "it is a SECTION heading (a part of the page a menu item could scroll to: About, Services, "
+        "Contact, a news rubric like Health/Sports, a testimonials block) or a CARD heading (the "
+        "title of one item inside a list: one article, one product, one team member, one comment). "
+        "Judge by MEANING and by the text itself: a rubric or a page area is short and generic; an "
+        "item title is specific and reads like a headline or a product name. "
+        "IMPORTANT: on a blog whose page is just a list of posts and there are NO rubric headings "
+        "at all, the POST titles are the sections - they are the only thing a menu can point to. "
+        "Sidebar widget titles (Search, Tags, Recent Posts, Archives) are neither: mark them card. "
+        'Reply with ONLY JSON: [{"i": <index>, "role": "section"|"card"}]. No commentary.'
+    )
+    data = _ask_json(system, f"HEADINGS:\n{listing}", max_tokens=900)
+    if not isinstance(data, list):
+        return None
+    out = {}
+    valid = {it.get("i") for it in items}
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            i = int(row.get("i"))
+        except (TypeError, ValueError):
+            continue
+        role = str(row.get("role") or "").strip().lower()
+        if i in valid and role in ("section", "card"):
+            out[i] = role
+    return out or None

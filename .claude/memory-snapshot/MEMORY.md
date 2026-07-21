@@ -1,6 +1,15 @@
 - [AI semantics feature](ai-semantics-feature.md) — optional Haiku pass in the cleaner: tag semantics, section labels, meta; auto-on when ANTHROPIC_API_KEY set
-- [Nav linking rules](nav-linking-rules.md) — header MUST link the hero; footer = full sitemap (all sections); never leave empty '#'. Spec: site_studio/NAV_LINKING.md
+- [Nav linking rules](nav-linking-rules.md) — header MUST link the hero; footer = full sitemap (all sections); never leave empty '#'. Спека: docs/CLEANER.md, глава ЯКОРЯ/МЕНЮ/ХЕДЕР/ФУТЕР
 - [Fix script not file; restart server](fix-script-not-file-restart-server.md) — fix root cause in the SCRIPT, not one output file; studio server (debug=False) needs RESTART to apply script changes
 - [Generated header feature](generated-header-feature.md) — header_gen.py auto-builds a header (6 variants, colors from site, auto light/dark, CSS burger) for sites with no header
 - [Wayback download traps](wayback-download-traps.md) — 2 download bugs (asset-URL prefix, over-aggressive anchor strip) that blanked sites & deleted menus; check raw .bak first when a clean looks broken
 - [Расширять, а не подгонять](extend-dont-narrow-fix.md) — чинить баг расширением общей очистки, НЕ под один сломанный сайт; на каждое ослабление правила — отрицательный тест
+- [Читать спеки ДО правки](read-specs-before-fixing.md) — docs/CLEANER.md читать ПЕРЕД работой (единственный справочник); правила про якоря были записаны с начала проекта, а я их не открывал
+- [Структура страницы](page-structure-rule.md) — строго header > main > footer; ВСЕ секции внутри main, снаружи ничего
+- [Лестница якорей](anchor-placement-ladder.md) — секции → заголовки → визуальные заголовки → агент; агент же даёт имена #about/#contact вместо #section-3536
+- [Заголовок раздела vs карточки](heading-section-vs-card.md) — div/section > h2 (якорь) > h3 (карточки); блог без рубрик: разделами становятся статьи
+- [Одну величину считают по-разному](same-value-counted-differently.md) — ГЛАВНЫЙ класс багов: части кода расходятся в подсчёте одного и того же
+- [id() не ключ словаря](id-not-a-dict-key.md) — CPython переиспользует адреса; кэш на документ вешать атрибутом НА объект
+- [Трассировать, а не перечитывать](trace-dont-read.md) — правка не влияет? проверь подменой, вызывается ли функция вообще
+- [Якоря на h2](anchors-on-h2.md) — якорь на САМ <h2>, не на блок-обёртку; дубликаты подписей схлопывать
+- [Мерить как продукт](measure-like-the-product.md) — тест должен считать тем же правилом, что и код; иначе выдумывает дефекты

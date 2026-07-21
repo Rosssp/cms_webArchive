@@ -1162,6 +1162,24 @@ def _remove_nav_item(a):
         li.decompose()
 
 
+def _is_live_anchor(a, soup=None):
+    """Ведёт ли пункт меню на РЕАЛЬНЫЙ раздел этой страницы.
+
+    Единственный ответ на вопрос «якорь рабочий?» — раньше его считали в двух местах по разным
+    правилам, и это стоило sanjhapunjab всего меню. Проверка `href.startswith("#")` признавала
+    рабочей заглушку `href="#"`, которую сам же чистильщик ставит вместо мёртвой ссылки: сорок
+    мёртвых пунктов выглядели как сорок живых якорей, порог «меню в основном мертво» не срабатывал,
+    и пересборка меню из секций не запускалась ни разу.
+    """
+    href = (a.get("href") or "").strip()
+    if len(href) < 2 or not href.startswith("#") or href.lower() in _NAV_UNRESOLVED_HREFS:
+        return False
+    if soup is None:
+        return True
+    target = href[1:]
+    return soup.find(id=target) is not None or soup.find("a", attrs={"name": target}) is not None
+
+
 def _nav_menu_links(container):
     """The real menu <a> items in a nav container - skips dropdown toggles, social/share
     links, and icon-only links (no visible text), which aren't page-section menu items."""
@@ -1276,6 +1294,32 @@ def _looks_like_footer_nav(footer):
     return len(links) >= 2
 
 
+# A sidebar widget is chrome, not a section of the page. Without this the "sections" of
+# sanjhapunjab came out as Search / Featured Posts / Archives while its eight actual article
+# headings were ignored - so no menu item could ever match anything real.
+_WIDGET_CLASS_RE = re.compile(
+    r"(?:^|[\s_-])(?:widget|sidebar|side-bar|aside|secondary|rightcont|leftcont|"
+    r"search|archives?|categor(?:y|ies)|recent|tags?|calendar|meta|blogroll|"
+    r"subscribe|social|share|advert|banner|promo)\w*(?:[\s_-]|$)", re.I)
+
+
+def _is_widget_block(el):
+    for anc in [el, *el.parents]:
+        if getattr(anc, "name", None) in (None, "[document]"):
+            break
+        ident = _cls(anc) + " " + (anc.get("id") or "")
+        # Блок, который сам объявлен разделом, виджетом быть не может. Иначе `section-category`
+        # (раздел «Health»/«Lifestyle» на новостном сайте) попадал под слово «category» в списке
+        # виджетов, и ВСЕ настоящие разделы страницы выбрасывались из списка секций.
+        if re.search(r"(?:^|[\s_-])section(?:[\s_-]|$)", ident, re.I):
+            return False
+        if anc.name in ("aside",):
+            return True
+        if _WIDGET_CLASS_RE.search(ident):
+            return True
+    return False
+
+
 def _fallback_section_blocks(soup, nav_desc):
     """When a page has no <section> tags (common in older exports that lay content out as
     <div class="content-section-a"> blocks straight under <body>), use the content root's
@@ -1305,7 +1349,7 @@ def _fallback_section_blocks(soup, nav_desc):
             continue
         if id(ch) in nav_desc:
             continue
-        if _find_heading_like(ch) is not None:
+        if _find_heading_like(ch) is not None and not _is_widget_block(ch):
             out.append(ch)
     return out
 
@@ -1365,7 +1409,28 @@ def _content_sections(soup):
     # <section> while twelve real content blocks stayed <div> never reached the fallback, so the
     # menu had one anchor target and the rest of its items were deleted. Two is the threshold - one
     # section is not an outline.
-    _secs = [s for s in soup.find_all("section") if id(s) not in nav_desc]
+    _secs = [s for s in soup.find_all("section")
+             if id(s) not in nav_desc and not _is_widget_block(s)]
+    # ЯКОРЬ СТАВИТСЯ НА <h2> (правило владельца, 2026-07-20). Чистильщик сам приводит уровни так,
+    # что h2 — это заголовок РАЗДЕЛА, а h3 — карточка внутри него. Значит список h2 и есть готовый
+    # перечень разделов, причём детерминированный: не зависит ни от агента, ни от того, обернул ли
+    # шаблон блок в <section>. Раньше разделы искались по блокам-обёрткам, и у sanjhapunjab при
+    # одиннадцати h2 находилось два раздела — цеплять якоря было практически не к чему.
+    _h2_hosts = []
+    _main = soup.find("main") or soup.body or soup
+    for h in _main.find_all("h2"):
+        if id(h) in nav_desc or _is_widget_block(h):
+            continue
+        if h.find_parent(["header", "footer", "nav"]) is not None:
+            continue
+        if not h.get_text(strip=True):
+            continue
+        _h2_hosts.append(h)
+    # Якорь вешается на САМ заголовок: он и есть цель перехода, и его id никуда не уедет при
+    # перестановке блоков. Обёртку не ищем — именно поиск обёртки и терял разделы.
+    for h in _h2_hosts:
+        if not any(id(h) == id(x) for x in _secs):
+            _secs.append(h)
     if len(_secs) < 2:
         _seen_ids = {id(s) for s in _secs}
         _extra = [b for b in _fallback_section_blocks(soup, nav_desc) if id(b) not in _seen_ids]
@@ -1375,6 +1440,47 @@ def _content_sections(soup):
     # no rule separates "Mayor's Corner" (a section title) from a bold word inside a paragraph.
     # Without it such pages get zero sections, and with nothing to anchor to the menu is stripped
     # to a single item.
+    # Still thin? Every real heading in the content is a legitimate section start. A blog page is
+    # eight articles with eight <h2>; treating only wrapper divs as sections found none of them, so
+    # the menu had nothing to point at even though the page was full of anchorable titles.
+    # Заголовки РАЗДЕЛОВ добавляются ВСЕГДА, а не только когда секций мало. У firsttalk на странице
+    # девять тегов <section> (модалка, тикер, лента), поэтому проверка «если секций < 2» не
+    # срабатывала, и настоящие разделы Health/Lifestyle/India в список не попадали вовсе — меню
+    # цеплялось к служебным блокам.
+    if True:
+        try:
+            import clean_wayback_site as _cw
+            _sec_heads, _ = _cw.classify_headings(soup)
+        except Exception:  # noqa: BLE001
+            _sec_heads = []
+        for h in _sec_heads:
+            if id(h) in nav_desc or _is_widget_block(h):
+                continue
+            if h.find_parent(["header", "footer", "nav"]) is not None:
+                continue
+            host = h.parent if h.parent is not None and h.parent.name not in ("main", "body") else h
+            # поднимаемся до блока раздела, а не до обёртки заголовка
+            for _ in range(3):
+                par = host.parent
+                if par is None or par.name in ("main", "body", "html"):
+                    break
+                if len(par.get_text(" ", strip=True)) > len(host.get_text(" ", strip=True)) * 1.5:
+                    break
+                host = par
+            if not any(id(host) == id(x) for x in _secs):
+                _secs.append(host)
+
+    if len(_secs) < 2:
+        main = soup.find("main") or soup.body or soup
+        for h in main.find_all(HEADING_TAGS):
+            if id(h) in nav_desc or _is_widget_block(h):
+                continue
+            if h.find_parent(["header", "footer", "nav"]) is not None:
+                continue
+            host = h.parent if h.parent is not None and h.parent.name not in ("main", "body") else h
+            if not any(id(host) == id(x) for x in _secs):
+                _secs.append(host)
+
     if len(_secs) < 2:
         _ai_secs = _ai_section_starts(soup, nav_desc)
         if _ai_secs:
@@ -1394,7 +1500,9 @@ def _content_sections(soup):
         # card's h3), else a title made from the section's own class name.
         tag_el = sec.find(class_=re.compile(r"section-tag|eyebrow|overline|subtitle|kicker|label", re.I))
         tag_text = re.sub(r"\s+", " ", tag_el.get_text(" ", strip=True)).strip() if tag_el else ""
-        h = sec.find(HEADING_TAGS)
+        # Раздел может БЫТЬ заголовком (якорь ставим прямо на h2). `find` ищет только среди
+        # потомков и для самого заголовка вернёт None — подпись тогда собиралась из имени класса.
+        h = sec if sec.name in HEADING_TAGS else sec.find(HEADING_TAGS)
         h_text = re.sub(r"\s+", " ", h.get_text(" ", strip=True)).strip() if h else ""
         cls_words = [w for w in _slug_words(_cls(sec))
                      if w not in _SECTION_LABEL_NOISE and not _ANIM_CLASS_RE.match(w)]
@@ -1407,6 +1515,19 @@ def _content_sections(soup):
         sample = re.sub(r"\s+", " ", p.get_text(" ", strip=True)).strip()[:200] if p else ""
         out.append({"el": sec, "text": title, "keys": keys, "sample": sample,
                     "kind": None, "ai_label": _AI_SECTION_LABELS.get(id(sec)), "is_hero": is_hero})
+    # Разделы с ОДИНАКОВОЙ подписью схлопываются в один. Иначе и в меню, и в карте появлялись
+    # повторы («Snakes town» трижды подряд, наезжая друг на друга) — один и тот же заголовок
+    # попадал в список и как блок-обёртка, и как сам <h2>. Для читателя это выглядит как поломка
+    # вёрстки, хотя ссылки рабочие. Первое вхождение выигрывает — оно выше по странице.
+    _seen_titles, _uniq = set(), []
+    for s in out:
+        key = re.sub(r"\s+", " ", (s.get("text") or "")).strip().casefold()
+        if key and key in _seen_titles:
+            continue
+        if key:
+            _seen_titles.add(key)
+        _uniq.append(s)
+    out = _uniq
     # The first section in document order is the hero/top block even if it carries no hero-ish
     # class - the header's guaranteed "top" link points here.
     if out:
@@ -1434,6 +1555,41 @@ def _classify_sections_ai(sections):
         sec["kind"] = lab.get("kind")
         sec["ai_label"] = lab.get("label") or None
 
+    # Human anchor names. The deterministic slug comes from the heading's words and fails exactly
+    # where it matters - a Vietnamese or Urdu heading yields nothing usable and the fallback was
+    # "#section-3536", which tells a visitor and a search engine nothing. The model names a block
+    # for what it IS (#about, #products, #contact) in any language.
+    try:
+        slugs = semantics.name_anchors(
+            [{"i": i, "text": s.get("text") or "", "cls": _cls(s["el"])}
+             for i, s in enumerate(sections)])
+        for i, slug in (slugs or {}).items():
+            if not (0 <= i < len(sections)):
+                continue
+            if not sections[i]["el"].get("id"):
+                sections[i]["kind"] = slug  # _ensure_section_anchor prefers `kind` as the slug
+            # ...и ПОДПИСЬ тоже. Иначе в меню и в карте сайта попадают имена классов и технические
+            # id: "Heading2", "Rightcomtext", "content_wapper_choice", "section-7680" - для
+            # посетителя это шум. Берём человеческое имя, когда своего заголовка у секции нет или
+            # он сам выглядит техническим.
+            # Проверяем И собственный заголовок, И уже проставленную метку: техническое имя
+            # («Heading2», «Rightcomtext», «content_wapper_choice», «section-7392») приходит чаще
+            # всего именно из метки, а не из текста, и раньше оно побеждало человеческое имя.
+            def _is_technical(v):
+                v = (v or "").strip()
+                if not v:
+                    return True
+                if re.fullmatch(r"[\w -]*(?:section|wapper|wrapper|cont|content|text|heading|"
+                                r"title|div|block|item|left|right|main|body)[\w -]*\d*", v, re.I):
+                    return True
+                # строка без пробелов из букв/цифр/подчёркиваний — это id или класс, а не заголовок
+                return bool(re.fullmatch(r"[a-z0-9_-]{4,}", v, re.I)) and " " not in v
+
+            if _is_technical(sections[i].get("text")) and _is_technical(sections[i].get("ai_label")):
+                sections[i]["ai_label"] = slug.replace("-", " ").strip().capitalize()
+    except Exception:  # noqa: BLE001 - no key -> deterministic slugs, unchanged behaviour
+        pass
+
 
 def _ensure_section_anchor(sec):
     """Anchor id for a section: its existing id if present, else a fresh contextual slug (max
@@ -1452,8 +1608,20 @@ def _ensure_section_anchor(sec):
     slug = "-".join(words[:3])
     if not slug:
         slug = "-".join(_slug_words(_cls(sec))[:3])
+    # NEVER return empty: the caller writes "#" + slug, so an empty slug produces href="#", a link
+    # that goes nowhere - exactly what NAV_LINKING.md forbids ("Never leave an empty #"). It happens
+    # whenever the heading is non-Latin or punctuation-only and _slug_words yields nothing.
     if not slug:
         slug = "section-" + str(abs(id(sec["el"])) % 10000)
+    # ...and it must be UNIQUE: two sections with the same heading otherwise share one id and every
+    # link scrolls to the first of them.
+    root = sec["el"]
+    while root.parent is not None:
+        root = root.parent
+    base, n = slug, 2
+    while root.find(id=slug) is not None:
+        slug = f"{base}-{n}"
+        n += 1
     sec["el"]["id"] = slug
     return slug
 
@@ -1603,6 +1771,63 @@ def _ensure_footer_copyright(footer, domain, soup):
     p.string = text
     footer.append(p)
     return True
+
+
+def _rebuild_nav_from_sections(nav, sections, limit=4):
+    """Rewrite a menu into working in-page navigation, REUSING its own <a> elements.
+
+    Preserving the original labels only makes sense when they can be matched to something on the
+    page. On a restored single-page site they usually cannot: the menu points at sub-pages that no
+    longer exist, and on sanjhapunjab it was 40 Urdu items over English article titles - matching
+    them was never going to work, and the result was 40 dead words in the header.
+
+    What the page needs is navigation that WORKS. So the item text is replaced with the section
+    title and the href with its anchor. Existing <a> elements are reused rather than created, so
+    the theme's CSS still styles the bar exactly as before; surplus items are removed.
+    """
+    if nav is None or not sections:
+        return 0
+    items = _nav_menu_links(nav)
+    want = sections[:max(1, min(limit, len(sections)))]
+    # Если переиспользовать нечего — СОЗДАТЬ пункты. Раньше функция просто выходила, и это была
+    # причина, по которой firsttalk оставался с одним пунктом: его семь пунктов вели на подстраницы
+    # (/spotlight, /world), их обнулили и удалили как непривязанные, а пересборка потом не нашла ни
+    # одного <a>, который можно переписать. Меню обязано быть, даже если исходное стёрли.
+    if not items:
+        # Подняться до САМОГО корня: new_tag есть только у объекта документа, а find_parent("html")
+        # возвращает обычный тег — из-за этого создание пунктов молча не срабатывало.
+        soup = nav
+        while getattr(soup, "parent", None) is not None:
+            soup = soup.parent
+        if not hasattr(soup, "new_tag"):
+            return 0
+        host = nav.find("ul") or nav
+        for _ in want:
+            a = soup.new_tag("a") if hasattr(soup, "new_tag") else None
+            if a is None:
+                break
+            if host.name == "ul":
+                li = soup.new_tag("li")
+                li.append(a)
+                host.append(li)
+            else:
+                host.append(a)
+            items.append(a)
+        if not items:
+            return 0
+    changed = 0
+    for a, sec in zip(items, want):
+        href = "#" + _ensure_section_anchor(sec)
+        label = _section_label(sec)
+        if not label:
+            continue
+        a["href"] = href
+        _set_link_text(a, label)
+        changed += 1
+    for a in items[len(want):]:
+        _remove_nav_item(a)
+        changed += 1
+    return changed
 
 
 def _rebuild_footer_sitemap(footer, sections):
@@ -1947,6 +2172,26 @@ def auto_link_menu(site_dir):
         #     result is always exactly "every section, anchored + labeled" no matter what the
         #     original footer links were (Privacy/Payment/Refund PDFs etc.). ---
         # (Not for a CMS footer menu - like the header, that's the site's real nav; leave it.)
+        # Если в футере ВООБЩЕ нет блока ссылок — его надо создать. Карта сайта в футере это
+        # правило владельца («футер = ВСЕ секции»), а не улучшение по возможности. Раньше карта
+        # строилась только поверх уже существующих ссылок, поэтому созданный или бедный футер
+        # (sylhet, tuonggo, bikenfoot) оставался пустым.
+        if (footer is not None and sections and not _is_cms_menu(footer)
+                and not _looks_like_footer_nav(footer)):
+            _fnav = soup.new_tag("nav")
+            _fnav["class"] = ["wb-footer-nav"]
+            for _sec in sections:
+                _a = soup.new_tag("a", href="#" + _ensure_section_anchor(_sec))
+                _a.string = (_sec.get("ai_label") or _sec.get("text") or "").strip()[:60] or "Раздел"
+                _fnav.append(_a)
+            _cp = footer.find("p", class_="site-copyright")
+            if _cp is not None:
+                _cp.insert_before(_fnav)
+            else:
+                footer.insert(0, _fnav)
+            linked.append(f"{rel_self}: в футере СОЗДАНА карта сайта ({len(sections)} разделов)")
+            dirty = True
+
         if (footer is not None and _looks_like_footer_nav(footer) and sections
                 and not _is_cms_menu(footer)):
             fchanges = _rebuild_footer_sitemap(footer, sections)
@@ -1954,6 +2199,21 @@ def auto_link_menu(site_dir):
                 for c in fchanges:
                     linked.append(f'{rel_self}: footer {c}')
                 dirty = True
+
+        # If the menu still has no working in-page navigation, build it from the sections. Matching
+        # original labels is a nice-to-have; a header whose items lead nowhere is not acceptable.
+        _hnav = _find_header_nav(soup) or soup.find("header")
+        if _hnav is not None and sections:
+            _anchored = [a for a in _nav_menu_links(_hnav) if _is_live_anchor(a, soup)]
+            # Rebuild when the menu is mostly dead, not only when it is completely dead. Two
+            # working anchors out of forty is not navigation.
+            _all_items = _nav_menu_links(_hnav)
+            if len(_anchored) < min(3, len(sections)) or len(_anchored) < len(_all_items) * 0.5:
+                _n = _rebuild_nav_from_sections(_hnav, sections, _HEADER_MAX_LINKS)
+                if _n:
+                    linked.append(f"{rel_self}: меню пересобрано из секций ({_n} пунктов) — "
+                                  f"исходные подписи никуда не вели")
+                    dirty = True
 
         # Footer links follow the SAME rule as the header: once the sections run out, a menu item
         # that points nowhere is dead weight and gets removed rather than kept as unclickable text.
@@ -1996,13 +2256,56 @@ def auto_link_menu(site_dir):
         #     placeholders, icon-only social links. A link WITH visible text gets a section anchor
         #     (contextual word-match, else the first/any section); an icon-only link (social, no
         #     text) just loses its dead href so it stops looking clickable. ---
+        # Deterministic matching first; whatever it leaves unmatched goes to the model. Word overlap
+        # cannot connect an Urdu menu to English headings, and the result was 40 items with neither
+        # an anchor nor a removal - the worst of both.
+        _ai_map = {}
+        if sections:
+            _pending = []
+            for _a in soup.find_all("a"):
+                _low = (_a.get("href") or "").strip().lower()
+                if _a.has_attr("href"):
+                    if _low not in _NAV_UNRESOLVED_HREFS and not _low.startswith("javascript:"):
+                        continue
+                elif _a.find_parent(["header", "nav", "footer"]) is None:
+                    continue
+                _txt = _a.get_text(" ", strip=True)
+                if not _txt:
+                    continue
+                if _matched_section(_txt, sections) is None:
+                    _pending.append(_a)
+            if _pending:
+                try:
+                    import semantics
+                    if semantics.available():
+                        _res = semantics.match_menu_to_sections(
+                            [x.get_text(" ", strip=True) for x in _pending],
+                            [s.get("text") or "" for s in sections])
+                        for _a, _si in zip(_pending, _res or []):
+                            if _si is not None and 0 <= _si < len(sections):
+                                _ai_map[id(_a)] = sections[_si]
+                        if _ai_map:
+                            linked.append(f"{rel_self}: агент привязал {len(_ai_map)} пунктов "
+                                          f"меню по смыслу (совпадений по словам не было)")
+                except Exception:  # noqa: BLE001 - no key -> deterministic behaviour unchanged
+                    pass
+
         _anchor_use = {}  # section-element id -> how many links already point at it
-        for a in list(soup.find_all("a", href=True)):
+        # Also take <a> that has NO href at all. An earlier pass (external-link stripping) removes
+        # the attribute outright, and everything here only ever looked at a[href] - so those items
+        # were invisible to the whole wiring stage: never anchored, never removed, left as dead
+        # words in the menu. That is exactly what sanjhapunjab shipped: 40 such items.
+        for a in list(soup.find_all("a")):
             low = (a.get("href") or "").strip().lower()
-            if low not in _NAV_UNRESOLVED_HREFS and not low.startswith("javascript"):
-                continue
-            if _is_dropdown_toggle(a):
-                continue  # a real dropdown toggle legitimately uses "#" - leave it
+            if a.has_attr("href"):
+                if low not in _NAV_UNRESOLVED_HREFS and not low.startswith("javascript"):
+                    continue
+            elif a.find_parent(["header", "nav", "footer"]) is None:
+                continue  # a hrefless <a> in body text is not a menu item - leave it alone
+            if _is_dropdown_toggle(a) and a.find_next_sibling(["ul", "div"]) is not None:
+                continue  # a toggle that still HAS a submenu legitimately uses "#" - leave it
+            # ...but a toggle whose submenu went away with the JS toggles nothing. It is a dead
+            # menu item like any other, so it gets a section anchor and the section's name.
             txt = a.get_text(" ", strip=True)
             if not txt:
                 # icon-only dead link (social etc.) -> drop the dead href, keep the empty <a>
@@ -2014,6 +2317,8 @@ def auto_link_menu(site_dir):
             # section" pointed a 135-item mega-menu at one and the same anchor - worse than
             # leaving it dead, and it hides the fact that nothing matched.
             sec = _matched_section(txt, sections) if sections else None
+            if sec is None:
+                sec = _ai_map.get(id(a))  # смысловая привязка от агента
             # One section must not swallow the whole menu. On danvanhaiphong the org's name
             # ("dân vận") is both the first section's heading AND part of dozens of menu labels,
             # so 45 items "matched" the same anchor - a technically-real overlap that means
@@ -2026,7 +2331,16 @@ def auto_link_menu(site_dir):
                     _anchor_use[key] = _anchor_use.get(key, 0) + 1
             if sec is not None:
                 a["href"] = "#" + _ensure_section_anchor(sec)
-                linked.append(f'{rel_self}: "{txt[:24]}" -> {a["href"]}')
+                # Rename to the section. The original label pointed at a sub-page that no longer
+                # exists, so keeping it just lies about where the link goes. Header gets the SHORT
+                # form (a narrow bar), the footer the FULL section title (it is the sitemap).
+                _in_footer = a.find_parent("footer") is not None
+                _new_label = (sec.get("ai_label")
+                              or (sec.get("text") if _in_footer else _short_label(sec.get("text") or ""))
+                              or sec.get("text") or "")
+                if _new_label:
+                    _set_link_text(a, _new_label.strip())
+                linked.append(f'{rel_self}: "{txt[:20]}" -> {a["href"]} ("{_new_label[:20]}")')
             elif _in_protected_cms_menu(a):
                 # The site's REAL multi-page menu (WordPress &c). Deleting its items guts the
                 # site's navigation - keep every item, just stop it being a dead link.
@@ -2041,6 +2355,44 @@ def auto_link_menu(site_dir):
                 # In the page body keep the text/layout, just stop pretending it's a link.
                 del a["href"]
                 relabeled.append(f'{rel_self}: stripped dead href on "{txt[:24]}"')
+            dirty = True
+
+        # No two menu items may carry the SAME text AND the same anchor. firsttalk shipped three
+        # identical "Latest Article" links all pointing at #featured - that is not navigation, it is
+        # the same item repeated. Keep the first, drop the rest.
+        for _navc in soup.find_all(["nav", "header", "footer"]):
+            _seen_pairs = set()
+            for _a in list(_navc.find_all("a", href=True)):
+                _h = (_a.get("href") or "").strip()
+                if not _h.startswith("#"):
+                    continue
+                _key = (_h, _a.get_text(" ", strip=True).lower())
+                if _key in _seen_pairs:
+                    _remove_nav_item(_a)
+                    removed.append(f'{rel_self}: nav дубль "{_key[1][:18]}" -> {_h}')
+                    dirty = True
+                else:
+                    _seen_pairs.add(_key)
+
+        # FINAL CLEANUP: nothing in a menu may be left without an href. By this point every item
+        # that could be anchored has been; whatever still has no href leads nowhere, and dead words
+        # in a menu bar are worse than a shorter menu (owner's rule). Typically these are the
+        # submenu items of a mega-menu whose parent items now point at sections - sanjhapunjab kept
+        # 36 of them. Guarded so the menu is never emptied completely.
+        for _navc in soup.find_all(["nav", "header", "footer"]):
+            # Считать живые ссылки по ВСЕМУ контейнеру, а не только по верхнему уровню меню.
+            # У мега-меню (firsttalk: 7 верхних пунктов + 57 во вложенных списках) верхний уровень
+            # мог дать всего одну живую ссылку, страховка «не опустошать меню» срабатывала, и все
+            # 57 мёртвых подпунктов оставались на странице.
+            _live = [a for a in _navc.find_all("a") if (a.get("href") or "").strip()]
+            _dead = [a for a in _navc.find_all("a")
+                     if not (a.get("href") or "").strip() and a.get_text(strip=True)]
+            if not _dead or len(_live) < 2:
+                continue
+            for _a in _dead:
+                _remove_nav_item(_a)
+                removed.append(f'{rel_self}: nav "{_a.get_text(" ", strip=True)[:20]}" '
+                               f'(без ссылки — удалён)')
             dirty = True
 
         if dirty:
