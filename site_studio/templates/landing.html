@@ -109,6 +109,9 @@
   .wtg:hover{background:#efeadf}
   .wtg.on{background:var(--green); color:#fff}
   .wtg.on:hover{background:var(--green)}
+  .opts{display:flex; flex-direction:column; gap:3px; margin:2px 0}
+  .hdtog{display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:600; color:var(--text-dim); cursor:pointer; user-select:none; padding:1px 2px}
+  .hdtog input{margin:0; cursor:pointer; accent-color:var(--green)}
   .wwwtog.busy{display:inline-flex; align-items:center; gap:7px; padding:5px 11px; border:1px solid var(--border-strong);
     border-radius:8px; font-size:11px; font-weight:700; color:var(--text-dim); align-self:flex-start}
   .wwwtog.busy::before{content:''; width:11px; height:11px; border:2px solid var(--border); border-top-color:var(--green);
@@ -296,6 +299,10 @@ function cardHTML(e){
       <div class="url">${esc(e.url)}</div>
       ${wwwTog}
       ${mid}
+      ${(e.dl_done && !dlErr && !cleaning) ? `<div class="opts">
+        <label class="hdtog" title="Вкл: выровнять уровни заголовков (h2→h3, без пропусков). Выкл: оставить как в веб-архиве."><input type="checkbox" data-hd="${e.id}" ${_hdOn[e.id]!==false?'checked':''}> менять заголовки</label>
+        <label class="hdtog" title="Пункты меню хедера, которым некуда привязать якорь, НЕ удалять — просто убрать href (останутся как текст)."><input type="checkbox" data-kh="${e.id}" ${_khOn[e.id]===true?'checked':''}> не удалять пункты хедера</label>
+      </div>` : ''}
       <div class="acts">${acts}</div>
     </div>
   </div>`;
@@ -303,7 +310,15 @@ function cardHTML(e){
 
 // keep a small per-card cache-buster so the preview <img> reloads when clean finishes
 const _pv = {};
+const _hdOn = {};  // entry id -> "менять заголовки" checked (default on); persists across re-renders
+const _khOn = {};  // entry id -> "не удалять пункты хедера" checked (default off)
 const _wwwBusy = new Set();  // cards mid www<->non-www switch - render a skeleton on them
+// remember the checkbox choices so a re-render (every poll) doesn't reset them
+document.addEventListener('change', ev => {
+  const t = ev.target;
+  if(t && t.matches && t.matches('input[data-hd]')) _hdOn[t.getAttribute('data-hd')] = t.checked;
+  if(t && t.matches && t.matches('input[data-kh]')) _khOn[t.getAttribute('data-kh')] = t.checked;
+});
 function render(entries){
   const head = $('#gridHead'), grid = $('#grid');
   if(!entries.length){ head.style.display='none'; grid.innerHTML=''; return; }
@@ -345,7 +360,11 @@ document.addEventListener('click', ev=>{
       setTimeout(()=>{ _wwwBusy.delete(id); if(!r.ok) alert(r.error||''); poll(); }, wait);
     });
   }
-  else if(t.dataset.clean){ api('/api/entry/clean',{id:t.dataset.clean}).then(r=>{ if(!r.ok) alert(r.error||''); poll(); }); }
+  else if(t.dataset.clean){
+    const nh = _hdOn[t.dataset.clean] !== false;   // default on;  survives re-renders
+    const kh = _khOn[t.dataset.clean] === true;     // default off
+    api('/api/entry/clean',{id:t.dataset.clean, normalize_headings:nh, keep_header_items:kh}).then(r=>{ if(!r.ok) alert(r.error||''); poll(); });
+  }
   else if(t.dataset.cancel){ api('/api/entry/cancel',{id:t.dataset.cancel}).then(poll); }
   else if(t.dataset.remove){ api('/api/entry/remove',{id:t.dataset.remove}).then(poll); }
   else if(t.dataset.folder){ api('/api/entry/open-folder',{id:t.dataset.folder}).then(r=>{ if(!r.ok) alert(r.error||''); }); }

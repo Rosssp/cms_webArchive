@@ -664,6 +664,8 @@ class Report:
         self.htaccess_created = False
         self.canonical_old = None
         self.canonical_new = None
+        self.html_lang = None
+        self.head_meta_deduped = 0
         self.recovered_images = []
         self.failed_image_recovery = []
         self.noindex_removed = None
@@ -874,6 +876,10 @@ class Report:
                 lines.append(f"canonical переписан: {self.canonical_old}  ->  {self.canonical_new}")
             else:
                 lines.append(f"canonical добавлен: {self.canonical_new}")
+        if self.html_lang:
+            lines.append(f"<html lang> выставлен: {self.html_lang}")
+        if self.head_meta_deduped:
+            lines.append(f"дублей meta в <head> убрано: {self.head_meta_deduped}")
         if self.noindex_removed:
             lines.append(f"removed a noindex robots meta tag: {self.noindex_removed!r}")
         if self.external_redirect_found:
@@ -2983,6 +2989,33 @@ def _recovery_note(success):
             _REC_TL.dead = True
 
 
+# A throttled web.archive.org hands back timeouts, dropped connections and 429/5xx for assets
+# that ARE archived and DO come back a second later - so those get backed-off retries and are
+# never memoized as dead. A 404/410 (or anything else) is a definitive verdict: fail once,
+# remember it, never ask again. This split is what lets a page with a dead plugin's unarchived
+# sprites STAMPEDING right before a perfectly-archived theme icon still recover that icon,
+# without reintroducing the "minutes of backoff on a page full of genuinely-gone assets"
+# regression - definitive misses cost exactly one request each, as before.
+_ARCHIVE_TRANSIENT_RETRIES = 3
+_TRANSIENT_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _is_transient_fetch_error(e):
+    import http.client
+    import socket
+    import urllib.error
+
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in _TRANSIENT_HTTP_CODES
+    if isinstance(e, (socket.timeout, TimeoutError, ConnectionError,
+                      http.client.IncompleteRead, http.client.RemoteDisconnected)):
+        return True
+    if isinstance(e, urllib.error.URLError):  # wraps the socket-level failures above
+        return isinstance(getattr(e, "reason", None),
+                          (socket.timeout, TimeoutError, ConnectionError, OSError))
+    return False
+
+
 def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH_RETRIES):
     import time
     import urllib.request
@@ -2992,7 +3025,8 @@ def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH
     # asked for again and again (the same missing sprite referenced from several stylesheets, the
     # same font from every page), so remember what already failed and fail those instantly. This
     # is the single biggest cleanup speed-up on asset-heavy sites - no behaviour is lost, we just
-    # stop re-asking for things we already know aren't there.
+    # stop re-asking for things we already know aren't there. Only DEFINITIVE failures are
+    # memoized (see below) - a transient throttle timeout is not a verdict about the URL.
     with _FETCH_FAIL_LOCK:
         if url in _FETCH_FAILED:
             raise _FETCH_FAILED[url]
@@ -3000,7 +3034,8 @@ def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (image-recovery-bot)"})
     use_lock = "archive.org" in url  # only the throttle-sensitive archive host is serialized
     last_err = None
-    for attempt in range(retries + 1):
+    attempt = 0
+    while True:
         _raise_if_cancelled()  # every network attempt is a cancellation point
         try:
             if use_lock:
@@ -3012,12 +3047,24 @@ def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH
                     return resp.read()
         except CleanupCancelled:
             raise
-        except Exception as e:  # noqa: BLE001 - retry any transient network/HTTP failure
+        except Exception as e:  # noqa: BLE001 - classify: throttle spike (retry) vs gone (bail)
             last_err = e
-            if attempt < retries:
-                time.sleep(0.5)
-    with _FETCH_FAIL_LOCK:
-        _FETCH_FAILED[url] = last_err
+            # Definitive miss (404/410/...): bail immediately, no wasted backoff sleep. Transient
+            # throttle on archive.org: back off and retry - the asset is really there. The lock is
+            # already released here (we're outside the `with`), so the sleep frees the slot.
+            if _is_transient_fetch_error(e):
+                max_attempts = _ARCHIVE_TRANSIENT_RETRIES if use_lock else retries
+                if attempt < max_attempts:
+                    time.sleep(min(4.0, 0.5 * (2 ** attempt)))
+                    attempt += 1
+                    continue
+            break
+
+    # Only remember DEFINITIVE failures. Memoizing a transient throttle timeout would turn a
+    # temporary spike into a permanent "dead" verdict and drop an asset that's really archived.
+    if not _is_transient_fetch_error(last_err):
+        with _FETCH_FAIL_LOCK:
+            _FETCH_FAILED[url] = last_err
     raise last_err
 
 
@@ -3038,6 +3085,15 @@ def _looks_like_valid_asset_bytes(data, ext=""):
     return not data.lstrip()[:15].lower().startswith((b"<!doctype", b"<html"))
 
 
+# A CDX *search* is a far heavier query than a raw id_ asset fetch and legitimately takes
+# 15-20s when archive.org is under load - measured 18s for a URL that has only 2 captures. The
+# 8s asset-fetch timeout kills it mid-answer, so an asset that IS archived gets a false "gone"
+# verdict. Give the CDX lookup its own generous ceiling; it only bites when archive.org is slow
+# (a clean "no captures" still returns fast and costs one request), which is exactly when we
+# must wait for the authoritative answer rather than guess the asset away.
+RECOVERY_CDX_TIMEOUT = 25
+
+
 def _wayback_nearest_snapshot_url(original_url, timestamp):
     """The exact timestamp embedded in a rewritten reference sometimes 404s (the page
     around it was captured, this one asset wasn't, at that exact crawl) - ask the CDX
@@ -3052,7 +3108,7 @@ def _wayback_nearest_snapshot_url(original_url, timestamp):
         {"url": original_url, "output": "json", "filter": "statuscode:200"}
     )
     try:
-        rows = json.loads(_fetch_url_bytes(api).decode("utf-8", "replace"))
+        rows = json.loads(_fetch_url_bytes(api, timeout=RECOVERY_CDX_TIMEOUT).decode("utf-8", "replace"))
     except Exception:
         return None
     if len(rows) < 2:
@@ -3390,6 +3446,71 @@ def recover_corrupted_local_assets(html_path, report, site_domain=None, cancelle
             f"{rel}: was a wayback error page saved as a local image, could not recover the real file - quarantined"
         )
         print(f"[corrupted-asset] FAILED, quarantined: {rel}")
+
+
+def drop_dangling_local_media(html_path, report):
+    """A local <img>/<source> can be left pointing at a file that isn't on disk - most often
+    because recover_corrupted_local_assets just quarantined a wayback-error-page-masquerading-as-
+    an-image (sanjhapunjab's justice.jpg: the archive never captured it, so it can't be rebuilt)
+    AFTER the HTML was already written, so localize_media_refs (which ran on the soup, while the
+    file still existed) couldn't catch it. strip_dead_css_urls does exactly this for CSS
+    backgrounds; this is its HTML-side twin. Prune each missing-local src / srcset candidate, and
+    if a tag is left with no working source at all, drop it - a page showing nothing beats a
+    broken-image icon. External (http/data) refs are never touched."""
+    if html_path is None:
+        return 0
+    try:
+        soup = BeautifulSoup(read_text_safe(html_path), PARSER)
+    except Exception:  # noqa: BLE001 - a post-pass never fails the whole clean
+        return 0
+    base = html_path.parent
+
+    def _missing_local(ref):
+        ref = (ref or "").strip()
+        if not ref or ref.startswith(("data:", "http://", "https://", "//", "#", "mailto:", "tel:")):
+            return False  # not a local file ref - leave it be
+        target = (base / ref.split("?")[0].split("#")[0]).resolve()
+        return not target.exists()
+
+    dropped, changed = 0, False
+    for tag in soup.find_all(["img", "source"]):
+        for attr in ("src", "poster"):
+            if tag.has_attr(attr) and _missing_local(tag[attr]):
+                del tag[attr]
+                changed = True
+        if tag.has_attr("srcset"):
+            kept = [p.strip() for p in tag["srcset"].split(",")
+                    if p.strip() and not _missing_local(p.strip().split(" ", 1)[0])]
+            if len(kept) != len([p for p in tag["srcset"].split(",") if p.strip()]):
+                changed = True
+            if kept:
+                tag["srcset"] = ", ".join(kept)
+            else:
+                del tag["srcset"]
+        if tag.name in ("img", "source") and not tag.get("src") and not tag.get("srcset"):
+            report.detached_media.append(
+                f"<{tag.name}> \"{(tag.get('alt') or '').strip()[:40]}\" (локальный файл отсутствует, битую картинку убрал)"
+            )
+            tag.decompose()
+            dropped += 1
+            changed = True
+
+    # WordPress wraps each image in an <a> to its full-size file; when that file is the missing
+    # one (or the same one we just dropped), the link 404s. De-link it, and if the anchor only
+    # existed to wrap the now-removed image (no text, no other media left), drop the empty shell.
+    for a in soup.find_all("a", href=True):
+        if _missing_local(a["href"]):
+            del a["href"]
+            changed = True
+            if not a.get_text(strip=True) and not a.find(["img", "picture", "source", "svg", "video", "audio", "iframe"]):
+                a.decompose()
+
+    if changed:
+        try:
+            html_path.write_text(collapse_blank_lines(str(soup)), encoding="utf-8")
+        except OSError:
+            pass
+    return dropped
 
 
 def localize_media_refs(soup, html_path, site_domain, report, dry_run=False, cancelled=None):
@@ -4447,6 +4568,98 @@ def _reorder_head_seo(soup):
         else:
             ref.insert_after(t)
         ref = t
+
+
+# Unicode script -> ISO-639-1 language, for pages whose <html> never declared a lang and carry no
+# og:locale. Ordered most-specific first (Gurmukhi before the generic Indic fallback). Latin is the
+# implicit default (en) - listing every Latin-script language is hopeless, and en is the safe base.
+_SCRIPT_LANG_RANGES = (
+    ("ru", (0x0400, 0x04FF)),   # Cyrillic
+    ("el", (0x0370, 0x03FF)),   # Greek
+    ("he", (0x0590, 0x05FF)),   # Hebrew
+    ("ar", (0x0600, 0x06FF)),   # Arabic (also Urdu/Farsi - og:locale disambiguates when present)
+    ("hi", (0x0900, 0x097F)),   # Devanagari
+    ("pa", (0x0A00, 0x0A7F)),   # Gurmukhi (Punjabi)
+    ("bn", (0x0980, 0x09FF)),   # Bengali
+    ("ta", (0x0B80, 0x0BFF)),   # Tamil
+    ("th", (0x0E00, 0x0E7F)),   # Thai
+    ("ja", (0x3040, 0x30FF)),   # Hiragana/Katakana -> Japanese
+    ("zh", (0x4E00, 0x9FFF)),   # CJK unified -> Chinese
+    ("ko", (0xAC00, 0xD7A3)),   # Hangul
+)
+_LANG_CODE_RE = re.compile(r"^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8})*$")
+
+
+def _detect_page_lang(soup):
+    """Best-effort page language for <html lang>. og:locale (en_US) and a content-language meta are
+    authoritative when present; otherwise sniff the dominant non-Latin script of the visible text.
+    Latin script (and empty/ambiguous) -> 'en', the safe default for a restored PBN page."""
+    loc = soup.find("meta", property="og:locale") or soup.find("meta", attrs={"property": "og:locale"})
+    if loc and loc.get("content"):
+        code = re.split(r"[_\-]", loc["content"].strip())[0].lower()
+        if len(code) in (2, 3) and code.isalpha():
+            return code
+    cl = soup.find("meta", attrs={"http-equiv": re.compile(r"^content-language$", re.I)})
+    if cl and cl.get("content"):
+        code = re.split(r"[,_\-]", cl["content"].strip())[0].lower()
+        if len(code) in (2, 3) and code.isalpha():
+            return code
+    body = soup.find("body")
+    text = body.get_text(" ", strip=True) if body else ""
+    if not text:
+        return "en"
+    counts = {}
+    for ch in text[:8000]:  # a sample is plenty to find the dominant script
+        o = ord(ch)
+        for lang, (lo, hi) in _SCRIPT_LANG_RANGES:
+            if lo <= o <= hi:
+                counts[lang] = counts.get(lang, 0) + 1
+                break
+    if counts:
+        return max(counts, key=counts.get)
+    return "en"
+
+
+def ensure_html_lang(soup, report):
+    """<html> must declare a language (accessibility, SEO, and it drives the footer copyright's
+    localisation). Keep a valid existing lang; otherwise auto-pick one (see _detect_page_lang)."""
+    html = soup.find("html")
+    if html is None:
+        return
+    cur = (html.get("lang") or "").strip()
+    if cur and _LANG_CODE_RE.match(cur):
+        return  # already declared and well-formed - leave the site's own choice
+    lang = _detect_page_lang(soup)
+    if lang:
+        html["lang"] = lang
+        report.html_lang = lang
+
+
+def dedupe_head_meta(soup, report):
+    """Wayback/CMS exports pile up duplicate social metas (sanjhapunjab shipped og:site_name x3,
+    og:type x3, og:title x2). Keep the FIRST of each property/name key and drop the rest - the
+    duplicates are pure head clutter. Repeatable properties (og:image, article:tag, ...) are left
+    alone; those legitimately appear more than once."""
+    head = soup.find("head")
+    if head is None:
+        return 0
+    repeatable = ("og:image", "og:video", "og:audio", "article:tag", "article:author",
+                  "article:section", "book:author", "music:musician")
+    seen, removed = set(), 0
+    for m in head.find_all("meta"):
+        prop = (m.get("property") or "").strip().lower()
+        name = (m.get("name") or "").strip().lower()
+        key = ("property", prop) if prop else (("name", name) if name else None)
+        if key is None or key[1].startswith(repeatable):
+            continue
+        if key in seen:
+            m.decompose()
+            removed += 1
+        else:
+            seen.add(key)
+    if removed:
+        report.head_meta_deduped = removed
+    return removed
 
 
 def check_and_fix_noindex(soup, report):
@@ -6255,6 +6468,7 @@ def clean_html_file(
     domain_override=None,
     progress=None,
     cancelled=None,
+    normalize_headings=True,
 ):
     # Install this run's cancel hook for the whole thread, so even the low-level network fetches
     # (font/icon downloads, archive recovery) abort promptly - not just the phase boundaries.
@@ -6359,10 +6573,12 @@ def clean_html_file(
     # structure). Demotes any nav/header/footer that swallowed the page's landmarks - that
     # otherwise hides every section from the menu-anchor step.
     repair_landmark_nesting(soup, report)
-    # Fix the heading outline so levels never skip (h2 then h3, never h4). Deterministic - runs
-    # with or without the AI pass, after tag-semantics so it sees the final structure.
-    drop_empty_headings(soup, report)
-    normalize_heading_levels(soup, report)
+    # Heading tags. Opt-out (normalize_headings=False, the card switch "менять заголовки" off):
+    # DON'T touch headings AT ALL - no level fix, no h1 promotion, not even dropping empty ones -
+    # so they stay EXACTLY as in the archive. These are the ONLY two functions that modify h1-h6.
+    if normalize_headings:
+        drop_empty_headings(soup, report)
+        normalize_heading_levels(soup, report)
     # Deterministic <main> + <section> landmarks (box-model-neutral, runs without the AI key too).
     ensure_landmarks(soup, report)
     # Empty fonts_param -> try to detect a font already used on this page (falls back
@@ -6412,6 +6628,8 @@ def clean_html_file(
     if not dry_run:
         apply_semantic_meta(soup, site_domain, report)
     ensure_canonical(soup, html_path, site_domain, report, dry_run=dry_run)
+    ensure_html_lang(soup, report)   # <html lang> - auto-detected; also drives footer-copyright localisation
+    dedupe_head_meta(soup, report)   # drop duplicate og:/name metas piled up by the CMS export
     _reorder_head_seo(soup)  # head order: <title> -> <meta description> -> <link canonical> -> fonts
     check_internal_link_targets(soup, html_path, report)
     strip_empty_style_declarations(soup)
@@ -6452,6 +6670,7 @@ def clean_html_file(
     _p(96, "Убираю неиспользуемые файлы")
     remove_unused_local_assets(html_path, new_text, report, dry_run=dry_run, extra_texts=local_css_texts)
     strip_dead_css_urls(html_path, report)
+    drop_dangling_local_media(html_path, report)  # HTML twin of strip_dead_css_urls: no broken <img>
     _audit_final_output(html_path, report)  # universal "did it come out broken?" self-check
     # ...and the input-vs-output net: everything the archive had must still be here.
     for _w in audit_against_original(original_text, soup, report, html_path):

@@ -334,6 +334,8 @@ def _clean_entry(eid):
     with ENTRIES_LOCK:
         e = ENTRIES.get(eid)
         site_dir = Path(e["site_dir"]) if e and e.get("site_dir") else None
+        normalize_headings = bool(e.get("normalize_headings", True)) if e else True
+        keep_header_items = bool(e.get("keep_header_items", False)) if e else False
     if site_dir is None:
         return
     html_path = site_dir / "index.html"
@@ -350,10 +352,11 @@ def _clean_entry(eid):
         clean_wayback_site.clean_html_file(
             html_path, None, dry_run=False, backup=True,
             progress=cb, cancelled=(ev.is_set if ev else None),
+            normalize_headings=normalize_headings,
         )
         _entry_set(eid, clean_action="Привязываю ссылки меню/футера")
         try:
-            site_edit.auto_link_menu(site_dir)
+            site_edit.auto_link_menu(site_dir, keep_header_items=keep_header_items)
         except Exception:  # noqa: BLE001 - never fail cleanup over the menu step
             pass
         _entry_set(eid, clean_action="Обновляю превью")
@@ -375,7 +378,10 @@ def _clean_entry(eid):
 
 @app.route("/api/entry/clean", methods=["POST"])
 def api_entry_clean():
-    eid = (request.json or {}).get("id")
+    body = request.json or {}
+    eid = body.get("id")
+    normalize_headings = bool(body.get("normalize_headings", True))
+    keep_header_items = bool(body.get("keep_header_items", False))
     with ENTRIES_LOCK:
         e = ENTRIES.get(eid)
         if not e:
@@ -385,7 +391,8 @@ def api_entry_clean():
         if e.get("clean_running"):
             return jsonify({"ok": False, "error": "очистка уже идёт"}), 409
         e.update(clean_running=True, clean_pct=0, clean_action="Запускаю…",
-                 clean_done=False, clean_error=None, clean_cancelled=False)
+                 clean_done=False, clean_error=None, clean_cancelled=False,
+                 normalize_headings=normalize_headings, keep_header_items=keep_header_items)
     _CANCEL[eid] = threading.Event()
     threading.Thread(target=_clean_entry, args=(eid,), daemon=True).start()
     return jsonify({"ok": True})

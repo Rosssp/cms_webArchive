@@ -1739,19 +1739,50 @@ _COPYRIGHT_LINE_RE = re.compile(r"©|&copy;|\(c\)\s*\d{4}|copyright|all rights r
                                 r"все права защищены|усі права", re.I)
 
 
-def _ensure_footer_copyright(footer, domain, soup):
-    """Guarantee the page ends with a copyright line: `© <year> <domain>. All rights reserved.`
-
-    Added only when the footer states nothing of the sort - a site that already says it keeps its
-    own wording. On a non-English page the sentence is translated by the model when a key is
-    configured (a Vietnamese site ending in an English sentence looks machine-made); without a key
-    the English line is still written, so the guarantee holds either way."""
-    if footer is None:
+def _augment_existing_copyright(footer, name, year):
+    """The footer ALREADY says something copyright-ish - keep its wording, but make sure it carries
+    (a) the current year and (b) this site's domain. Edits the single text node that holds the ©
+    line, so surrounding markup is untouched. Idempotent: a line that's already current+on-domain is
+    left byte-for-byte. Returns True if anything changed."""
+    node = None
+    for s in footer.find_all(string=_COPYRIGHT_LINE_RE):
+        node = s
+        break
+    if node is None:  # the © sits across several tags - don't risk mangling it, leave as-is
         return False
-    if _COPYRIGHT_LINE_RE.search(footer.get_text(" ", strip=True)):
+    s = orig = str(node)
+    years = re.findall(r"(?:19|20)\d{2}", s)
+    if years and int(years[-1]) < year:  # bump the newest year in a "2010-2015" style range
+        idx = s.rfind(years[-1])
+        s = s[:idx] + str(year) + s[idx + 4:]
+    elif not years:  # a copyright with no year at all - give it one (before any trailing period)
+        s = f"{s.rstrip().rstrip('.')} {year}"
+    low = name.lower()
+    bare = low[4:] if low.startswith("www.") else low
+    if bare and bare not in s.lower():
+        s = f"{s.rstrip()} · {name}"
+    if s != orig:
+        node.replace_with(s)
+        return True
+    return False
+
+
+def _ensure_footer_copyright(footer, domain, soup):
+    """Guarantee the page ends with a proper copyright line: `© <year> <domain>. All rights
+    reserved.`
+
+    If the footer already states something copyright-ish, its wording is KEPT but topped up to the
+    current year and this site's domain (see _augment_existing_copyright). If it says nothing of the
+    sort, the full line is appended. On a non-English page the appended sentence is translated by the
+    model when a key is configured (a Vietnamese site ending in an English sentence looks
+    machine-made); without a key the English line is still written, so the guarantee holds either
+    way."""
+    if footer is None:
         return False
     year = datetime.now().year
     name = (domain or "").strip().rstrip("/") or "this site"
+    if _COPYRIGHT_LINE_RE.search(footer.get_text(" ", strip=True)):
+        return _augment_existing_copyright(footer, name, year)
     text = f"© {year} {name}. All rights reserved."
     lang = ""
     root = soup.find("html")
@@ -1891,7 +1922,7 @@ def _rebuild_footer_sitemap(footer, sections):
     return changes
 
 
-def auto_link_menu(site_dir):
+def auto_link_menu(site_dir, keep_header_items=False):
     """Wire up header/footer/mobile nav across every page. See NAV_LINKING.md for the full spec;
     the short version, and the two rules that MUST hold (a past bug got them wrong):
 
@@ -2022,7 +2053,7 @@ def auto_link_menu(site_dir):
             for a in _nav_menu_links(header_nav):
                 orig = a.get_text(" ", strip=True)
                 key = " ".join(_slug_words(orig))
-                if kept >= _HEADER_MAX_LINKS:
+                if not keep_header_items and kept >= _HEADER_MAX_LINKS:
                     _remove_nav_item(a)
                     removed.append(f'{rel_self}: header "{orig}" (over {_HEADER_MAX_LINKS})')
                     dirty = True
@@ -2062,16 +2093,18 @@ def auto_link_menu(site_dir):
                 #    is strictly worse than a menu whose items don't scroll anywhere. Keep the
                 #    items, just drop the dead href. Regeneration cannot save this case: a
                 #    <header> already exists, so every generate branch is gated off.
-                if sections:
+                if sections and not keep_header_items:
                     for a, orig in orphans:
                         _remove_nav_item(a)
                         removed.append(f'{rel_self}: header "{orig}" (нет секции — удалён)')
                 else:
+                    # keep_header_items (owner switch), or no sections at all -> never delete a header
+                    # item; the ones that couldn't be anchored just lose their href (plain text label).
                     for a, orig in orphans:
                         if a.get("href"):
                             del a["href"]
-                    relabeled.append(f'{rel_self}: на странице нет секций — {len(orphans)} пунктов '
-                                     f'меню оставлены без href (иначе хедер пустой)')
+                    why = "оставить пункты хедера (свич)" if keep_header_items else "на странице нет секций"
+                    relabeled.append(f'{rel_self}: {why} — {len(orphans)} пунктов меню оставлены без href')
                 dirty = True
 
         # The header MUST carry a link to the HERO (the first/top block). Resolving broken links
@@ -2202,8 +2235,10 @@ def auto_link_menu(site_dir):
 
         # If the menu still has no working in-page navigation, build it from the sections. Matching
         # original labels is a nice-to-have; a header whose items lead nowhere is not acceptable.
+        # Skipped under keep_header_items: the owner asked to keep the original items even hrefless,
+        # so we must NOT replace them with a fresh section-menu.
         _hnav = _find_header_nav(soup) or soup.find("header")
-        if _hnav is not None and sections:
+        if _hnav is not None and sections and not keep_header_items:
             _anchored = [a for a in _nav_menu_links(_hnav) if _is_live_anchor(a, soup)]
             # Rebuild when the menu is mostly dead, not only when it is completely dead. Two
             # working anchors out of forty is not navigation.
@@ -2346,6 +2381,12 @@ def auto_link_menu(site_dir):
                 # site's navigation - keep every item, just stop it being a dead link.
                 del a["href"]
                 relabeled.append(f'{rel_self}: cms-menu "{txt[:24]}" (href dropped, item kept)')
+            elif keep_header_items and a.find_parent("header") is not None:
+                # Owner switch "не удалять пункты хедера": a header item with nothing to anchor to
+                # stays put and merely loses its href (plain-text label), never removed.
+                if a.has_attr("href"):
+                    del a["href"]
+                relabeled.append(f'{rel_self}: header "{txt[:24]}" (пункт оставлен без href)')
             elif a.find_parent(["header", "nav", "footer"]) is not None:
                 # Nothing to point at, and it sits in the menu -> a menu item that leads nowhere
                 # is pure noise on a restored single-page site. Drop it.
@@ -2380,6 +2421,10 @@ def auto_link_menu(site_dir):
         # submenu items of a mega-menu whose parent items now point at sections - sanjhapunjab kept
         # 36 of them. Guarded so the menu is never emptied completely.
         for _navc in soup.find_all(["nav", "header", "footer"]):
+            # keep_header_items (owner switch): header items with no anchor MUST stay as plain-text
+            # labels - so don't strip the dead ones out of the header here.
+            if keep_header_items and (_navc.name == "header" or _navc.find_parent("header") is not None):
+                continue
             # Считать живые ссылки по ВСЕМУ контейнеру, а не только по верхнему уровню меню.
             # У мега-меню (firsttalk: 7 верхних пунктов + 57 во вложенных списках) верхний уровень
             # мог дать всего одну живую ссылку, страховка «не опустошать меню» срабатывала, и все
