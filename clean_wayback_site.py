@@ -1225,6 +1225,59 @@ def strip_url_meta_tags(soup, report):
             meta.decompose()
 
 
+def strip_head_to_essentials(soup, report):
+    """Оставить в <head> из СЕО/соц-мета только НЕОБХОДИМОЕ (правило владельца, 2026-07-22):
+    `<title>`, `<meta name=description>`, `<link rel=canonical>` и ОДНУ иконку. Всё прочее
+    соц/СЕО — удалить: `<meta property=…>` (og:*, twitter:*, fb:*, article:*), `<meta name=…>`
+    вроде og:site_name/twitter:card/twitter:description/keywords/msapplication-*/robots,
+    `<link rel=alternate hreflang>` и ЛИШНИЕ иконки (apple-touch-icon, mask-icon, дубли).
+
+    ТЕХНИЧЕСКОЕ не трогаем — без него ломается страница: `<meta charset>`, `<meta name=viewport>`,
+    `<meta http-equiv=…>`, `<link rel=stylesheet>`, `preconnect`/`preload`/`dns-prefetch` (шрифты),
+    `<style>`, `<script>`, `<base>`, `<title>`.
+    """
+    head = soup.find("head")
+    if not head:
+        return 0
+    removed = 0
+    for meta in list(head.find_all("meta")):
+        if meta.has_attr("charset") or meta.has_attr("http-equiv"):
+            continue
+        name = (meta.get("name") or "").strip().lower()
+        prop = (meta.get("property") or "").strip().lower()
+        itemprop = (meta.get("itemprop") or "").strip().lower()
+        if not prop and not itemprop and name in ("description", "viewport"):
+            continue
+        if name or prop or itemprop:   # любой соц/СЕО-мета — прочь
+            report.removed_cms_meta.append(f"<meta {prop or name or itemprop}> (соц/СЕО-мусор)")
+            meta.decompose()
+            removed += 1
+    icon_kept = False
+    for link in list(head.find_all("link")):
+        rel = link.get("rel")
+        rel_str = " ".join(rel).lower() if isinstance(rel, list) else str(rel or "").lower()
+        if ("stylesheet" in rel_str or "canonical" in rel_str
+                or "preconnect" in rel_str or "preload" in rel_str
+                or "modulepreload" in rel_str or "dns-prefetch" in rel_str):
+            continue
+        if "icon" in rel_str:
+            plain_icon = rel_str in ("icon", "shortcut icon", "shortcut", "icon shortcut")
+            if plain_icon and not icon_kept:
+                icon_kept = True
+                continue
+            report.removed_cms_meta.append(f"<link rel={rel_str!r}> (лишняя иконка)")
+            link.decompose()
+            removed += 1
+            continue
+        if "alternate" in rel_str or link.get("hreflang"):
+            report.removed_cms_meta.append(f"<link rel={rel_str!r} hreflang> {link.get('href','')}")
+            link.decompose()
+            removed += 1
+            continue
+        # прочие технические rel (manifest/amphtml/…) не трогаем, чтобы не сломать неизвестное
+    return removed
+
+
 _FONT_FACE_RULE_RE = re.compile(r"@font-face\s*\{[^{}]*\}", re.I)
 _TYPEKIT_RULE_RE = re.compile(r"@import[^;]*typekit[^;]*;", re.I)
 
@@ -6793,6 +6846,7 @@ def clean_html_file(
         apply_semantic_meta(soup, site_domain, report)
     ensure_canonical(soup, html_path, site_domain, report, dry_run=dry_run)
     ensure_html_lang(soup, report)   # <html lang> - auto-detected; also drives footer-copyright localisation
+    strip_head_to_essentials(soup, report)  # в head оставить только title/description/canonical/иконку
     dedupe_head_meta(soup, report)   # drop duplicate og:/name metas piled up by the CMS export
     _reorder_head_seo(soup)  # head order: <title> -> <meta description> -> <link canonical> -> fonts
     check_internal_link_targets(soup, html_path, report)

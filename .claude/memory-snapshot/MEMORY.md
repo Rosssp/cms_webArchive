@@ -19,3 +19,4 @@
 - [Ленивая загрузка: promote_src](lazyload-promote-src.md) — реальный URL в data-lazy-src, в src svg-пустышка; смотреть разметку, а не чинить сеть
 - [Использовать лендмарки темы](use-theme-landmarks.md) — готовые header/main/footer темы поднять на уровень body; медиа не пустая слайдер-оболочка
 - [Тест на свежей скачке](test-on-fresh-download.md) — старая .bak может не иметь файлов, которые новый загрузчик ловит; полдня на фантомный баг
+- [Whitelist мет в head](head-meta-whitelist.md) — оставить только title/description/canonical/иконку; og/twitter/hreflang/msapplication снести; charset/viewport/stylesheet не трогать
