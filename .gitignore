@@ -9,3 +9,4 @@ __pycache__/
 
 # node
 site_studio/node_modules/
+site_studio/.wb_dest

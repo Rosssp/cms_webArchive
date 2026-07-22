@@ -86,6 +86,30 @@ _CANCEL = {}  # entry id -> threading.Event, set to abort a running cleanup
 _ENTRY_SEQ = [0]
 _DL_SEM = threading.Semaphore(2)  # downloads are browser-heavy - cap concurrent ones at 2
 _WB_DEST = {"path": None}  # last chosen download folder (restored on refresh)
+# Папка запоминается НА ДИСКЕ, а не только в памяти: после рестарта сервера память пуста, и студия
+# переставала показывать уже скачанные сайты («раньше показывала всё в папке, почему пропало»). Файл
+# рядом с сервером хранит последнюю папку, при старте она восстанавливается — и adopt подтягивает
+# сайты с диска сам. Диск — источник правды, терять нечего.
+_WB_DEST_FILE = Path(__file__).resolve().parent / ".wb_dest"
+
+
+def _remember_dest(path):
+    """Запомнить папку скачивания в память и на диск (переживает рестарт сервера)."""
+    _WB_DEST["path"] = str(path)
+    try:
+        _WB_DEST_FILE.write_text(str(path), encoding="utf-8")
+    except OSError:
+        pass  # не смогли сохранить — не критично, останется в памяти на эту сессию
+
+
+def _restore_dest():
+    """Восстановить последнюю папку при старте сервера."""
+    try:
+        saved = _WB_DEST_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if saved and Path(saved).is_dir():
+        _WB_DEST["path"] = saved
 
 import re as _re  # noqa: E402
 
@@ -280,7 +304,7 @@ def api_wayback_start():
     except Exception as e:
         return jsonify({"ok": False, "error": f"не удалось создать папку: {e}"}), 400
 
-    _WB_DEST["path"] = str(dest_path)
+    _remember_dest(dest_path)
     with ENTRIES_LOCK:
         ids = [_new_entry(u) for u in urls]
     for eid in ids:
@@ -306,7 +330,7 @@ def api_wayback_adopt():
     root = Path(dest)
     if not root.is_dir():
         return jsonify({"ok": False, "error": "папки нет"}), 400
-    _WB_DEST["path"] = str(root)
+    _remember_dest(root)
     added = []
     with ENTRIES_LOCK:
         tracked = {e["site_dir"] for e in ENTRIES.values() if e.get("site_dir")}
@@ -1018,6 +1042,7 @@ def main():
     if args.site_dir:
         set_site(args.site_dir)
 
+    _restore_dest()  # вернуть последнюю папку скачивания — карточки появятся сами после рестарта
     print(f"site_studio running at http://127.0.0.1:{args.port}/")
     if STATE["site_dir"]:
         print(f"editing: {STATE['site_dir']}")

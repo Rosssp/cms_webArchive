@@ -1804,7 +1804,7 @@ def _ensure_footer_copyright(footer, domain, soup):
     return True
 
 
-def _rebuild_nav_from_sections(nav, sections, limit=4):
+def _rebuild_nav_from_sections(nav, sections, limit=4, keep_labels=False):
     """Rewrite a menu into working in-page navigation, REUSING its own <a> elements.
 
     Preserving the original labels only makes sense when they can be matched to something on the
@@ -1815,6 +1815,11 @@ def _rebuild_nav_from_sections(nav, sections, limit=4):
     What the page needs is navigation that WORKS. So the item text is replaced with the section
     title and the href with its anchor. Existing <a> elements are reused rather than created, so
     the theme's CSS still styles the bar exactly as before; surplus items are removed.
+
+    keep_labels (свич владельца «не удалять пункты хедера»): ПОДПИСИ сохраняются, только href
+    привязывается к секции по порядку, а лишние пункты НЕ удаляются (останутся без href). Владелец
+    хочет и оставить исходные пункты, и получить рабочие якоря — раньше свич выключал привязку
+    целиком, и якоря не цеплялись вообще.
     """
     if nav is None or not sections:
         return 0
@@ -1849,15 +1854,20 @@ def _rebuild_nav_from_sections(nav, sections, limit=4):
     changed = 0
     for a, sec in zip(items, want):
         href = "#" + _ensure_section_anchor(sec)
+        if keep_labels:
+            a["href"] = href          # только якорь, подпись владельца не трогаем
+            changed += 1
+            continue
         label = _section_label(sec)
         if not label:
             continue
         a["href"] = href
         _set_link_text(a, label)
         changed += 1
-    for a in items[len(want):]:
-        _remove_nav_item(a)
-        changed += 1
+    if not keep_labels:               # под свич лишние пункты НЕ удаляем — владелец их оставляет
+        for a in items[len(want):]:
+            _remove_nav_item(a)
+            changed += 1
     return changed
 
 
@@ -2235,19 +2245,22 @@ def auto_link_menu(site_dir, keep_header_items=False):
 
         # If the menu still has no working in-page navigation, build it from the sections. Matching
         # original labels is a nice-to-have; a header whose items lead nowhere is not acceptable.
-        # Skipped under keep_header_items: the owner asked to keep the original items even hrefless,
-        # so we must NOT replace them with a fresh section-menu.
+        # ПОД keep_header_items привязка НЕ отключается — она делается с keep_labels=True: якоря
+        # цепляются к пунктам, подписи владельца сохраняются, лишние пункты остаются. Раньше свич
+        # выключал этот блок целиком, и якоря не присасывались вообще (жалоба владельца).
         _hnav = _find_header_nav(soup) or soup.find("header")
-        if _hnav is not None and sections and not keep_header_items:
+        if _hnav is not None and sections:
             _anchored = [a for a in _nav_menu_links(_hnav) if _is_live_anchor(a, soup)]
             # Rebuild when the menu is mostly dead, not only when it is completely dead. Two
             # working anchors out of forty is not navigation.
             _all_items = _nav_menu_links(_hnav)
             if len(_anchored) < min(3, len(sections)) or len(_anchored) < len(_all_items) * 0.5:
-                _n = _rebuild_nav_from_sections(_hnav, sections, _HEADER_MAX_LINKS)
+                _n = _rebuild_nav_from_sections(_hnav, sections, _HEADER_MAX_LINKS,
+                                                keep_labels=keep_header_items)
                 if _n:
-                    linked.append(f"{rel_self}: меню пересобрано из секций ({_n} пунктов) — "
-                                  f"исходные подписи никуда не вели")
+                    _msg = ("якоря привязаны к пунктам, подписи сохранены" if keep_header_items
+                            else "меню пересобрано из секций — исходные подписи никуда не вели")
+                    linked.append(f"{rel_self}: {_msg} ({_n} пунктов)")
                     dirty = True
 
         # Footer links follow the SAME rule as the header: once the sections run out, a menu item
@@ -2343,9 +2356,11 @@ def auto_link_menu(site_dir, keep_header_items=False):
             # menu item like any other, so it gets a section anchor and the section's name.
             txt = a.get_text(" ", strip=True)
             if not txt:
-                # icon-only dead link (social etc.) -> drop the dead href, keep the empty <a>
-                del a["href"]
-                relabeled.append(f'{rel_self}: dropped dead href on icon-only <a> ({_cls(a)[:24]})')
+                # icon-only dead link (social etc.) -> neutralise to "#", keep the <a>. Not attribute
+                # removal: icon controls are styled via a:link/:visited too, and a hrefless <a> loses
+                # that styling. "#" keeps the anchor a link without navigating anywhere.
+                a["href"] = "#"
+                relabeled.append(f'{rel_self}: icon-only <a> ({_cls(a)[:24]}) — ссылка -> "#"')
                 dirty = True
                 continue
             # Only anchor a link that GENUINELY matches a section. Falling back to "the first
@@ -2378,24 +2393,34 @@ def auto_link_menu(site_dir, keep_header_items=False):
                 linked.append(f'{rel_self}: "{txt[:20]}" -> {a["href"]} ("{_new_label[:20]}")')
             elif _in_protected_cms_menu(a):
                 # The site's REAL multi-page menu (WordPress &c). Deleting its items guts the
-                # site's navigation - keep every item, just stop it being a dead link.
-                del a["href"]
-                relabeled.append(f'{rel_self}: cms-menu "{txt[:24]}" (href dropped, item kept)')
+                # site's navigation - keep every item, just neutralise the dead link to "#".
+                # "#" (not attribute removal): themes style these via a:link/a:visited, and those
+                # pseudo-classes only match an <a> that HAS an href - stripping it kills the look
+                # (sanjhapunjab sidebar accordion arrows). "#" navigates nowhere and keeps styling.
+                a["href"] = "#"
+                relabeled.append(f'{rel_self}: cms-menu "{txt[:24]}" (мёртвая ссылка -> "#", пункт сохранён)')
             elif keep_header_items and a.find_parent("header") is not None:
                 # Owner switch "не удалять пункты хедера": a header item with nothing to anchor to
-                # stays put and merely loses its href (plain-text label), never removed.
-                if a.has_attr("href"):
-                    del a["href"]
-                relabeled.append(f'{rel_self}: header "{txt[:24]}" (пункт оставлен без href)')
+                # stays put. Neutralise to "#" rather than removing href, so a:link/:visited styling
+                # survives (same reason as the CMS-menu branch above).
+                a["href"] = "#"
+                relabeled.append(f'{rel_self}: header "{txt[:24]}" (пункт оставлен, ссылка -> "#")')
             elif a.find_parent(["header", "nav", "footer"]) is not None:
                 # Nothing to point at, and it sits in the menu -> a menu item that leads nowhere
                 # is pure noise on a restored single-page site. Drop it.
                 _remove_nav_item(a)
                 removed.append(f'{rel_self}: nav "{txt[:24]}" (no matching section, removed)')
             else:
-                # In the page body keep the text/layout, just stop pretending it's a link.
-                del a["href"]
-                relabeled.append(f'{rel_self}: stripped dead href on "{txt[:24]}"')
+                # In the page body, KEEP the anchor a link with href="#" instead of removing the
+                # attribute. Themes routinely style these controls via a:link / a:visited (jQuery-UI
+                # accordion toggles, tabs, sidebar widget headers) and those pseudo-classes match
+                # ONLY an <a> that HAS an href - stripping it silently kills the background icon and
+                # the whole look (sanjhapunjab: the sidebar accordion ARROWS vanished though the CSS
+                # rule and the image were both intact). "#" navigates nowhere harmful and preserves
+                # the styling 1-to-1. These anchors already carried "#"/""/"/" (a JS hook or an
+                # already-neutralised dead link), so this changes appearance, not destinations.
+                a["href"] = "#"
+                relabeled.append(f'{rel_self}: мёртвая ссылка оставлена как "#" на "{txt[:24]}" (сохранён :link-стиль)')
             dirty = True
 
         # No two menu items may carry the SAME text AND the same anchor. firsttalk shipped three

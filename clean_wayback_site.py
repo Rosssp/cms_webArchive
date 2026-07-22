@@ -2429,10 +2429,44 @@ def collapse_blank_lines(text):
     return _EXCESS_BLANK_LINES_RE.sub("\n\n", text)
 
 
+# Ленивая загрузка: плагины (WP Rocket LazyLoad, a3 Lazy Load, Lazy Load by WP, jQuery Lazy…)
+# кладут в src ПУСТЫШКУ (прозрачный gif или инлайновый svg-спейсер нужного размера), а настоящий
+# URL прячут в data-атрибут. Реальные имена атрибутов у плагинов разные — перечисляем известные.
+_LAZY_SRC_ATTRS = ("data-lazy-src", "data-src", "data-original", "data-echo",
+                   "data-lazyload", "data-lazy", "data-img-url", "data-original-src")
+_LAZY_SRCSET_ATTRS = ("data-lazy-srcset", "data-srcset", "data-original-srcset")
+# Пустышка-плейсхолдер: инлайновый svg-спейсер или 1x1-gif. Настоящий data:-образ так не начинается
+# с viewBox/пустого gif, поэтому подмену получают только заглушки.
+_LAZY_PLACEHOLDER_RE = re.compile(
+    r"^\s*data:image/(?:svg\+xml|gif)[;,]", re.I)
+
+
+def _is_lazy_placeholder_src(src):
+    """src отсутствует или это заглушка ленивой загрузки (её надо заменить настоящим URL)."""
+    if not src or not src.strip():
+        return True
+    return bool(_LAZY_PLACEHOLDER_RE.match(src))
+
+
 def promote_src(soup):
+    """Поднять настоящий URL ленивой загрузки в src/srcset.
+
+    Без этого страница показывает пустые плейсхолдеры вместо картинок: у saramonicvietnam так
+    «не скачались» 55 фото галереи — файлы лежали локально (`index_files/photo_…jpg`), но `src`
+    оставался svg-заглушкой, а реальный путь висел в `data-lazy-src`. Проверялся только `data-src`,
+    поэтому lazy-load любого распространённого WP-плагина ронял всю галерею в пустоту.
+    """
     for tag in soup.find_all(["img", "source", "video", "audio"]):
-        if not tag.get("src") and tag.get("data-src"):
-            tag["src"] = tag["data-src"]
+        if _is_lazy_placeholder_src(tag.get("src")):
+            for _a in _LAZY_SRC_ATTRS:
+                if tag.get(_a) and not _is_lazy_placeholder_src(tag.get(_a)):
+                    tag["src"] = tag[_a]
+                    break
+        if not (tag.get("srcset") or "").strip():
+            for _a in _LAZY_SRCSET_ATTRS:
+                if (tag.get(_a) or "").strip():
+                    tag["srcset"] = tag[_a]
+                    break
 
 
 def add_lazy_loading(soup, report):
@@ -3255,6 +3289,18 @@ def _recover_css_asset(raw_url, css_path, report, site_domain):
             # still shouldn't stay hardcoded-absolute. Downgrade to root-relative.
             return to_relative(raw_url, site_domain)
         return None  # a wayback-wrapped non-asset url - leave to the plain unwayback pass
+
+    # СНАЧАЛА локальный файл, потом сеть. Тот же ассет часто УЖЕ скачан рядом с CSS под своим или
+    # дедуп-именем (`accordion_up.png` и `accordion_up_1.png` от двух копий одного стиля). Ходить в
+    # архив за тем, что уже на диске, — это и лишняя копия, и риск: под троттлом сеть падает, ассет
+    # уходит в «мёртвые», а рабочий файл всё это время лежал в той же папке. Ищем в каталоге CSS
+    # точное имя и его дедуп-вариант `<stem>_<цифры><ext>`; берём файл, а не wayback-HTML под ним.
+    _local = css_path.parent / name
+    if not _local.is_file():
+        _cands = sorted(css_path.parent.glob(f"{Path(name).stem}_[0-9]*{Path(name).suffix}"))
+        _local = next((c for c in _cands if c.is_file()), _local)
+    if _local.is_file() and not _looks_like_corrupted_wayback_asset(_local.read_bytes()):
+        return _local.relative_to(css_path.parent).as_posix() + fragment
 
     print(f"[css-recovery] fetching {original_url} (referenced in {css_path.name})...")
     data, _ext = recover_asset_bytes(original_url, timestamp)
@@ -4872,42 +4918,93 @@ def _is_header_like(el):
     return len([a for a in el.find_all("a") if a.get_text(strip=True)]) >= 2
 
 
+def _is_header_bar(prev):
+    """Является ли соседний СВЕРХУ блок частью шапки — логотип, баннер названия, топбар, узкая
+    служебная полоса. Один ответ на этот вопрос для всех веток сборки шапки."""
+    if prev is None or getattr(prev, "name", None) in (
+            None, "script", "style", "link", "meta", "noscript",
+            "header", "main", "footer", "nav"):
+        return False
+    ident = _sem_cls(prev)
+    text = prev.get_text(" ", strip=True)
+    named_header = bool(_SEM_HEADER_CLASS_RE.search(ident))
+    logo_bar = bool(prev.find("img")) and len(text) <= 60
+    # Узкая служебная полоса вплотную над шапкой (телефон, язык, вход, соцсети) — часть шапки.
+    # По имени класса её не поймать: у firsttalk это id="nav-top", те же слова в обратном порядке.
+    # Признак надёжнее — РАЗМЕР: полоска в пару ссылок и десяток символов не может быть контентом.
+    thin_strip = len(text) <= 120 and len(prev.find_all("a")) <= 3 and prev.find(_HEADING_RE) is None
+    if _SEM_HERO_RE.search(ident) and not named_header:
+        return False   # геройская секция — контент, а не шапка
+    if len(text) > 400:
+        return False   # это уже контент
+    return named_header or logo_bar or thin_strip
+
+
+def _wrap_nav_in_header(soup, nav_block):
+    """Обернуть nav-блок и стоящие ВЫШЕ полосы шапки в СВЕЖИЙ НЕЙТРАЛЬНЫЙ <header>, сохранив
+    исходные блоки как СОСЕДЕЙ, а не вкладывая их друг в друга.
+
+    Это замена «переименовать div#nav → header#nav и втянуть баннер ВНУТРЬ». Тот подход ломал
+    вёрстку: у sanjhapunjab на `#nav` висит CSS синей полосы меню (фон, высота, ширина), и баннер
+    `div#header`, засунутый внутрь, наследовал этот бокс. Нейтральная обёртка без id/class ничего
+    не навязывает — каждый исходный блок сохраняет свой стиль 1-в-1, а порядок остаётся прежним.
+    Возвращает созданный <header>.
+    """
+    bars = []
+    prev = nav_block
+    for _ in range(3):
+        prev = prev.find_previous_sibling(lambda t: getattr(t, "name", None) is not None)
+        if not _is_header_bar(prev):
+            break
+        bars.append(prev)
+    header = soup.new_tag("header")
+    anchor = bars[-1] if bars else nav_block   # верхний блок задаёт место вставки
+    anchor.insert_before(header)
+    for bar in reversed(bars):                 # сверху вниз, порядок сохраняется
+        header.append(bar.extract())
+    header.append(nav_block.extract())
+    return header
+
+
+def _ensure_inner_nav(header_el):
+    """Гарантировать <nav> внутри шапки для списка ссылок меню, если его ещё нет."""
+    if header_el.find("nav") is not None:
+        return
+    for sub in header_el.find_all(["div", "ul"], recursive=True):
+        if len([a for a in sub.find_all("a") if a.get_text(strip=True)]) >= 2:
+            sub.name = "nav"
+            break
+
+
+def _make_header(soup, ch):
+    """Сделать блок `ch` шапкой страницы, сохранив вёрстку.
+
+    Если СВЕРХУ стоит полоса шапки (логотип/баннер/топбар) — оборачиваем в нейтральный <header>
+    как соседей, не трогая исходные блоки (их id/class несут CSS). Если полосы нет — просто
+    переименовываем сам блок в <header>: вкладывать не во что, ломать нечего."""
+    prev = ch.find_previous_sibling(lambda t: getattr(t, "name", None) is not None)
+    if _is_header_bar(prev):
+        header = _wrap_nav_in_header(soup, ch)
+        _ensure_inner_nav(header)
+    else:
+        ch.name = "header"
+        _ensure_inner_nav(ch)
+
+
 def _absorb_header_bar(header_el):
-    """Втянуть в <header> соседние сверху полосы шапки — логотип, баннер с названием, топбар.
+    """Втянуть в СУЩЕСТВУЮЩИЙ нейтральный <header> соседние сверху полосы шапки.
 
-    CMS почти всегда режет шапку на два соседних блока: <div id="header"> с логотипом и
-    <div id="nav"> с меню. Шапкой выбирается тот, где ссылки, а полоса с логотипом остаётся
-    снаружи и ВЫШЕ <header> — то есть <header> перестаёт быть первым элементом страницы, а
-    логотип висит сам по себе. Пользователь это видит как «хеддер не встаёт».
-
-    Втягиваются только СОСЕДНИЕ СВЕРХУ блоки, порядок сохраняется, поэтому вид страницы не
-    меняется. Берём блок, если он либо назван шапкой (header/masthead/topbar), либо это
-    полоса-логотип (картинка почти без текста). Геройский баннер НЕ трогаем — у него есть свой
-    заметный текст, и он относится к контенту. Возвращает число втянутых блоков.
+    Применяется, только когда `header_el` — уже настоящий/свежесозданный <header> без своего
+    навязчивого стиля (втягивание в такой безопасно). Для блока со своим id/class (styled box)
+    вкладывать в него полосы НЕЛЬЗЯ — там используется `_wrap_nav_in_header`. Возвращает число
+    втянутых полос.
     """
     if header_el is None:
         return 0
     taken = 0
     for _ in range(3):   # максимум три полосы: топбар + логотип + служебная строка
         prev = header_el.find_previous_sibling(lambda t: getattr(t, "name", None) is not None)
-        if prev is None or prev.name in ("script", "style", "link", "meta", "noscript",
-                                         "header", "main", "footer", "nav"):
-            break
-        ident = _sem_cls(prev)
-        text = prev.get_text(" ", strip=True)
-        named_header = bool(_SEM_HEADER_CLASS_RE.search(ident))
-        logo_bar = bool(prev.find("img")) and len(text) <= 60
-        # Узкая служебная полоса вплотную над шапкой (телефон, язык, вход, соцсети) — часть шапки.
-        # По имени класса её не поймать: у firsttalk это id="nav-top", то есть те же слова в обратном
-        # порядке, и ни один список синонимов такое не покроет. Признак надёжнее — РАЗМЕР: полоска
-        # в пару ссылок и десяток символов не может быть содержимым страницы.
-        thin_strip = len(text) <= 120 and len(prev.find_all("a")) <= 3 and prev.find(_HEADING_RE) is None
-        # Геройская секция не является частью шапки, даже если стоит вплотную к ней.
-        if _SEM_HERO_RE.search(ident) and not named_header:
-            break
-        if not (named_header or logo_bar or thin_strip):
-            break
-        if len(text) > 400:      # это уже контент, а не полоса шапки
+        if not _is_header_bar(prev):
             break
         header_el.insert(0, prev.extract())
         taken += 1
@@ -4979,13 +5076,7 @@ def _promote_header(soup, root):
     for ch in planned_headers[:1]:
         if can_be_header(ch, root):
             old_name = ch.name
-            ch.name = "header"
-            if ch.find("nav") is None:
-                for sub in ch.find_all(["div", "ul"], recursive=True):
-                    if len([a for a in sub.find_all("a") if a.get_text(strip=True)]) >= 2:
-                        sub.name = "nav"
-                        break
-            _absorb_header_bar(ch)
+            _make_header(soup, ch)
             return old_name
     for ch in children[:6]:
         cls = _sem_cls(ch)
@@ -5010,16 +5101,11 @@ def _promote_header(soup, root):
             # что и в остальных ветках — раньше здесь была своя, более узкая проверка.
             _absorb_header_bar(header)
             return "nav"
-        # a navbar-classed container (or any block wrapping a <nav>) -> rename it to <header>,
-        # and make sure its inner link list is a <nav>.
+        # a navbar-classed container (or any block wrapping a <nav>) -> make it the <header>.
+        # _make_header wraps in a neutral <header> when a logo/banner bar sits above (keeping the
+        # styled block's CSS intact), else renames in place.
         old = ch.name
-        ch.name = "header"
-        if ch.find("nav") is None:
-            for sub in ch.find_all("div", recursive=True):
-                if len([a for a in sub.find_all("a") if a.get_text(strip=True)]) >= 2:
-                    sub.name = "nav"
-                    break
-        _absorb_header_bar(ch)
+        _make_header(soup, ch)
         return old
 
     # Nothing nav-like among the top-level blocks. On old table/<center> layouts the menu is buried
@@ -5227,26 +5313,33 @@ def strip_dead_css_urls(html_path, report):
             text = css.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        out, changed = text, False
-        for m in re.finditer(r"url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", text, re.I):
-            ref = m.group(1).strip()
+        def _is_dead(ref):
+            ref = ref.strip().strip("'\"").strip()
             if not ref or ref.startswith(("data:", "http://", "https://", "//", "#")):
-                continue
+                return False
             target = (css.parent / ref.split("?")[0].split("#")[0]).resolve()
-            if target.exists():
-                continue
-            # kill the whole declaration this url() belongs to, not just the url token, so no
-            # `background-image:;` stub is left behind
-            start = out.rfind(";", 0, out.find(m.group(0))) + 1 if m.group(0) in out else -1
-            if start <= 0:
-                out = out.replace(m.group(0), "none")
-            else:
-                end = out.find(";", start)
-                decl = out[start:end if end != -1 else len(out)]
-                if "url(" in decl:
-                    out = out[:start] + (out[end:] if end != -1 else "")
-            changed = True
-            removed += 1
+            return not target.exists()
+
+        # Режем ТОЛЬКО мёртвый url()-токен, а не всё объявление. `background: #285b8b url(dead)
+        # no-repeat` должен потерять только картинку и сохранить цвет и позицию — иначе пропадает
+        # синий фон, и блок «худеет» (аккордеон sanjhapunjab). Пустое объявление, оставшееся после
+        # выреза (`background-image:` без значения), убираем следующим проходом, чтобы не плодить
+        # `prop:;`-огрызки.
+        cnt = [0]
+
+        def _sub(m):
+            if _is_dead(m.group(1)):
+                cnt[0] += 1
+                return ""
+            return m.group(0)
+
+        out = re.sub(r"url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", _sub, text, flags=re.I)
+        # Объявление, чьё значение стало ПУСТЫМ после выреза url (`background-image: ;`), убираем.
+        # ТОЛЬКО пустое — не `none`: `display:none` это осмысленное значение, его трогать нельзя.
+        out = re.sub(r"[a-zA-Z-]+\s*:\s*;", "", out)          # пустое значение перед ;
+        out = re.sub(r"[a-zA-Z-]+\s*:\s*(?=\})", "", out)     # пустое значение перед }
+        changed = cnt[0] > 0 and out != text
+        removed += cnt[0]
         if changed:
             try:
                 css.write_text(out, encoding="utf-8")

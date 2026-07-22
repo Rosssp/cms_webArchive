@@ -194,6 +194,7 @@ async function pickDest(){
 async function adoptDest(){
   const dest = $('#dest').value.trim();
   if(!dest) return;
+  try{ localStorage.setItem('wb_dest', dest); }catch(_){}  // запомнить папку на будущие рестарты
   await api('/api/wayback/adopt', {dest});
   poll();
 }
@@ -380,8 +381,11 @@ async function poll(){
   _entries = data.entries || [];
   if(data.dest && !$('#dest').value) $('#dest').value = data.dest;
   render(_entries);
-  // first time we learn a folder, pull whatever's already downloaded in it into cards
-  if(data.dest && !_adopted){ _adopted = true; adoptDest(); }
+  // Первый раз, когда знаем папку, подтягиваем всё уже скачанное в ней в карточки. Папку берём из
+  // ЛЮБОГО источника — поле (восстановленное из localStorage) ИЛИ память сервера, — а не только из
+  // памяти сервера: после рестарта сервер её забывает, и карточки не появлялись, хотя сайты лежат
+  // на диске. Пользователь: «раньше показывала всё в папке, почему пропало».
+  if(!_adopted && $('#dest').value.trim()){ _adopted = true; adoptDest(); }
   const busy = _entries.some(e => !e.dl_done || e.clean_running);
   clearTimeout(_timer);
   _timer = setTimeout(poll, busy ? 900 : 3000);
@@ -390,6 +394,9 @@ async function poll(){
 $('#pickBtn').addEventListener('click', pickDest);
 $('#goBtn').addEventListener('click', startDownload);
 $('#dest').addEventListener('change', adoptDest);  // typed/pasted a path -> load its sites
+// Восстановить папку из localStorage ДО опроса: тогда сканирование запустится сразу, даже если
+// сервер только что перезапущен и папку не помнит.
+try{ const saved = localStorage.getItem('wb_dest'); if(saved && !$('#dest').value) $('#dest').value = saved; }catch(_){}
 poll();  // restore full state on load / after refresh
 </script>
 </body>
