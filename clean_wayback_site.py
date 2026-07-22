@@ -2362,6 +2362,12 @@ def fix_static_sliders(soup, report):
     for box in boxes:
         if box.decomposed or not box.find_parent("body"):
             continue  # already removed together with an ancestor
+        # Сам медиа-элемент — это КОНТЕНТ, а не пустая оболочка. Класс слайдер-бокса нередко висит
+        # прямо на картинке (Elementor: `<img class="swiper-slide-image">` у логотипов партнёров),
+        # а у <img> нет вложенных <img>, поэтому проверка «есть ли внутри картинка» ложно давала
+        # «пусто» и удаляла саму картинку (bambooship: логотипы партнёров исчезали из карусели).
+        if box.name in ("img", "video", "picture", "svg", "canvas", "iframe", "source", "audio"):
+            continue
         # NB: ignore <style>/<script> text - Smart Slider embeds its whole stylesheet INSIDE the
         # slider div, which made "does it have text?" always true and the empty shell survive.
         visible_text = "".join(
@@ -5838,6 +5844,71 @@ def repair_landmarks_in_main(soup, report):
     return fixed
 
 
+def hoist_theme_landmarks(soup, report):
+    """Поднять УЖЕ СУЩЕСТВУЮЩИЕ лендмарки темы <header>/<main>/<footer> на уровень <body>.
+
+    WordPress/Astra заворачивает страницу в `div#page.hfeed.site`, а внутри — `<header id=masthead>`,
+    `<div#content> … <main>`, `<footer id=colophon>`. Чистильщик иначе переименовывает эту обёртку в
+    `<section>` и оставляет все три лендмарка ВЛОЖЕННЫМИ, так что `<header>/<main>/<footer>` не на
+    верхнем уровне. Владелец руками выносит их на уровень body, и ничего не ломается — это и есть
+    настоящие лендмарки страницы (bambooship: header#masthead/main#main/footer#colophon уже в теме).
+
+    Срабатывает ТОЛЬКО когда все три лендмарка лежат под ОДНОЙ обёрткой-ребёнком body и ни один ещё
+    не поднят. Страницы, где лендмарки уже наверху (их собрал сам чистильщик), не трогаются.
+    """
+    body = soup.find("body")
+    if body is None:
+        return 0
+    header, main, footer = soup.find("header"), soup.find("main"), soup.find("footer")
+    if header is None or main is None or footer is None:
+        return 0
+    if header.parent is body and main.parent is body and footer.parent is body:
+        return 0  # уже наверху — нечего делать
+
+    def _top_wrapper(el):
+        w = el
+        while w.parent is not None and w.parent is not body:
+            w = w.parent
+        return w if (w is not None and w.parent is body) else None
+
+    wh, wm, wf = _top_wrapper(header), _top_wrapper(main), _top_wrapper(footer)
+    if wh is None or not (wh is wm and wm is wf):
+        return 0  # не под одной общей обёрткой body-уровня — не наш случай, не рискуем
+    wrapper = wh
+    # Лендмарк не должен быть вложен в другой лендмарк (иначе перенос ломает вложенность).
+    if header.find_parent("main") or footer.find_parent("main") or main.find_parent(("header", "footer")):
+        return 0
+    # header — перед обёрткой, footer — после; обёртка с контентом становится единственным <main>.
+    wrapper.insert_before(header.extract())
+    wrapper.insert_after(footer.extract())
+    for _nested in wrapper.find_all("main"):
+        _nested.name = "div"          # один <main> на страницу: вложенный демотируем в div (id/class целы)
+    wrapper.name = "main"             # обёртка (бывш. div#page) и есть основной контент
+    report.semantic_tags_applied.append("лендмарки темы подняты на уровень body (header > main > footer)")
+    return 1
+
+
+def relocate_hidden_svg_defs(soup, report):
+    """Скрытые svg-symbol-листы (`<svg style="visibility:hidden;position:absolute">` с `<defs>`/
+    `<symbol>`) утащить из НАЧАЛА body в самый конец. Elementor/иконочные темы кладут их вверху, и
+    они стоят ПЕРЕД <header>, ломая «первый элемент body = header». Не удаляем (на них ссылаются
+    `<use href="#…">`), только переносим — положение в DOM для `<use>` не важно, а вид не меняется."""
+    body = soup.find("body")
+    if body is None:
+        return 0
+    moved = 0
+    for ch in list(body.find_all("svg", recursive=False)):
+        style = (ch.get("style") or "").replace(" ", "").lower()
+        hidden = "visibility:hidden" in style or "display:none" in style or "position:absolute" in style
+        is_defs = ch.find(["defs", "symbol"]) is not None and not ch.get_text(strip=True)
+        if hidden and is_defs:
+            body.append(ch.extract())
+            moved += 1
+    if moved:
+        report.semantic_tags_applied.append(f"скрытых svg-symbol-листов перенесено вниз body: {moved}")
+    return moved
+
+
 def sections_outside_main(soup):
     """ЕДИНСТВЕННЫЙ ответ на вопрос «какие секции лежат снаружи <main>».
 
@@ -6732,6 +6803,8 @@ def clean_html_file(
     if not dry_run:
         _audit_stylesheets(soup, html_path, site_domain, report)
 
+    hoist_theme_landmarks(soup, report)     # готовые header/main/footer темы — на уровень body
+    relocate_hidden_svg_defs(soup, report)  # скрытые svg-symbol-листы — из начала body в конец
     pull_sections_into_main(soup, report)   # секции обязаны лежать внутри <main>
     repair_landmarks_in_main(soup, report)  # лендмарк внутри <main> — чиним, а не только сообщаем
     _strip_role_marks(soup)  # служебные метки разметки не должны уехать в готовый HTML

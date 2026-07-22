@@ -1162,6 +1162,21 @@ def _remove_nav_item(a):
         li.decompose()
 
 
+def _neutralize_kept_anchor(a):
+    """Пункт ОСТАВЛЯЕМ, но мёртвую ссылку снимаем — по-разному в меню и в теле страницы.
+
+    В МЕНЮ (header/nav/footer): убрать href СОВСЕМ — владелец: «если якорь не присосался, весь хрю
+    удалить», пункт становится простым текстом `<a class="menu-link"><span>…</span></a>`, без
+    `href="#"`. В BODY: заменить на `"#"`, а НЕ удалять — там оформление часто завязано на
+    `a:link`/`a:visited` (стрелки аккордеона сайдбара), и `<a>` без href теряет фон-иконку.
+    Разделение по контексту, а не одно правило на всё."""
+    if a.find_parent(["header", "nav", "footer"]) is not None:
+        if a.has_attr("href"):
+            del a["href"]
+    else:
+        a["href"] = "#"
+
+
 def _is_live_anchor(a, soup=None):
     """Ведёт ли пункт меню на РЕАЛЬНЫЙ раздел этой страницы.
 
@@ -2359,8 +2374,8 @@ def auto_link_menu(site_dir, keep_header_items=False):
                 # icon-only dead link (social etc.) -> neutralise to "#", keep the <a>. Not attribute
                 # removal: icon controls are styled via a:link/:visited too, and a hrefless <a> loses
                 # that styling. "#" keeps the anchor a link without navigating anywhere.
-                a["href"] = "#"
-                relabeled.append(f'{rel_self}: icon-only <a> ({_cls(a)[:24]}) — ссылка -> "#"')
+                _neutralize_kept_anchor(a)
+                relabeled.append(f'{rel_self}: icon-only <a> ({_cls(a)[:24]}) — мёртвая ссылка снята')
                 dirty = True
                 continue
             # Only anchor a link that GENUINELY matches a section. Falling back to "the first
@@ -2397,14 +2412,14 @@ def auto_link_menu(site_dir, keep_header_items=False):
                 # "#" (not attribute removal): themes style these via a:link/a:visited, and those
                 # pseudo-classes only match an <a> that HAS an href - stripping it kills the look
                 # (sanjhapunjab sidebar accordion arrows). "#" navigates nowhere and keeps styling.
-                a["href"] = "#"
-                relabeled.append(f'{rel_self}: cms-menu "{txt[:24]}" (мёртвая ссылка -> "#", пункт сохранён)')
+                _neutralize_kept_anchor(a)
+                relabeled.append(f'{rel_self}: cms-menu "{txt[:24]}" (мёртвая ссылка снята, пункт сохранён)')
             elif keep_header_items and a.find_parent("header") is not None:
                 # Owner switch "не удалять пункты хедера": a header item with nothing to anchor to
                 # stays put. Neutralise to "#" rather than removing href, so a:link/:visited styling
                 # survives (same reason as the CMS-menu branch above).
-                a["href"] = "#"
-                relabeled.append(f'{rel_self}: header "{txt[:24]}" (пункт оставлен, ссылка -> "#")')
+                _neutralize_kept_anchor(a)
+                relabeled.append(f'{rel_self}: header "{txt[:24]}" (пункт оставлен, href снят — простой текст)')
             elif a.find_parent(["header", "nav", "footer"]) is not None:
                 # Nothing to point at, and it sits in the menu -> a menu item that leads nowhere
                 # is pure noise on a restored single-page site. Drop it.
@@ -2419,8 +2434,8 @@ def auto_link_menu(site_dir, keep_header_items=False):
                 # rule and the image were both intact). "#" navigates nowhere harmful and preserves
                 # the styling 1-to-1. These anchors already carried "#"/""/"/" (a JS hook or an
                 # already-neutralised dead link), so this changes appearance, not destinations.
-                a["href"] = "#"
-                relabeled.append(f'{rel_self}: мёртвая ссылка оставлена как "#" на "{txt[:24]}" (сохранён :link-стиль)')
+                _neutralize_kept_anchor(a)
+                relabeled.append(f'{rel_self}: мёртвая ссылка нейтрализована на "{txt[:24]}" (body -> "#", меню -> без href)')
             dirty = True
 
         # No two menu items may carry the SAME text AND the same anchor. firsttalk shipped three
