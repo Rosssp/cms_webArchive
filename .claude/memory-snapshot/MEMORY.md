@@ -20,3 +20,5 @@
 - [Использовать лендмарки темы](use-theme-landmarks.md) — готовые header/main/footer темы поднять на уровень body; медиа не пустая слайдер-оболочка
 - [Тест на свежей скачке](test-on-fresh-download.md) — старая .bak может не иметь файлов, которые новый загрузчик ловит; полдня на фантомный баг
 - [Whitelist мет в head](head-meta-whitelist.md) — оставить только title/description/canonical/иконку; og/twitter/hreflang/msapplication снести; charset/viewport/stylesheet не трогать
+- [Bulk-CDX, не по-ассетно](cdx-bulk-not-per-asset.md) — CDX тяжёлый; один запрос domain/* вместо N; прямой fetch по ts до CDX; очистка 190с→30с
+- [Портируемость: lxml и .env](portability-lxml-and-env.md) — на другом компе едет из-за парсера (lxml vs html.parser) и отсутствия ключа

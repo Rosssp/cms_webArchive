@@ -2990,6 +2990,13 @@ WAYBACK_ASSET_URL_RE = re.compile(
 )
 
 
+def _wb_ts(url):
+    """Таймстамп из wayback-обёрнутого URL (`/web/<ts>im_/http://…`) или None. С ним восстановление
+    идёт прямым id_-fetch без тяжёлого CDX-поиска — главный рычаг скорости очистки."""
+    m = WAYBACK_ASSET_URL_RE.match((url or "").strip())
+    return m.group(1) if m else None
+
+
 RECOVERY_FETCH_RETRIES = 1  # one gentle retry covers the common transient web.archive.org
 # hiccup (a genuinely-present asset lost to a single slow response) without turning a page
 # full of genuinely-gone assets into minutes of backoff sleeps. Kept SHORT on purpose - the
@@ -3065,6 +3072,7 @@ def _reset_recovery_state():
     _REC_TL.consec_fails = 0
     _REC_TL.dead = False
     _REC_TL.miss = set()  # original URLs already known-dead this run (skip re-lookup)
+    _reset_throttle()  # свежий детектор троттла на каждый прогон
 
 
 def _recovery_giving_up():
@@ -3091,6 +3099,49 @@ def _recovery_note(success):
 # regression - definitive misses cost exactly one request each, as before.
 _ARCHIVE_TRANSIENT_RETRIES = 3
 _TRANSIENT_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+# Глобальный (на весь процесс, между потоками) детектор троттла. Ретраи с бэкоффом восстанавливают
+# ассет при РАЗОВОМ спайке — но когда web.archive.org режет IP УСТОЙЧИВО, каждый ассет всё равно
+# получает 4 попытки по таймауту (8с) + бэкофф, и очистка растягивается с минуты до получаса.
+# Считаем ПОДРЯД идущие транзиентные фейлы по всем потокам: как только их _THROTTLE_TRIP, значит нас
+# троттлят — дальше отказываем БЫСТРО (0 ретраев, короткий таймаут). Восстановление на ЗДОРОВОМ
+# архиве не страдает: любой успех сбрасывает счётчик и режим. Определённые промахи (404) на троттл
+# НЕ влияют — это честное «нет», а не троттл. Ничего не отключаем навсегда — только перестаём молотить
+# в стену, пока стена есть.
+_THROTTLE_TRIP = 6
+_THROTTLE_LOCK = threading.Lock()
+_THROTTLE = {"consec": 0, "on": False}
+
+# Таймстамп захвата САМОЙ страницы (из её wayback-URL). Для ассета того же домена БЕЗ своего ts
+# (в CSS часто голый абсолютный `http://site/wp-content/…`) это лучшая подсказка: ассет снимался
+# вместе со страницей, поэтому прямой id_-fetch на этом ts обычно попадает — и тяжёлый CDX-поиск
+# (15-40с) не нужен. Модульный (не thread-local): восстановление идёт в воркер-потоках.
+_RUN_SITE_TS = {"ts": None}
+_FIRST_WAYBACK_TS_RE = re.compile(r"/web/(\d{8,14})[a-zA-Z_]*/https?://", re.I)
+
+
+def _reset_throttle():
+    with _THROTTLE_LOCK:
+        _THROTTLE["consec"] = 0
+        _THROTTLE["on"] = False
+
+
+def _note_transient_fail():
+    with _THROTTLE_LOCK:
+        _THROTTLE["consec"] += 1
+        if _THROTTLE["consec"] >= _THROTTLE_TRIP:
+            _THROTTLE["on"] = True
+
+
+def _note_fetch_success():
+    with _THROTTLE_LOCK:
+        _THROTTLE["consec"] = 0
+        _THROTTLE["on"] = False
+
+
+def _throttled():
+    with _THROTTLE_LOCK:
+        return _THROTTLE["on"]
 
 
 def _is_transient_fetch_error(e):
@@ -3126,6 +3177,9 @@ def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH
 
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (image-recovery-bot)"})
     use_lock = "archive.org" in url  # only the throttle-sensitive archive host is serialized
+    # Пока нас троттлят — короткий таймаут, чтобы фейл ловился быстро, а не висел все 8с.
+    if use_lock and _throttled():
+        timeout = min(timeout, 4)
     last_err = None
     attempt = 0
     while True:
@@ -3134,10 +3188,13 @@ def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH
             if use_lock:
                 with _ARCHIVE_FETCH_LOCK:
                     with urllib.request.urlopen(req, timeout=timeout) as resp:
-                        return resp.read()
+                        data = resp.read()
             else:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return resp.read()
+                    data = resp.read()
+            if use_lock:
+                _note_fetch_success()   # архив ответил — троттла нет, сбрасываем детектор
+            return data
         except CleanupCancelled:
             raise
         except Exception as e:  # noqa: BLE001 - classify: throttle spike (retry) vs gone (bail)
@@ -3146,7 +3203,12 @@ def _fetch_url_bytes(url, timeout=RECOVERY_FETCH_TIMEOUT, retries=RECOVERY_FETCH
             # throttle on archive.org: back off and retry - the asset is really there. The lock is
             # already released here (we're outside the `with`), so the sleep frees the slot.
             if _is_transient_fetch_error(e):
-                max_attempts = _ARCHIVE_TRANSIENT_RETRIES if use_lock else retries
+                if use_lock:
+                    _note_transient_fail()
+                # Под УСТОЙЧИВЫМ троттлом ретраи бесполезны (следующая попытка тоже упрётся в лимит) и
+                # именно они раздували очистку до получаса — отказываем сразу (0 ретраев). При
+                # здоровом архиве (троттл не сработал) ретраим как раньше — восстановление не теряем.
+                max_attempts = 0 if (use_lock and _throttled()) else (_ARCHIVE_TRANSIENT_RETRIES if use_lock else retries)
                 if attempt < max_attempts:
                     time.sleep(min(4.0, 0.5 * (2 ** attempt)))
                     attempt += 1
@@ -3187,6 +3249,56 @@ def _looks_like_valid_asset_bytes(data, ext=""):
 RECOVERY_CDX_TIMEOUT = 25
 
 
+_DOMAIN_CDX_CACHE = {}          # bare_domain -> {norm_url: timestamp} | None (недоступно)
+_DOMAIN_CDX_LOCK = threading.Lock()
+_ASSET_KEY_SCHEME_RE = re.compile(r"^https?://", re.I)
+
+
+def _norm_asset_key(url):
+    """Ключ ассета для CDX-карты: без схемы, без query, нижний регистр — чтобы сопоставлять
+    ссылку из страницы со строкой CDX независимо от http/https и хвоста ?ver=."""
+    u = _ASSET_KEY_SCHEME_RE.sub("", (url or "").split("?")[0])
+    return u.rstrip("/").lower()
+
+
+def _domain_cdx_map(domain):
+    """ОДИН CDX-запрос на ВЕСЬ домен вместо отдельного поиска по каждому ассету (кэшируется на прогон).
+
+    CDX-search — тяжёлый запрос (15-40с под нагрузкой archive.org). На странице с десятком
+    невосстановленных ассетов это десяток таких запросов подряд = минуты-десятки минут (longandshort:
+    6+ поисков по 20-60с). Один префиксный запрос `domain/*` возвращает по одному захвату на каждый
+    URL домена; дальше поиск конкретного ассета — локальная выборка из словаря, без сети. При сбое
+    запроса возвращаем None → вызывающий откатывается на поиск по одному URL (поведение как было).
+    """
+    key = (domain or "").lower()
+    if not key:
+        return None
+    import json
+    import urllib.parse
+    # Лок держится НА ВРЕМЯ запроса: иначе несколько параллельных потоков восстановления, пройдя
+    # проверку кэша до того как первый его заполнит, делают один и тот же bulk-запрос по 3-4 раза
+    # (замер: 4 одинаковых `domain/*`). Так — ровно один запрос, остальные ждут готовый результат.
+    with _DOMAIN_CDX_LOCK:
+        if key in _DOMAIN_CDX_CACHE:
+            return _DOMAIN_CDX_CACHE[key]
+        api = "https://web.archive.org/cdx/search/cdx?" + urllib.parse.urlencode({
+            "url": domain + "/*", "output": "json", "filter": "statuscode:200",
+            "collapse": "urlkey", "fl": "original,timestamp", "limit": "50000",
+        })
+        result = None
+        try:
+            rows = json.loads(_fetch_url_bytes(api, timeout=RECOVERY_CDX_TIMEOUT + 20).decode("utf-8", "replace"))
+            if len(rows) >= 2:
+                result = {}
+                for r in rows[1:]:
+                    if len(r) >= 2 and r[0] and r[1]:
+                        result.setdefault(_norm_asset_key(r[0]), r[1])
+        except Exception:  # noqa: BLE001 - недоступно/таймаут => откат на поиск по одному URL
+            result = None
+        _DOMAIN_CDX_CACHE[key] = result
+        return result
+
+
 def _wayback_nearest_snapshot_url(original_url, timestamp):
     """The exact timestamp embedded in a rewritten reference sometimes 404s (the page
     around it was captured, this one asset wasn't, at that exact crawl) - ask the CDX
@@ -3196,6 +3308,14 @@ def _wayback_nearest_snapshot_url(original_url, timestamp):
     RECENT successful capture. Returns a raw-bytes ('id_') fetch URL, or None."""
     import json
     import urllib.parse
+
+    # Сначала общий кэш по домену: один запрос на весь сайт вместо поиска по каждому ассету.
+    _dmap = _domain_cdx_map(domain_of(original_url))
+    if _dmap is not None:
+        _ts = _dmap.get(_norm_asset_key(original_url))
+        if _ts:
+            return f"https://web.archive.org/web/{_ts}id_/{original_url}"
+        return None  # домен опрошен целиком, ассета в архиве нет — по одному URL искать незачем
 
     api = "https://web.archive.org/cdx/search/cdx?" + urllib.parse.urlencode(
         {"url": original_url, "output": "json", "filter": "statuscode:200"}
@@ -3243,20 +3363,32 @@ def recover_asset_bytes(original_url, timestamp=None):
         # was dead - skip the (serialized, slow) CDX round-trip and go straight to the fallback.
         if _recovery_giving_up() or original_url in getattr(_REC_TL, "miss", ()):
             return None, ext
-    candidates = []
-    if timestamp:
-        candidates.append(f"https://web.archive.org/web/{timestamp}id_/{original_url}")
-    nearest = _wayback_nearest_snapshot_url(original_url, timestamp)
-    if nearest and nearest not in candidates:
-        candidates.append(nearest)
-    for candidate in candidates:
+    # 1) ПРЯМОЙ fetch по таймстампу — без CDX. CDX-поиск (`_wayback_nearest_snapshot_url`) это
+    #    тяжёлый запрос (15-40с под нагрузкой archive.org), а прямой id_-fetch точного снапшота —
+    #    ~1-2с. Раньше оба кандидата строились СРАЗУ, поэтому CDX дёргался даже когда прямой fetch
+    #    успешен — это и раздувало очистку (longandshort: 40+32+28+27+20+18с только на CDX). Если
+    #    таймстамп есть и на нём ассет лежит (обычный случай) — CDX не нужен вовсе.
+    # Нет своего ts (голая абсолютная ссылка того же домена) — берём ts захвата страницы: ассет
+    # снимался вместе с ней, прямой fetch на этом ts обычно попадает и CDX не нужен.
+    ts_try = timestamp or _RUN_SITE_TS.get("ts")
+    if ts_try:
         try:
-            data = _fetch_url_bytes(candidate)
-        except Exception:
-            continue
-        if _looks_like_valid_asset_bytes(data, ext):
-            _recovery_note(True)
-            return data, ext
+            data = _fetch_url_bytes(f"https://web.archive.org/web/{ts_try}id_/{original_url}")
+            if _looks_like_valid_asset_bytes(data, ext):
+                _recovery_note(True)
+                return data, ext
+        except Exception:  # noqa: BLE001 - прямой не вышел, дальше пробуем CDX
+            pass
+    # 2) Прямой не сработал (или таймстампа нет) — ТОЛЬКО теперь тяжёлый CDX-поиск ближайшего снапшота.
+    nearest = _wayback_nearest_snapshot_url(original_url, timestamp)
+    if nearest:
+        try:
+            data = _fetch_url_bytes(nearest)
+            if _looks_like_valid_asset_bytes(data, ext):
+                _recovery_note(True)
+                return data, ext
+        except Exception:  # noqa: BLE001
+            pass
     _recovery_note(False)
     if enabled:
         _REC_TL.miss.add(original_url)
@@ -3659,16 +3791,16 @@ def localize_media_refs(soup, html_path, site_domain, report, dry_run=False, can
             if name in local_by_name or name in seen:
                 continue
             seen.add(name)
-            want.append((u.split("#")[0], name))
+            want.append((u.split("#")[0], name, _wb_ts(url)))   # ts из ОРИГИНАЛА (до unwayback)
         if want:
             from concurrent.futures import ThreadPoolExecutor
 
             def _rec_media(item):
-                _u, _name = item
+                _u, _name, _ts = item
                 if cancelled is not None and cancelled():
                     raise CleanupCancelled()
                 try:
-                    _data, _ = recover_asset_bytes(_u)
+                    _data, _ = recover_asset_bytes(_u, _ts)
                 except CleanupCancelled:
                     raise
                 except Exception:  # noqa: BLE001
@@ -3702,7 +3834,7 @@ def localize_media_refs(soup, html_path, site_domain, report, dry_run=False, can
             return rel, False
         if not dry_run:
             try:
-                data, _ext = recover_asset_bytes(u.split("#")[0])
+                data, _ext = recover_asset_bytes(u.split("#")[0], _wb_ts(url))  # ts из оригинала → без CDX
             except Exception:  # noqa: BLE001
                 data = None
             if data:
@@ -6702,6 +6834,8 @@ def clean_html_file(
     bak_path = html_path.with_suffix(html_path.suffix + ".bak")
     source_path = bak_path if (backup and bak_path.is_file()) else html_path
     original_text = read_text_safe(source_path)
+    _m_ts = _FIRST_WAYBACK_TS_RE.search(original_text)   # ts захвата страницы — подсказка для ассетов
+    _RUN_SITE_TS["ts"] = _m_ts.group(1) if _m_ts else None
     # A stray element between <html> and <head> (e.g. wayback/YUI's
     # <div id="yui3-css-stamp">) makes some parsers misplace <head>'s
     # content into <body> - strip it before parsing.
