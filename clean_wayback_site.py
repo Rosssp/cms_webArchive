@@ -666,6 +666,7 @@ class Report:
         self.canonical_new = None
         self.html_lang = None
         self.head_meta_deduped = 0
+        self.slider_driver = None
         self.recovered_images = []
         self.failed_image_recovery = []
         self.noindex_removed = None
@@ -682,6 +683,7 @@ class Report:
         self.headings_normalized = []  # e.g. "h4 -> h3"
         self.base_tag_removed = None  # the killed <base href="..."> if any
         self.sri_stripped = 0  # integrity/crossorigin attrs removed (they'd block local assets)
+        self.noscript_css_promoted = 0  # <link stylesheet> hoisted out of <noscript> (CSS-from-JS themes)
         self.qa_fixed = []  # QA self-check auto-fixes (e.g. "стиль был HTML, снят")
         self.qa_warnings = []  # QA self-check issues that need a human eye
 
@@ -820,6 +822,8 @@ class Report:
             lines.append("icons: self-hosted a working Font Awesome locally (broken icon webfont replaced)")
         if self.sliders_fixed:
             lines.append(f"static slider fix: {self.sliders_fixed}")
+        if self.slider_driver:
+            lines.append(self.slider_driver)
         if self.reveal_unhidden:
             lines.append(f"scroll-reveal blocks un-hidden (their animation JS was stripped): {self.reveal_unhidden}")
         if self.glyphicons_rewritten:
@@ -909,6 +913,8 @@ class Report:
             lines.append(f"убран <base href> (ломал все относительные ссылки/стили): {self.base_tag_removed}")
         if self.sri_stripped:
             lines.append(f"снято integrity/crossorigin (блокировали локальные стили/скрипты): {self.sri_stripped}")
+        if self.noscript_css_promoted:
+            lines.append(f"стили вынесены из <noscript> в <head> (CSS грузился из JS): {self.noscript_css_promoted}")
         if self.qa_fixed:
             lines.append(f"QA-автофиксы ({len(self.qa_fixed)}):")
             for s in self.qa_fixed:
@@ -2443,6 +2449,99 @@ def fix_static_sliders(soup, report):
     return activated, untracked, collapsed, decloned
 
 
+_SLIDER_DRIVER_JS = r"""(function(){
+  "use strict";
+  var SLIDE_RE = /(?:^|\s)(?:slideshow__slide|slider__slide|swiper-slide|owl-item|slick-slide|splide__slide|glide__slide|grid__item|slide)(?:\s|$)/;
+  function slides(track){
+    var all = Array.prototype.filter.call(track.children, function(n){ return n.nodeType===1; });
+    var real = all.filter(function(n){ return SLIDE_RE.test(n.className || ""); });
+    if(real.length >= 2) return real;               // real slide elements (Dawn interleaves w:0 spacers)
+    return all.filter(function(n){ return n.getBoundingClientRect().width > 1; });
+  }
+  function currentIndex(track, sl){
+    var tl = track.getBoundingClientRect().left, best = 0, min = Infinity;
+    for(var i=0;i<sl.length;i++){
+      var d = Math.abs(sl[i].getBoundingClientRect().left - tl);
+      if(d < min){ min = d; best = i; }
+    }
+    return best;
+  }
+  function drive(track){
+    try{
+      var sl = slides(track);
+      if(sl.length < 2 || track.getAttribute("data-wb-slider")) return;
+      track.setAttribute("data-wb-slider","1");
+      var root = track.closest("slideshow-component, slider-component, [role='region']") || track.parentElement;
+      var q = function(s){ return root ? root.querySelector(s) : null; };
+      var prev = q(".slider-button--prev") || q("button[name='previous']");
+      var next = q(".slider-button--next") || q("button[name='next']");
+      var dots = root ? Array.prototype.slice.call(root.querySelectorAll(".slider-counter__link--dots")) : [];
+      function go(i){
+        i = Math.max(0, Math.min(sl.length-1, i));
+        var delta = sl[i].getBoundingClientRect().left - track.getBoundingClientRect().left;
+        track.scrollBy({left: delta, behavior:"smooth"});
+      }
+      function sync(){
+        var c = currentIndex(track, sl);
+        for(var i=0;i<dots.length;i++){
+          dots[i].classList.toggle("slider-counter__link--active", i === c);
+          dots[i].setAttribute("aria-current", i === c ? "true" : "false");
+        }
+      }
+      if(prev) prev.addEventListener("click", function(e){ e.preventDefault(); go(currentIndex(track,sl)-1); });
+      if(next) next.addEventListener("click", function(e){ e.preventDefault(); go(currentIndex(track,sl)+1); });
+      for(var i=0;i<dots.length;i++){ (function(k){ dots[k].addEventListener("click", function(e){ e.preventDefault(); go(k); }); })(i); }
+      var st; track.addEventListener("scroll", function(){ clearTimeout(st); st = setTimeout(sync, 90); }, {passive:true});
+      sync();
+      var hero = track.closest("slideshow-component");
+      if(hero){
+        var timer = null;
+        function play(){ if(!timer) timer = setInterval(function(){ var c = currentIndex(track,sl); go(c >= sl.length-1 ? 0 : c+1); }, 5000); }
+        function stop(){ if(timer){ clearInterval(timer); timer = null; } }
+        hero.addEventListener("mouseenter", stop); hero.addEventListener("mouseleave", play);
+        hero.addEventListener("focusin", stop); hero.addEventListener("focusout", play);
+        document.addEventListener("visibilitychange", function(){ document.hidden ? stop() : play(); });
+        play();
+      }
+    }catch(e){}
+  }
+  function init(){
+    var tracks = document.querySelectorAll("[id^='Slider-'], ul.slider");
+    Array.prototype.forEach.call(tracks, drive);
+  }
+  if(document.readyState === "loading") document.addEventListener("DOMContentLoaded", init); else init();
+})();
+"""
+
+
+def inject_slider_driver(soup, html_path, report, dry_run=False):
+    """Shopify Dawn carousels (<slideshow-component>/<slider-component> + <ul class="slider">) are
+    CSS scroll-snap sliders whose prev/next/dots/autoplay were wired by the theme's global.js - which
+    cleanup drops with the rest of the JS, leaving a static first slide (speedgifts.ph). The markup
+    AND the CSS survive untouched, so rather than rewrite anything (docs A1: never rebuild slider
+    markup) we attach a TINY vanilla driver that re-wires the EXISTING buttons/dots to scroll the
+    EXISTING track. Fires ONLY on the Dawn custom-element signature, so no other archive is touched -
+    additive by construction. (owl/swiper/embla/slick get their own adapters later, each verified on
+    a real site so the working set never regresses.)"""
+    if not (soup.find(["slideshow-component", "slider-component"]) or soup.select_one("ul.slider[id^='Slider-']")):
+        return
+    body = soup.find("body")
+    if body is None or dry_run:
+        return
+    files_dir = html_path.parent / "index_files"
+    try:
+        files_dir.mkdir(exist_ok=True)
+        (files_dir / "_slider-driver.js").write_text(_SLIDER_DRIVER_JS, encoding="utf-8")  # always refresh
+    except OSError:
+        return
+    if soup.find("script", src="index_files/_slider-driver.js"):
+        return  # tag already present (idempotent re-clean) - the file above was refreshed
+    tag = soup.new_tag("script", src="index_files/_slider-driver.js")
+    tag["defer"] = ""
+    body.append(tag)
+    report.slider_driver = "Dawn-слайдер оживлён (scroll-snap: стрелки/точки/автоплей на существующей разметке)"
+
+
 def clean_data_and_event_attrs(soup):
     for tag in soup.find_all(True):
         for attr in list(tag.attrs.keys()):
@@ -2857,6 +2956,46 @@ def strip_sri_attrs(soup, report=None):
     if report is not None and n:
         report.sri_stripped = n
     return n
+
+
+def promote_noscript_stylesheets(soup, report=None):
+    """Some themes load their CSS from JS and keep the real <link rel=stylesheet> ONLY inside
+    <noscript>, as the no-JS fallback (HTML5 UP / templated.co on skel.js: skel.min.js +
+    skel-layers.min.js + init.js inject the stylesheets at runtime by breakpoint). We strip that JS,
+    so nothing loads the CSS - and the browser still has JS ON, so it IGNORES the <noscript> block:
+    the page ships COMPLETELY UNSTYLED (mddaonline.com: document.styleSheets was empty, 3 <link>s sat
+    unused in <noscript>). A restored static page IS effectively a no-JS page, so that <noscript>
+    fallback is exactly what must apply now. Hoist every <link rel=stylesheet>/<style> out of
+    <noscript> into <head> (in order), dropping any href already linked outside. Only stylesheets are
+    touched - a 'please enable JavaScript' message or a tracking pixel in <noscript> is left alone."""
+    head = soup.find("head")
+    linked = set()
+    if head is not None:
+        for l in head.find_all("link", rel=lambda v: v and "stylesheet" in v):
+            if l.find_parent("noscript") is None and l.get("href"):
+                linked.add(l["href"].split("?")[0])
+    dest = head if head is not None else (soup.find("body") or soup)
+    promoted = 0
+    for ns in list(soup.find_all("noscript")):
+        for tag in ns.find_all(["link", "style"]):
+            if tag.name == "link":
+                rel = tag.get("rel") or []
+                rel = rel if isinstance(rel, list) else [rel]
+                if not any("stylesheet" == (r or "").lower() for r in rel):
+                    continue
+                href = (tag.get("href") or "").split("?")[0]
+                if href and href in linked:
+                    tag.extract()  # the same stylesheet already loads outside noscript - drop the dup
+                    continue
+                if href:
+                    linked.add(href)
+            dest.append(tag.extract())
+            promoted += 1
+        if not ns.find(True) and not (ns.get_text() or "").strip():
+            ns.decompose()  # husk emptied of everything but whitespace
+    if report is not None and promoted:
+        report.noscript_css_promoted = promoted
+    return promoted
 
 
 def strip_wayback_toolbar(soup):
@@ -6875,6 +7014,7 @@ def clean_html_file(
     strip_base_href(soup, report)  # kill <base href> - else all relative CSS/JS/img break locally
     strip_sri_attrs(soup, report)  # kill integrity/crossorigin - else SRI blocks our local copies
     strip_blocking_meta(soup, report)  # kill <meta CSP> - else it blocks every local resource
+    promote_noscript_stylesheets(soup, report)  # CSS-from-JS themes hide the real <link> in <noscript>
     unwayback_all_attrs(soup)
     clean_scripts(soup, report)
     clean_stylesheet_links(soup, report, site_domain)
@@ -6890,6 +7030,9 @@ def clean_html_file(
     # Same idea for sliders: without their JS they must still show slide 1, and a slider whose
     # slides were JS-generated must not leave a tall empty band.
     fix_static_sliders(soup, report)
+    # ...and if it's a known CSS-scroll slider (Shopify Dawn), go one better than "static first
+    # slide": re-wire its existing buttons/dots with a tiny vanilla driver so it actually slides.
+    inject_slider_driver(soup, html_path, report, dry_run=dry_run)
     # DETERMINISTIC page header (runs WITH OR WITHOUT the AI key): make the site's real top nav -
     # even a bare <div>/<center> full of links with no nav class - the page <header>. Old exports
     # whose menu is just a link-heavy div were previously missed entirely; the AI pass below only

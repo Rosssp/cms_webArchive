@@ -1775,7 +1775,8 @@ def _augment_existing_copyright(footer, name, year):
     low = name.lower()
     bare = low[4:] if low.startswith("www.") else low
     if bare and bare not in s.lower():
-        s = f"{s.rstrip()} · {name}"
+        # strip a dangling separator first ("© 2026, " -> "© 2026" -> "© 2026 · site")
+        s = f"{re.sub(r'[\\s,;·]+$', '', s)} · {name}"
     if s != orig:
         node.replace_with(s)
         return True

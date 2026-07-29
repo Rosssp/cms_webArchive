@@ -358,8 +358,8 @@ def _clean_entry(eid):
     with ENTRIES_LOCK:
         e = ENTRIES.get(eid)
         site_dir = Path(e["site_dir"]) if e and e.get("site_dir") else None
-        normalize_headings = bool(e.get("normalize_headings", True)) if e else True
-        keep_header_items = bool(e.get("keep_header_items", False)) if e else False
+        normalize_headings = bool(e.get("normalize_headings", False)) if e else False
+        keep_header_items = bool(e.get("keep_header_items", True)) if e else True
     if site_dir is None:
         return
     html_path = site_dir / "index.html"
@@ -404,8 +404,8 @@ def _clean_entry(eid):
 def api_entry_clean():
     body = request.json or {}
     eid = body.get("id")
-    normalize_headings = bool(body.get("normalize_headings", True))
-    keep_header_items = bool(body.get("keep_header_items", False))
+    normalize_headings = bool(body.get("normalize_headings", False))
+    keep_header_items = bool(body.get("keep_header_items", True))
     with ENTRIES_LOCK:
         e = ENTRIES.get(eid)
         if not e:

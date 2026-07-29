@@ -301,8 +301,8 @@ function cardHTML(e){
       ${wwwTog}
       ${mid}
       ${(e.dl_done && !dlErr && !cleaning) ? `<div class="opts">
-        <label class="hdtog" title="Вкл: выровнять уровни заголовков (h2→h3, без пропусков). Выкл: оставить как в веб-архиве."><input type="checkbox" data-hd="${e.id}" ${_hdOn[e.id]!==false?'checked':''}> менять заголовки</label>
-        <label class="hdtog" title="Пункты меню хедера, которым некуда привязать якорь, НЕ удалять — просто убрать href (останутся как текст)."><input type="checkbox" data-kh="${e.id}" ${_khOn[e.id]===true?'checked':''}> не удалять пункты хедера</label>
+        <label class="hdtog" title="Вкл: выровнять уровни заголовков (h2→h3, без пропусков). Выкл: оставить как в веб-архиве."><input type="checkbox" data-hd="${e.id}" ${_hdOn[e.id]===true?'checked':''}> менять заголовки</label>
+        <label class="hdtog" title="Пункты меню хедера, которым некуда привязать якорь, НЕ удалять — просто убрать href (останутся как текст)."><input type="checkbox" data-kh="${e.id}" ${_khOn[e.id]!==false?'checked':''}> не удалять пункты хедера</label>
       </div>` : ''}
       <div class="acts">${acts}</div>
     </div>
@@ -311,8 +311,8 @@ function cardHTML(e){
 
 // keep a small per-card cache-buster so the preview <img> reloads when clean finishes
 const _pv = {};
-const _hdOn = {};  // entry id -> "менять заголовки" checked (default on); persists across re-renders
-const _khOn = {};  // entry id -> "не удалять пункты хедера" checked (default off)
+const _hdOn = {};  // entry id -> "менять заголовки" checked (default OFF); persists across re-renders
+const _khOn = {};  // entry id -> "не удалять пункты хедера" checked (default ON)
 const _wwwBusy = new Set();  // cards mid www<->non-www switch - render a skeleton on them
 // remember the checkbox choices so a re-render (every poll) doesn't reset them
 document.addEventListener('change', ev => {
@@ -362,8 +362,8 @@ document.addEventListener('click', ev=>{
     });
   }
   else if(t.dataset.clean){
-    const nh = _hdOn[t.dataset.clean] !== false;   // default on;  survives re-renders
-    const kh = _khOn[t.dataset.clean] === true;     // default off
+    const nh = _hdOn[t.dataset.clean] === true;    // default OFF; survives re-renders
+    const kh = _khOn[t.dataset.clean] !== false;    // default ON
     api('/api/entry/clean',{id:t.dataset.clean, normalize_headings:nh, keep_header_items:kh}).then(r=>{ if(!r.ok) alert(r.error||''); poll(); });
   }
   else if(t.dataset.cancel){ api('/api/entry/cancel',{id:t.dataset.cancel}).then(poll); }

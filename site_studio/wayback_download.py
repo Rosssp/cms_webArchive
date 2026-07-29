@@ -234,6 +234,23 @@ def _fetch_css_assets(files_dir, css_items, url_to_local, used, log=None):
                 pass
 
 
+_ARCHIVE_HOSTS = ("https://web.archive.org", "http://web.archive.org", "//web.archive.org")
+
+
+def _is_real_asset_ref(url):
+    """True only for a url_to_local KEY that is safe to str.replace across the whole HTML: a genuine
+    archive ref (host + "/web/<ts>/..."), an absolute/protocol-relative site URL, or a root-relative
+    "/web/..." path. False for the degenerate captures that otherwise corrupt the document - the bare
+    archive host root ("https://web.archive.org/", collapses via url[len(host):] to "/") and the empty
+    string. See the rewrite loop for the two failure modes these cause."""
+    if len(url) < 8:
+        return False
+    for host in _ARCHIVE_HOSTS:
+        if url.startswith(host):
+            return url[len(host):].startswith("/web/")  # host root / non-/web/ archive path = junk
+    return url.startswith(("http://", "https://", "//", "/web/"))
+
+
 def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
     """Download `archive_url` (a web.archive.org page URL) into <dest_root>/<domain>/. Calls
     progress(percent, message) as it goes. Returns {'site_dir', 'domain'}. The folder name IS
@@ -415,6 +432,20 @@ def download_wayback_site(archive_url, dest_root, progress=None, use_www=False):
 
     _p(90, "Переписываю ссылки на локальные")
     for url in sorted(url_to_local, key=len, reverse=True):
+        # Only a REAL asset reference is safe for the blind str.replace below - a DEGENERATE key
+        # corrupts the WHOLE document. A single archive-host-root capture (a toolbar/redirect/favicon
+        # response whose URL is exactly https://web.archive.org/) registers TWO poison keys:
+        #   "/"                        -> replacing every slash: text/javascript -> textindex_files/…,
+        #                                 </head></body> eaten, <body> gone -> blank white page;
+        #   "https://web.archive.org/" -> replacing the archive prefix inside every wrapped URL:
+        #                                 https://web.archive.org/web/<ts>/https://cdn/x.js
+        #                                 -> index_files/assetweb/<ts>/https://cdn/x.js -> 404s
+        #                                 (speedgifts: dozens of ERR_FILE_NOT_FOUND).
+        # A genuine archive ref is the host followed by "/web/<ts>"; a genuine site ref is an absolute
+        # http(s)/protocol-relative URL; a genuine root-relative ref starts with "/web/". Everything
+        # else (bare host, "/", "") is junk and skipped.
+        if not _is_real_asset_ref(url):
+            continue
         html = html.replace(url, url_to_local[url])
 
     # When the DOM used the wayback-WRAPPED form of an asset URL but only its inner (unwrapped)
